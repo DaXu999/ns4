@@ -147,3 +147,12 @@ Sustained ~2.80x prefill speedup across the swept context range; gen
 within 2.5% of baseline (run-to-run variance).  See `local/docs/`
 (auto-round companion repo) for the full Phase 0-7 execution log,
 parity-test output, and detailed plan.
+
+## ns4 local rename
+
+The ns4 standalone renamed its local patch surface inside the patched files
+(`ds4_*` identifiers, `DS4_*` env switches and the `ds4:` log prefix became
+`ns4_*`/`NS4_*`/`ns4:`). Upstream identifiers that merely contain the letters
+"ds4" -- `MMQ_Q8_1_DS_LAYOUT_DS4` and the `block_q8_1_mmq` member `ds4[4]`
+("4 delta-sum pairs") -- are upstream vocabulary and were left untouched, as
+were the verbatim files.

@@ -11,7 +11,7 @@ CUDA kernels in `ns4_cuda.cu`.
 - Keep model loading mmap-backed for the default case; do not eagerly copy the full GGUF. Keep the model loading for SSD streaming of routed experts explicit: allocated buffers, fast reads from disk, always try to hide loading of missing routed experts by loading them while performing the inference of the shared expert and routed experts already in RAM. Always try to hide loading of layers for prefill in SSD streaming mode using the inference time of the current layer as the next one is loaded.
 - Keep the CPU backend CPU-only and use it only as reference/debug code.
 - Preserve correctness before speed. Do not keep a faster path with unexplained attention, KV cache, or logits drift.
-- Make long local agent sessions practical through live KV reuse and disk KV checkpoints.
+- Make long-running sessions practical through live KV reuse and disk KV checkpoints.
 
 ## Quality Rules
 
@@ -25,19 +25,23 @@ CUDA kernels in `ns4_cuda.cu`.
 
 ## Safety
 
-- Avoid large CPU inference runs on macOS; the CPU path has previously exposed kernel VM failures with very large mappings.
+- Avoid very large CPU inference runs; the CPU path has previously exposed host kernel VM failures with very large mappings.
 - Do not run multiple huge model processes concurrently. The instance lock is intentional.
 
 ## Layout
 
-- `ns4.c`: model loading, tokenizer, CPU reference code, graph scheduling,
+- `src/ns4.c`: model loading, tokenizer, CPU reference code, graph scheduling,
   sessions, disk-cache payload serialization.
-- `ns4_cli.c`: command line, linenoise REPL, interactive transcript handling.
-- `ns4_server.c`: OpenAI/Anthropic compatible HTTP API, worker queue, streaming,
-  tool-call mapping, disk KV cache policy.
-- `ns4_cuda.cu`: CUDA runtime and compute kernels.
-- `tests/`: unit and live integration tests.
-- `misc/`: ignored notes, experiments, and old planning material.
+- `src/ns4_cli.c`: command line, linenoise REPL, interactive transcript handling.
+- `src/ns4_server.c`: OpenAI/Anthropic compatible HTTP API, worker queue,
+  streaming, tool-call mapping, disk KV cache policy.
+- `src/ns4_cuda.cu`: CUDA runtime and compute kernels; `src/cuda/mmq/` vendors
+  the llama.cpp quantized-matmul prefill tier (see its VENDOR.md).
+- `vendor/`: linenoise (CLI REPL) and rax (disk-KV index).
+- `tools/`: gguf-tools (quantizer, imatrix, quality scoring) and dir-steering.
+- `bench/`: speed benchmarking recipes, corpora, and decode profiling.
+- `tests/`: unit and live integration tests; `docs/`: operational docs;
+  `scripts/`: server launchers and the model download script.
 
 This list is not complete, check the files for more info.
 

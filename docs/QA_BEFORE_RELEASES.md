@@ -1,6 +1,6 @@
 # QA Before Releases
 
-This is the release gate for DwarfStar.  Run it before tagging or pushing a
+This is the release gate for ns4.  Run it before tagging or pushing a
 release build.  The goal is not to prove every code path exhaustively; it is to
 exercise the paths that have historically regressed: CUDA graph inference,
 SSD streaming, distributed execution, disk KV cache, server APIs, and the
@@ -12,9 +12,9 @@ run.
 
 Preferred release test hosts:
 
-- CUDA / DGX Spark: `toor@192.168.60.184`.
+- CUDA / DGX Spark: `<user>@<cuda-host>`.
 
-`192.168.60.250` is permission-only. Never connect to it for QA, stop or start
+`<permission-only-host>` is permission-only. Never connect to it for QA, stop or start
 its server, build there, or run tests or benchmarks there without asking
 Salvatore and receiving explicit permission for that specific QA pass. Earlier
 permission does not carry over to later work.
@@ -37,7 +37,7 @@ system.
 - Repeat the warning-free build gate on the release hardware:
   `make clean && make cuda-spark` on DGX Spark,
   `make clean && make cuda-generic CUDA_HOME=/usr` on the multi-GPU CUDA host
-  only after receiving permission for `192.168.60.250`.
+  only after receiving permission for `<permission-only-host>`.
 - Run whitespace checks before committing:
   `git diff --check`.
 - Confirm `./ns4 --help`, `./ns4-server --help`, and `./ns4-agent --help` render
@@ -199,13 +199,13 @@ from another checkpoint can have plausible acceptance statistics while
 producing a different greedy continuation.
 
 - Default greedy acceptance fixture:
-  `NS4_DSPARK_MODEL=/Users/antirez/ns4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf NS4_DSPARK_SUPPORT=/Users/antirez/ns4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-acceptance`.
+  `NS4_DSPARK_MODEL=$NS4_GGUF_DIR/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf NS4_DSPARK_SUPPORT=$NS4_GGUF_DIR/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-acceptance`.
 - 64-token guardrail:
-  `NS4_DSPARK_FIXTURE_TOKENS=64 NS4_DSPARK_MODEL=/Users/antirez/ns4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf NS4_DSPARK_SUPPORT=/Users/antirez/ns4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-acceptance`.
+  `NS4_DSPARK_FIXTURE_TOKENS=64 NS4_DSPARK_MODEL=$NS4_GGUF_DIR/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf NS4_DSPARK_SUPPORT=$NS4_GGUF_DIR/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-acceptance`.
 - Fixed-block partial-accept fallback:
-  `NS4_DSPARK_FIXTURE_CONFIDENCE=0 NS4_DSPARK_FIXTURE_TOKENS=8 NS4_DSPARK_FIXTURE_REQUIRE_PARTIAL=1 NS4_DSPARK_MODEL=/Users/antirez/ns4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf NS4_DSPARK_SUPPORT=/Users/antirez/ns4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-acceptance`.
+  `NS4_DSPARK_FIXTURE_CONFIDENCE=0 NS4_DSPARK_FIXTURE_TOKENS=8 NS4_DSPARK_FIXTURE_REQUIRE_PARTIAL=1 NS4_DSPARK_MODEL=$NS4_GGUF_DIR/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf NS4_DSPARK_SUPPORT=$NS4_GGUF_DIR/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-acceptance`.
 - DSpark verifier invariant smoke:
-  `NS4_TEST_MODEL=/Users/antirez/ns4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf NS4_DSPARK_SUPPORT=/Users/antirez/ns4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-verify-depth`.
+  `NS4_TEST_MODEL=$NS4_GGUF_DIR/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf NS4_DSPARK_SUPPORT=$NS4_GGUF_DIR/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-verify-depth`.
 - If shared support-model or verifier structures changed, also run legacy MTP:
   `make mtp-verify-depth` with `NS4_TEST_MTP` set to a one-stage MTP support
   GGUF, or confirm the target skips only because the optional file is missing.
@@ -270,7 +270,7 @@ SSD streaming is a capacity path, so test both correctness and user experience.
 ## 7. CUDA / DGX Spark
 
 Before a release, ask the user for CUDA access if it is not already configured.
-Use the DGX Spark / GB10 host `toor@192.168.60.184`.  Do not claim CUDA is
+Use the DGX Spark / GB10 host `<user>@<cuda-host>`.  Do not claim CUDA is
 release-ready without this pass.
 
 - Fetch or push the exact release commit to the CUDA machine.
@@ -278,12 +278,12 @@ release-ready without this pass.
   `make clean && make cuda-spark`.
 - Require both the DGX Spark build and the eight-GPU CUDA build to complete
   without compiler warnings. The eight-GPU build is performed only after
-  receiving explicit permission to use `192.168.60.250` for this QA pass.
+  receiving explicit permission to use `<permission-only-host>` for this QA pass.
 - Run:
   `make cuda-regression`.
 - For native MXFP4 changes, run
   `make test-mxfp4-cuda CUDA_ARCH=native` on the multi-GPU CUDA host only after
-  receiving explicit permission for `192.168.60.250`, and
+  receiving explicit permission for `<permission-only-host>`, and
   `make test-mxfp4-cuda CUDA_ARCH=sm_121` on DGX Spark. Dense MMQ, routed MMQ,
   routed MMVQ, fused gate/up, and fused down must pass. The Spark run must also
   pass the Blackwell K-tile guard. This synthetic parity test does not replace
@@ -458,7 +458,7 @@ claims across different models or contexts.
 | 8x L40S, CUDA TP | Flash q4, 2,048-token prefill benchmark | 1,524.84 t/s | 46.93 t/s |
 | 8x L40S, CUDA TP | Flash q4, 16-row decode oracle | - | 126.0 aggregate t/s |
 
-The 8x L40S values are retained from the last recorded run on `192.168.60.250`.
+The 8x L40S values are retained from the last recorded run on `<permission-only-host>`.
 They are historical references only: never connect to that host or interrupt
 its production server without explicit permission for the current QA pass. If
 permission is granted, the existing hard floor remains 110 aggregate t/s for

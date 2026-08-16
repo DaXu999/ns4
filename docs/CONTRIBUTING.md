@@ -1,6 +1,6 @@
 # Contributing
 
-DwarfStar4 changes should be tested against the failure mode they can realistically
+ns4 changes should be tested against the failure mode they can realistically
 affect. The project has two regression tracks: correctness and speed. Please
 include the commands you ran, the machine/backend, the model quant, and any
 notable failures in the PR or commit notes.
@@ -15,7 +15,7 @@ Build the default backend first:
 
 ```sh
 make clean
-make
+make cuda-generic        # or: make cuda CUDA_ARCH=sm_NN for an explicit arch
 ```
 
 The C test runner is `ns4_test`. Running it without arguments is equivalent to
@@ -62,7 +62,7 @@ NS4_TEST_LONG_PROMPT=/path/to/prompt.txt ./ns4_test --long-context
 For CUDA-specific changes, test on a CUDA machine:
 
 ```sh
-make
+make cuda-generic
 make cuda-regression
 ```
 
@@ -78,29 +78,29 @@ target.
 ## Quality Checks For Quantization Changes
 
 For GGUF or quantization work, use the official-continuation scorer in
-`gguf-tools/quality-testing`. The test compares how much probability a local
+`tools/gguf-tools/quality-testing`. The test compares how much probability a local
 GGUF assigns to official DeepSeek V4 Flash continuations, token by token.
 
 Build the scorer:
 
 ```sh
-make -C gguf-tools quality-score
+make -C tools/gguf-tools quality-score
 ```
 
 Then score old and new GGUFs against the same manifest and compare:
 
 ```sh
-gguf-tools/quality-testing/score_official OLD.gguf \
-  gguf-tools/quality-testing/data/manifest.tsv /tmp/old.tsv 4096
+tools/gguf-tools/quality-testing/score_official OLD.gguf \
+  tools/gguf-tools/quality-testing/data/flash/manifest.tsv /tmp/old.tsv 4096
 
-gguf-tools/quality-testing/score_official NEW.gguf \
-  gguf-tools/quality-testing/data/manifest.tsv /tmp/new.tsv 4096
+tools/gguf-tools/quality-testing/score_official NEW.gguf \
+  tools/gguf-tools/quality-testing/data/flash/manifest.tsv /tmp/new.tsv 4096
 
-python3 gguf-tools/quality-testing/compare_scores.py /tmp/old.tsv /tmp/new.tsv
+python3 tools/gguf-tools/quality-testing/compare_scores.py /tmp/old.tsv /tmp/new.tsv
 ```
 
 Lower `avg_nll` is better. See
-`gguf-tools/quality-testing/README.md` for collecting or refreshing official
+`tools/gguf-tools/quality-testing/README.md` for collecting or refreshing official
 continuations.
 
 ## Speed Regression Tests
@@ -115,7 +115,7 @@ Default linear sweep:
 ```sh
 ./ns4-bench \
   -m ns4flash.gguf \
-  --prompt-file speed-bench/promessi_sposi.txt \
+  --prompt-file bench/promessi_sposi.txt \
   --ctx-start 2048 \
   --ctx-max 65536 \
   --step-incr 2048 \
@@ -131,7 +131,7 @@ greedy and skips EOS so each frontier gets the same number of generated tokens.
 To generate a graph for a CSV:
 
 ```sh
-python3 speed-bench/plot_speed.py /tmp/ns4-speed.csv --title "Machine t/s"
+python3 bench/plot_speed.py /tmp/ns4-speed.csv --title "Machine t/s"
 ```
 
 ## Reporting sessions bugs

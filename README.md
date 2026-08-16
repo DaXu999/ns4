@@ -2,11 +2,11 @@
   <img src="logo.svg" alt="DwarfStar logo" width="220">
 </p>
 
-**DwarfStar** is a small native inference engine optimized first for
+**ns4** is a small native inference engine optimized first for
 **DeepSeek V4 Flash**. On very high-memory machines it also supports
 **DeepSeek V4 PRO**. It is self-contained and deliberately narrow,
 not a general GGUF runner. Model loading, prompt rendering, tool calls, KV
-state, the HTTP server, and the coding agent are built and tested together.
+state, and the HTTP server are built and tested together.
 The repository also includes tools and data for GGUF, imatrix, quality, and speed.
 
 Supported backend:
@@ -62,8 +62,8 @@ are definitely possible.
 
 I (Salvatore) believe that the way projects should be shipped and used changed because of AI. The main differences today are:
 
-1. With AI, users can modify the software in significant ways with low efforts, costs, and even lacking deep domain knowledge about the task they want to accomplish. For instance, a DwarfStar user with a specific hardware setup can ask a coding agent to improve the inference speed of this software for the specific hardware setup, asking the model to reach the maximum prefill and generation speed without impacting correctness, and also asking to do a deep QA pass.
-2. Similiarly, because of "1", software may be shipped in a different way than before. It must be more a working template for the biggest use cases, without trying to cover every possible setup. If DwarfStar showcases a few good implementations of tensor parallel execution, the code will work as a rail for implementing the same feature in specific conditions, for a new model, and so forth.
+1. With AI, users can modify the software in significant ways with low efforts, costs, and even lacking deep domain knowledge about the task they want to accomplish. For instance, an ns4 user with a specific hardware setup can ask a coding agent to improve the inference speed of this software for the specific hardware setup, asking the model to reach the maximum prefill and generation speed without impacting correctness, and also asking to do a deep QA pass.
+2. Similiarly, because of "1", software may be shipped in a different way than before. It must be more a working template for the biggest use cases, without trying to cover every possible setup. If ns4 showcases a few good implementations of tensor parallel execution, the code will work as a rail for implementing the same feature in specific conditions, for a new model, and so forth.
 
 So, while this project attempts to be usable for the featured models and the most common hardware setups, I ask you, if you have access to coding agents, to consider using coding agents as an interface to discover the project, make modifications, create personalized setups. This way you can likely do more than what we ship, and certain things that are not documented or implemented, and that you require, are potentially very easy to achieve.
 
@@ -73,27 +73,26 @@ If you are looking for very specific things, we have other
 sub-README files. Otherwise for normal usage keep reading the
 next sections.
 
-- [CONTRIBUTING.md](CONTRIBUTING.md): correctness and speed regression testing
-  guide for contributors. **Read this before sending a pull request**.
-- [QA_BEFORE_RELEASES.md](QA_BEFORE_RELEASES.md): the complete release test
-  matrix for the CUDA hosts.
-- [gguf-tools/README.md](gguf-tools/README.md): offline GGUF generation,
-  imatrix collection, quantization tooling, and quality checks.
-- [gguf-tools/imatrix/README.md](gguf-tools/imatrix/README.md): how the
-  routed-MoE imatrix is collected and used.
-- [gguf-tools/imatrix/dataset/README.md](gguf-tools/imatrix/dataset/README.md):
+- [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md): correctness and speed regression
+  testing guide for contributors. **Read this before sending a pull request**.
+- [docs/QA_BEFORE_RELEASES.md](docs/QA_BEFORE_RELEASES.md): the complete release
+  test matrix for the CUDA hosts.
+- [docs/PROVENANCE.md](docs/PROVENANCE.md): where this codebase comes from, what
+  it deliberately does not carry, and where recovery of dropped features lives.
+- [tools/gguf-tools/README.md](tools/gguf-tools/README.md): offline GGUF
+  generation, imatrix collection, quantization tooling, and quality checks.
+- [tools/gguf-tools/imatrix/README.md](tools/gguf-tools/imatrix/README.md): how
+  the routed-MoE imatrix is collected and used.
+- [tools/gguf-tools/imatrix/dataset/README.md](tools/gguf-tools/imatrix/dataset/README.md):
   how the calibration prompt corpus is generated.
-- [gguf-tools/quality-testing/README.md](gguf-tools/quality-testing/README.md):
+- [tools/gguf-tools/quality-testing/README.md](tools/gguf-tools/quality-testing/README.md):
   how local GGUFs are scored against official DeepSeek V4 Flash/PRO continuations.
-- [dir-steering/README.md](dir-steering/README.md): directional steering data,
-  vector generation, and usage.
-- [speed-bench/README.md](speed-bench/README.md): benchmark commands, charts,
-  and CSV generation.
+- [tools/dir-steering/README.md](tools/dir-steering/README.md): directional
+  steering data, vector generation, and usage.
+- [bench/README.md](bench/README.md): benchmark commands, charts, and CSV
+  generation.
 - [tests/test-vectors/README.md](tests/test-vectors/README.md): official
   continuation vectors used for regression checks.
-- [METAL_FEATURES_PORTING_NOTES.md](METAL_FEATURES_PORTING_NOTES.md): what the
-  removed Metal backend used to do that CUDA does not, and what porting each
-  piece back would cost.
 
 ## Model Weights
 
@@ -111,11 +110,11 @@ projections, routing) are left untouched to guarantee quality.
 Download one main model. **Prefer the imatrix versions.**
 
 ```sh
-./download_model.sh ds4f-q2      # 96/128 GB RAM machines
-./download_model.sh ds4f-q2-q4   # q2 with the last 6 expert layers at q4
-./download_model.sh ds4f-q4      # >= 256 GB RAM machines
-./download_model.sh ds4f-mxfp4   # native MXFP4 experts, about 156 GB
-./download_model.sh pro-q2-imatrix  # 512 GB RAM machines, PRO q2 imatrix quant
+./scripts/download_model.sh ds4f-q2      # 96/128 GB RAM machines
+./scripts/download_model.sh ds4f-q2-q4   # q2 with the last 6 expert layers at q4
+./scripts/download_model.sh ds4f-q4      # >= 256 GB RAM machines
+./scripts/download_model.sh ds4f-mxfp4   # native MXFP4 experts, about 156 GB
+./scripts/download_model.sh pro-q2-imatrix  # 512 GB RAM machines, PRO q2 imatrix quant
 ```
 
 The MXFP4 GGUF preserves DeepSeek's released MXFP4 routed-expert weights rather
@@ -126,8 +125,8 @@ Decode and other CUDA devices use Q8 activations.
 For the full PRO Q4 distributed run, download one half on each machine:
 
 ```sh
-./download_model.sh pro-q4-layers00-30      # first half of PRO Q4 split
-./download_model.sh pro-q4-layers31-output  # second half of PRO Q4 split
+./scripts/download_model.sh pro-q4-layers00-30      # first half of PRO Q4 split
+./scripts/download_model.sh pro-q4-layers31-output  # second half of PRO Q4 split
 ```
 
 The script downloads from `https://huggingface.co/antirez/deepseek-v4-gguf`,
@@ -139,7 +138,7 @@ Authentication is optional for public downloads, but `--token TOKEN`,
 `HF_TOKEN`, or the local Hugging Face token cache are used when present.
 
 If you want to regenerate GGUF files or collect a new imatrix, see
-[gguf-tools/README.md](gguf-tools/README.md). Those tools are meant for offline
+[tools/gguf-tools/README.md](tools/gguf-tools/README.md). Those tools are meant for offline
 model-building work and can take a long time on the full DeepSeek V4 Flash
 weights. Flash GGUF generation is supported by the local tools. PRO GGUF
 production currently still depends on the external `llama.cpp`-based workflow;
@@ -162,7 +161,7 @@ select another supported GGUF from `./gguf/`. Run `./ns4 --help` and
 
 DSpark is an auxiliary draft model released by DeepSeek for DeepSeek V4 Flash.
 It reads hidden states from the main model and proposes up to five future
-tokens. DwarfStar checks those proposals with the main Flash model and commits
+tokens. ns4 checks those proposals with the main Flash model and commits
 only the accepted prefix. The main model remains authoritative; a rejected or
 low-confidence suffix falls back to ordinary target decoding.
 
@@ -177,7 +176,7 @@ The DSpark checkpoint for Flash 0731 is packaged here as a separate support
 GGUF of about 5.6 GiB. It is not a standalone model. Download it once:
 
 ```sh
-./download_model.sh ds4f-dspark
+./scripts/download_model.sh ds4f-dspark
 ```
 
 The support file can be used with the 0731 Flash `ds4f-q2`, `ds4f-q2-q4`, and
@@ -217,16 +216,16 @@ long-context decode.
 | --- | ---: | ---: | ---: | ---: |
 | DGX Spark GB10, 128 GB | q2 | 7047 tokens | 343.81 t/s | 13.75 t/s |
 
-The historical Metal numbers (M3 Max, M5 Max, M3 Ultra) were dropped along with
-the Metal backend, since this build can no longer reproduce them. CUDA figures
-for more machine classes are wanted; see [speed-bench/README.md](speed-bench/README.md)
-for how they are collected.
+Historical numbers from the backends this project no longer carries were
+dropped, since this build can no longer reproduce them. CUDA figures for more
+machine classes are wanted; see [bench/README.md](bench/README.md) for how they
+are collected.
 
 ## Running models larger than RAM
 
 The normal path tries to make the model resident in GPU-addressable
 memory. This is the fastest path and should remain your default when the model
-fits. DwarfStar also has an **SSD streaming** capacity mode. In this mode the
+fits. ns4 also has an **SSD streaming** capacity mode. In this mode the
 non-routed model weights stay resident, while
 routed MoE experts are kept in an in-memory cache and loaded from the GGUF file
 on cache misses.
@@ -238,43 +237,31 @@ fast NVMe SSD makes cache misses tolerable. Long prefills can still
 be fast; generation is more sensitive to cache misses because every new token
 routes through experts again.
 
-Set the routed expert cache explicitly:
+Streaming needs no cache-size tuning on CUDA:
 
 ```sh
-./ns4 -m ./ns4flash.gguf --ssd-streaming --ssd-streaming-cache-experts 32GB
+./ns4 -m ./ns4flash.gguf --ssd-streaming
 ```
 
-The automatic cache budget was Metal-only and went with that backend, so on
-CUDA the size must be given. See
-[METAL_FEATURES_PORTING_NOTES.md](METAL_FEATURES_PORTING_NOTES.md) — the
-budget math is the cheapest of the Metal features to port back, because
-`ns4_gpu_recommended_working_set_size()` already exists for CUDA.
-
-The `32GB` value is a routed-expert memory budget, not a generic byte cache.
-DwarfStar first reserves headroom for the two full routed layers used by
-overlapped streaming prefill, then converts the remaining bytes to the number of
-dynamic cached experts that fit for the current GGUF. Explicit `NGB` budgets may
-also be capped after context/KV accounting so the backend working set stays out of
-the slow pressure zone. A plain number such as
-`--ssd-streaming-cache-experts 4000` is different: it means exactly 4000 dynamic
-expert slots, with no extra accounting. Non-routed weights, KV cache, graph
-scratch, and activations need additional memory. Leave
-the hot expert preload enabled for normal use; use `--ssd-streaming-cold` and
-`--ssd-streaming-preload-experts N` only for measurements.
+The routed experts selected for each token are staged on demand through the
+per-token selected-expert cache; there is no user-sized resident expert cache
+on this backend (the resident-cache budgeting that existed for the removed
+Metal-era backend was never implemented on CUDA and its flags were removed --
+see [docs/PROVENANCE.md](docs/PROVENANCE.md)). Non-routed weights, KV cache,
+graph scratch, and activations still need resident memory.
+`--ssd-streaming-cold` skips the streaming warm-up work and exists for
+measurements.
 
 ### Practical SSD streaming examples
 
-Start with the 2-bit Flash GGUF and a moderate expert cache, then raise the
-cache while the machine stays responsive and the startup log still shows the
-requested dynamic cache:
+Start with the 2-bit Flash GGUF:
 
 ```sh
-./download_model.sh ds4f-q2
+./scripts/download_model.sh ds4f-q2
 
 ./ns4 \
   -m ./ns4flash.gguf \
   --ssd-streaming \
-  --ssd-streaming-cache-experts 32GB \
   --ctx 32768 \
   --nothink
 ```
@@ -284,22 +271,18 @@ when you accept slow generation. Start with `--nothink`, then re-enable
 thinking with a conservative generation limit once the machine is stable:
 
 ```sh
-./download_model.sh pro-q2-imatrix
+./scripts/download_model.sh pro-q2-imatrix
 
 ./ns4 \
   -m gguf/DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix.gguf \
   --ssd-streaming \
-  --ssd-streaming-cache-experts 48GB \
   --ctx 32768 \
   --nothink
 ```
 
-The important startup line is the cache report. Start conservative, then
-increase the cache if the machine has headroom.
-
 ## Distributed inference with pipeline parallelism
 
-Pipeline parallelism lets DwarfStar **run a model that is too large for one machine** by
+Pipeline parallelism lets ns4 **run a model that is too large for one machine** by
 splitting transformer layers across multiple machines. The main example is the
 full 4-bit Flash quant across two 128 GB machines: each process maps only its
 own layer slice, activations are sent over TCP, and the coordinator keeps normal
@@ -325,8 +308,8 @@ To build an initial mental model, here are the high level concepts:
 The prefill path is pipelined (this is why it can go faster than in a single machine).
 For large prompts the coordinator can run its
 slice on chunk N+1 while the worker is running its slice on chunk N. The
-distributed rows below were measured on the Metal build (two 128 GB laptops
-over Thunderbolt 5) with the Q4 Flash GGUF and the default 4096-token
+distributed rows below were measured on the ancestor ds4 project's build (two
+128 GB laptops over Thunderbolt 5) with the Q4 Flash GGUF and the default 4096-token
 distributed prefill chunk. They are kept because the pipelining effect they
 show is transport- and backend-independent; the absolute numbers are not
 reproducible on this build. The single-process column is a reference run with
@@ -358,10 +341,10 @@ needs:
 
 ```sh
 # Coordinator machine.
-./download_model.sh pro-q4-layers00-30
+./scripts/download_model.sh pro-q4-layers00-30
 
 # Worker machine.
-./download_model.sh pro-q4-layers31-output
+./scripts/download_model.sh pro-q4-layers31-output
 ```
 
 The two files are:
@@ -377,8 +360,8 @@ while the worker owns the output head and returns logits.
 The PRO Q4 path uses queue-resident exact expert tables for the large routed
 experts. This avoids the broad multi-GiB routed-tensor bindings that made early
 distributed PRO Q4 attempts either run very slowly or hit backend memory
-accounting limits. In a short greedy smoke test over the direct
-`192.168.0.182` / `192.168.0.183` link, the model generated coherent text and
+accounting limits. In a short greedy smoke test over a direct
+gigabit-Ethernet link, the model generated coherent text and
 measured 11.47 t/s generation after startup. Per-token telemetry was balanced:
 local layers were around 39-43 ms, remote layers around 44-49 ms, for total
 token times around 84-92 ms. Expect a slow startup while each side maps and
@@ -421,7 +404,7 @@ for smaller per-token replies.
 
 The table below shows the same two hosts, the same 91 GB Flash quant,
 coordinator `--layers 0:19`, worker `--layers 20:output`, an 8192-token prompt
-from `speed-bench/promessi_sposi.txt`, and 128 generated tokens. WiFi and
+from `bench/promessi_sposi.txt`, and 128 generated tokens. WiFi and
 Internet numbers vary with local conditions, but the shape is the important
 part: high latency hurts generation directly, while lower bandwidth also pulls
 down long-prefill speed.
@@ -429,7 +412,7 @@ down long-prefill speed.
 | Link | Addresses | Ping avg | Prefill | Generation |
 | --- | --- | ---: | ---: | ---: |
 | Thunderbolt 5 | `169.254.43.68` -> `169.254.12.245` | 0.45 ms | 582.99 t/s | 25.09 t/s |
-| WiFi | `192.168.1.57` -> `192.168.1.95` | 77.20 ms | 250.70 t/s | 10.70 t/s |
+| WiFi | local WLAN | 77.20 ms | 250.70 t/s | 10.70 t/s |
 | Internet / VPN | `10.77.0.4` -> `10.77.0.3` | 152.10 ms | 114.88 t/s | 3.63 t/s |
 
 The Internet/VPN case is not meant to be a good interactive experience. It is
@@ -448,7 +431,7 @@ Useful tuning and diagnostics:
 ```sh
 ./ns4-bench \
   -m gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf \
-  --prompt-file speed-bench/promessi_sposi.txt \
+  --prompt-file bench/promessi_sposi.txt \
   --ctx-start 32768 \
   --ctx-max 65536 \
   --step-incr 32768 \
@@ -468,7 +451,7 @@ and bounded. `--dist-prefill-chunk N` exists for experiments, but the default
 4096-token chunk is the canonical setting and should be used unless you are
 explicitly validating a different chunk size.
 
-By default DwarfStar sends hidden-state activations as 32-bit floats. To reduce
+By default ns4 sends hidden-state activations as 32-bit floats. To reduce
 traffic, pass `--dist-activation-bits 16` or `--dist-activation-bits 8` on the
 coordinator. This changes only the transport format between machines, not the
 model weights or KV cache. 16-bit transport halves activation traffic and is the
@@ -486,9 +469,9 @@ rebuild worker KV state by replaying the prefix when the route is available
 again. Workers also validate a rolling 64-bit token-prefix hash on every work
 item, so a restarted worker at position 0 cannot silently accept work for
 position N; it reports the mismatch and the coordinator replays the current
-transcript. Ctrl+C in the CLI and agent is cooperative: DwarfStar waits for the
+transcript. Ctrl+C in the CLI is cooperative: ns4 waits for the
 current distributed token or prefill chunk to drain before returning control,
-which avoids coordinator-caused KV splits. Saved agent/server sessions use the
+which avoids coordinator-caused KV splits. Saved server sessions use the
 same KV file format as single-machine sessions: during save the coordinator
 fetches worker-owned layer tensors and serializes one normal payload; during
 load it splits that payload over the currently registered route.
@@ -540,7 +523,7 @@ unsupported grouped routed shapes use the exact fallback and have lower
 aggregate serving throughput. Download and build the L40S target with:
 
 ```sh
-./download_model.sh ds4f-q4
+./scripts/download_model.sh ds4f-q4
 make cuda CUDA_ARCH=sm_89
 ```
 
@@ -596,9 +579,9 @@ Long local inference runs can keep the GPU busy for extended periods. If you
 care more about heat, fan noise, or reducing thermal stress on the hardware
 than about maximum throughput, use `--power N`.
 
-`--power 100` is the default and means full speed. Lower values ask DwarfStar to target
+`--power 100` is the default and means full speed. Lower values ask ns4 to target
 that percentage of GPU usage: `--power 70` targets about 70%, `--power 50`
-targets about half usage, and so forth. DwarfStar does this by measuring GPU work time
+targets about half usage, and so forth. ns4 does this by measuring GPU work time
 and inserting small sleeps between work units: during prefill it sleeps between
 layers, and during generation it sleeps between decoded tokens. This reduces
 sustained load without changing model output.
@@ -614,35 +597,12 @@ For example:
 
 ## Native agent
 
-DwarfStar features a native coding agent that works in a different way
-than most other systems: the inference is controlled from within the agent
-itself, without socket/API boundaries, so the session is represented
-by the on-disk KV cache itself. Moreover the tools and the system prompt
-are all designed vertically for DeepSeek v4 Flash and PRO. This provides a
-few advantages:
-
-* Low latency experience, bounded mainly by the prefill speed limits. Displaying of generated text, tool calling, start of a new session are always instantaneous.
-* Live progress bar during prefill time.
-* No DSML tool calling conversion, the tools are handled natively in the LLM format.
-* KV cache mismatch are impossible by construction, the current state is always the truth.
-* Everything is tuned for this model.
-* Ability to switch saved sessions with `/list` and `/switch`; full KV sessions resume without a prefill stage.
-
-Agent sessions are stored in `~/.ns4/kvcache`. Use `/save` to persist the
-current session, `/list` to show saved sessions sorted by recent update time,
-and `/switch <sha>` to resume one of them. The session ID is stable across
-future saves and is derived from the first user prompt and creation time.
-`/del <sha>` removes a saved session. `/strip <sha>` keeps the rendered
-conversation text and title but removes the heavy KV payload; switching to a
-stripped session rebuilds the KV cache by prefilling the saved text.
-
-Use `--chdir /path/to/ns4` when launching `ns4-agent` from another directory,
-so relative runtime files resolve from the project tree.
-
-However while the system already works, there is a lot of work to do
-in order to make it ready for prime time. When finally the agent will reach
-the wanted shape, we will *likely* split the server and the client creating a stateful
-session-based protocol that can recreate all that in a client-server way.
+The ancestor ds4 project ships a native coding agent (`ds4-agent`) whose
+inference runs in-process, with the session represented by the on-disk KV
+cache itself. ns4 defers that front end: serving is the first-priority path
+here, and the agent will return as its own project (see
+[docs/PROVENANCE.md](docs/PROVENANCE.md)). External coding agents work today
+through `ns4-server` -- see the Agent Client Usage section under Server.
 
 ## Benchmarking
 
@@ -656,7 +616,7 @@ greedy non-EOS probe, restores the memory snapshot, and continues prefill.
 ```sh
 ./ns4-bench \
   -m ns4flash.gguf \
-  --prompt-file speed-bench/promessi_sposi.txt \
+  --prompt-file bench/promessi_sposi.txt \
   --ctx-start 2048 \
   --ctx-max 65536 \
   --step-incr 2048 \
@@ -827,7 +787,7 @@ While generation is active, prefill yields every 128 tokens by default.
 reduce scheduling handoffs but can make active decoders wait longer.
 
 Decode batching is exact: when a native batched kernel is unavailable,
-DwarfStar runs the affected rows in a fixed order and returns the same full
+ns4 runs the affected rows in a fixed order and returns the same full
 logits as separate session evaluations. The current backend behavior is:
 
 | Backend and model | Session execution |
@@ -873,7 +833,7 @@ controls. Tool uses are returned as Anthropic `tool_use` blocks.
 
 Default sampled API generation uses `temperature=1`, `top_p=1`, and
 `min_p=0.05`, so the default filter is relative probability rather than
-nucleus mass. In thinking mode DwarfStar applies those fixed sampling defaults
+nucleus mass. In thinking mode ns4 applies those fixed sampling defaults
 to any knob the request omits, matching DeepSeek's fixed-thinking API behavior,
 but sampling parameters set explicitly in the request always win: a
 `temperature=0` request is greedy through the whole reasoning phase, so
@@ -1320,7 +1280,7 @@ make cuda CUDA_ARCH=native
 ```
 
 CUDA builds accept `--gpu-vram N[,N,...]` and `--gpu-devices N[,N,...]` in the
-CLI, server, agent, and benchmark. VRAM values are per-device GiB budgets;
+CLI, server, and benchmark. VRAM values are per-device GiB budgets;
 `--gpu-vram auto` uses the free memory reported by CUDA. The device list controls
 the placement order and must have the same number of entries as an explicit
 budget list. Placement reserves graph and KV memory for the requested context
@@ -1354,7 +1314,7 @@ and snapshot format as CUDA, but normal inference should use CUDA.
 ## Steering
 
 This project supports steering with single-vector activation directions; see the
-`dir-steering` directory for more information. This follows the core idea of the
+`tools/dir-steering` directory for more information. This follows the core idea of the
 [Refusal in Language Models Is Mediated by a Single Direction](https://arxiv.org/abs/2406.11717)
 paper. You can use it to make the model more or less verbose, less likely to
 answer programming questions if it is a chatbot for your car rental web site,
