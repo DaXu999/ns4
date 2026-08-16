@@ -423,14 +423,13 @@ static void test_gpu_f16_prefill_matmul(void) {
 }
 
 static void test_gpu_q8_0_prefill_matmul(void) {
-    /* Not yet portable off Metal: the case feeds ns4_gpu_set_model_map() a
-     * plain malloc'd buffer, which Metal could address directly through
-     * unified memory.  CUDA registers nothing for it ("registered 0.00 GiB")
-     * and the quantize launch then fails with invalid argument.  Porting it
-     * needs the weights staged into a device-visible mapping first; see
-     * METAL_FEATURES_PORTING_NOTES.md. */
+    /* Not portable yet: the case feeds ns4_gpu_set_model_map() a plain
+     * malloc'd buffer, which only a unified-memory backend could address
+     * directly.  CUDA registers nothing for it ("registered 0.00 GiB") and
+     * the quantize launch then fails with invalid argument.  Porting it
+     * needs the weights staged into a device-visible mapping first. */
     fprintf(stderr, "ns4-test: q8_0 prefill matmul skipped, "
-                    "host-pointer model map is Metal-only (not yet ported)\n");
+                    "host-pointer model map needs a device-visible staging port\n");
     if (1) return;
     const uint32_t in_dim = 128;
     const uint32_t out_dim = 64;
@@ -799,7 +798,7 @@ static void test_gpu_q8_0_decode_pair_exact(void) {
 static void test_gpu_kernel_group(void) {
     /* These allocate device tensors directly instead of going through
      * test_get_engine(), so the backend has to be brought up explicitly.
-     * Metal allocated lazily and did not need this; CUDA returns NULL from
+     * The original backend allocated lazily and did not need this; CUDA returns NULL from
      * ns4_gpu_tensor_alloc() until the device is initialized. */
     if (ns4_gpu_init() == 0) {
         fprintf(stderr, "ns4-test: kernel group skipped, GPU backend unavailable\n");
@@ -2320,7 +2319,7 @@ static ns4_engine *test_open_dspark_engine(const char *support_path) {
     return rc == 0 ? engine : NULL;
 }
 
-/* Regression for the swapped top-k arguments in metal_graph_verify_suffix_tops
+/* Regression for the swapped top-k arguments in graph_verify_suffix_tops
  * at draft depth > 2.  Replays the committed speculative tokens through plain
  * decode and requires each to be a (near-)argmax: that is the verify invariant,
  * and unlike comparing token streams it tolerates the near-greedy tie
@@ -2463,9 +2462,6 @@ static void test_print_help(const char *prog) {
     }
     puts("  --list");
     puts("      Print test names only.");
-#ifndef NS4_NO_GPU
-    puts("      Compatibility alias for --metal-tensor-equivalence.");
-#endif
     puts("  -h, --help");
     puts("      Show this help.");
     puts("\nEnvironment:");
@@ -2483,11 +2479,6 @@ static void test_print_help(const char *prog) {
 }
 
 static const ns4_test_entry *test_find_entry(const char *arg) {
-#ifndef NS4_NO_GPU
-    if (!strcmp(arg, "--metal-mpp-equivalence")) {
-        arg = "--tensor-equivalence";
-    }
-#endif
     for (size_t i = 0; i < sizeof(test_entries) / sizeof(test_entries[0]); i++) {
         if (!strcmp(arg, test_entries[i].flag)) return &test_entries[i];
     }

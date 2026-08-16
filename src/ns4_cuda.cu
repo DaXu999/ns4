@@ -29259,13 +29259,13 @@ extern "C" int ns4_gpu_embed_tokens_quant_tensor(
 }
 
 extern "C" int ns4_gpu_flush_encoder(void) {
-    /* Metal encoder flush: CUDA kernels are already queued in stream
+    /* Encoder-flush compatibility shim: CUDA kernels are already queued in stream
      * order, nothing to split. */
     return 1;
 }
 
 
-/* Decode-time (n_tok small) quant matvec. The Metal "mpp/model-view"
+/* Decode-time (n_tok small) quant matvec. The original "mpp/model-view"
  * variant is a bandwidth-tuned matvec; on CUDA the generic quant matmul
  * already dispatches per type, so delegate. Revisit in the perf pass. */
 extern "C" int ns4_gpu_matmul_quant_tensor(ns4_gpu_tensor *out,
@@ -29616,7 +29616,7 @@ extern "C" int ns4_gpu_wait_selected_readback_ready(uint64_t event_value, const 
                    label ? label : "selected readback wait");
 }
 
-/* Compatibility surface shared with the canonical Metal graph. CUDA
+/* Compatibility surface shared with the canonical graph layer. CUDA
  * either delegates to its equivalent primitive or reports an unavailable
  * optional fast path so the graph can use its established fallback. */
 extern "C" int ns4_gpu_commit_and_wait_selected_readback(

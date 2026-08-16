@@ -76,8 +76,8 @@ bool ns4_ssd_memory_lock_acquire(ns4_ssd_memory_lock *lock,
 
     /*
      * Touch and lock in bounded chunks.  A single very large mlock() is harder
-     * to diagnose when it fails and can create long uninterruptible VM work on
-     * macOS; chunking mirrors the standalone diagnostic utility.
+     * to diagnose when it fails and can create long uninterruptible VM
+     * work; chunking mirrors the standalone diagnostic utility.
      */
     uint64_t locked = 0;
     for (uint64_t off = 0; off < bytes; off += chunk_bytes) {

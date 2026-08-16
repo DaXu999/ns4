@@ -99,7 +99,7 @@ int ns4_gpu_q8_cache_suppressed(void);
 void ns4_gpu_set_q8_cache_suppressed(int suppressed);
 
 /* Model-file ranges assigned to CUDA devices by the multi-GPU placement
- * planner. Metal keeps these declarations for the shared engine interface. */
+ * planner. Declared unconditionally for the shared engine interface. */
 #ifndef NS4_MAX_GPUS
 #define NS4_MAX_GPUS 16
 #endif
@@ -645,7 +645,7 @@ int ns4_gpu_matmul_f16_pair_tensor(
         const ns4_gpu_tensor *x,
         uint64_t                n_tok);
 
-/* Optional Metal decode fusion. Returns 1 when the paired projection and
+/* Optional decode fusion. Returns 1 when the paired projection and
  * recurrent compressor-state store were encoded, 0 when the optimized path
  * is unavailable, and -1 on an attempted-path error. */
 int ns4_gpu_matmul_f16_pair_compressor_store_tensor(
@@ -1720,7 +1720,7 @@ int ns4_gpu_hc_split_weighted_sum_norm_tensor(
         float                   norm_eps);
 
 /* Batched HC RMSNorm followed by its narrow F16 mixer projection. On the
- * tuned Metal path, scale_scratch stores one float per row instead of the
+ * tuned path, scale_scratch stores one float per row instead of the
  * full normalized HC tensor; other shapes retain the established fallback. */
 int ns4_gpu_hc_rms_scale_project_f16_tensor(
         ns4_gpu_tensor       *out,
@@ -1870,8 +1870,8 @@ int ns4_gpu_matmul_q8_0_hc_expand_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
-/* Decode-island CUDA graph capture (CUDA backend; Metal/CPU stub it
- * out and stay eager).  Design ported from the Entrpi/ns4 batched-serving
+/* Decode-island CUDA graph capture (CUDA backend; the CPU build stubs it
+ * out and stays eager).  Design ported from the Entrpi/ns4 batched-serving
  * fork's per-layer decode graph capture.  The key identifies a captured
  * island: layer, island index, and the activation buffers whose addresses
  * the captured kernels bake in.  ns4_cuda.cu mirrors this struct

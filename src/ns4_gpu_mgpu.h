@@ -6,7 +6,7 @@
  * the ns4_gpu_config struct, and the new tensor APIs.
  *
  * Why not in ns4_gpu.h? The legacy ns4_gpu.h is included from C-only
- * callers (ns4.c, ns4_cli.c, etc.) and from the Metal build, but is NOT
+ * callers (ns4.c, ns4_cli.c, etc.), but is NOT
  * included from ns4_cuda.cu historically. That asymmetry hid pre-existing
  * signature mismatches between the legacy header and ns4_cuda.cu. We keep
  * the legacy header opaque and put the new shared types here, so this
@@ -14,8 +14,8 @@
  * multi-GPU tasks without disturbing the legacy contract.
  *
  * The struct definitions reference CUDA-specific handle types via void *
- * placeholders so the header is safe to include from C builds, Metal
- * builds, and the CUDA build (where ns4_cuda.cu casts the void * back
+ * placeholders so the header is safe to include from C builds
+ * and the CUDA build (where ns4_cuda.cu casts the void * back
  * to cudaStream_t / cublasHandle_t / cudaEvent_t internally).
  */
 #ifndef NS4_GPU_MGPU_H

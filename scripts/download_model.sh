@@ -52,7 +52,7 @@ Targets:
 
   ds4f-mxfp4
        Native DeepSeek V4 Flash MXFP4 routed experts, about 156 GB on disk.
-       Supported by Metal and CUDA; Blackwell uses FP4 tensor cores for batched
+       Supported by CUDA; Blackwell uses FP4 tensor cores for batched
        expert work, while CUDA decode keeps Q8 activations.
 
   ds4f-dspark

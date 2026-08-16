@@ -66,12 +66,12 @@ int main(void) {
         /* CUDA build: linker resolves ns4_gpu_args_probe_auto_cuda. We
          * don't run that here (no CUDA hardware in unit test), so we
          * only assert the function returned with something reasonable.
-         * This test is mostly CPU/Metal-focused. */
+         * This test is mostly CPU-focused. */
         PASS_FAIL("parse auto (cuda build) doesn't NULL-deref",
                   (rc == 0 || rc != 0));  /* tautological — auto path
                                               exists; box smoke covers it */
 #else
-        PASS_FAIL("parse auto rejects on CPU/Metal build",
+        PASS_FAIL("parse auto rejects on CPU build",
                   rc != 0 && strstr(err, "auto") != NULL &&
                   strstr(err, "CUDA build") != NULL);
 #endif

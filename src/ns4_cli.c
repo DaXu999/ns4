@@ -8,7 +8,7 @@
  *
  * One-shot mode builds a single model-family chat prompt and exits.  Interactive
  * mode keeps a rendered token transcript plus one ns4_session, so follow-up
- * turns reuse the live Metal KV checkpoint just like the server does.  The CLI
+ * turns reuse the live GPU KV checkpoint just like the server does.  The CLI
  * deliberately keeps policy here and leaves graph/cache mechanics inside the
  * engine API. */
 
@@ -1057,7 +1057,7 @@ static int run_perplexity_file(ns4_engine *engine, const cli_config *cfg) {
     ns4_tokenize_text(engine, text, &tokens);
     free(text);
 
-    /* Seed the graph with enough real context to stay on the normal Metal
+    /* Seed the graph with enough real context to stay on the normal GPU
      * prefill path; scoring starts immediately after this fixed prefix. */
     const int prefix_len = 32;
     if (tokens.len <= prefix_len) {

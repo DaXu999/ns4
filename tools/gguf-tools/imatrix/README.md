@@ -87,7 +87,7 @@ Useful smoke-test limits:
 ```
 
 The collector hooks the layer-major prefill graph, so it needs the CUDA
-backend. It was only ever validated on Metal; see METAL_FEATURES_PORTING_NOTES.md.
+backend.
 It does not change inference math; it reads the already materialized MoE inputs
 and accumulates `sum(x[column]^2)` per routed expert.
 

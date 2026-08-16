@@ -1,6 +1,6 @@
 /* Unit tests for the monotonic-contiguous layer placement packer.
  *
- * Pure C99: no CUDA, no Metal. Builds and runs on any host. */
+ * Pure C99: no CUDA. Builds and runs on any host. */
 
 #include "ns4_layer_pack.h"
 
