@@ -1,6 +1,6 @@
 # Decode profiling harnesses
 
-Standalone tools used to produce `speed-bench/DECODE_LAUNCH_BUDGET.md`. None of these
+Standalone tools used to produce `bench/DECODE_LAUNCH_BUDGET.md`. None of these
 are built by the Makefile; each is a single translation unit.
 
 There is no `nsys`/`ncu` on the WSL2 box these were written for, which is why

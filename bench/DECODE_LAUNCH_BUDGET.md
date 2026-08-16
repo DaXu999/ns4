@@ -233,7 +233,7 @@ and all three widths.
 
 ## Reproducing
 
-Harnesses under `speed-bench/decode-profiling/`, none built by the Makefile:
+Harnesses under `bench/decode-profiling/`, none built by the Makefile:
 
 * `kprof.c` -- `LD_PRELOAD` launch interposer, per-kernel GPU time. Read its
   four traps in the README before trusting a report.

@@ -29,7 +29,7 @@ and Q4 recipes live in this directory.
 First regenerate or inspect the calibration dataset:
 
 ```sh
-python3 gguf-tools/imatrix/dataset/build_ns4_imatrix_dataset.py
+python3 tools/gguf-tools/imatrix/dataset/build_ds4_imatrix_dataset.py
 ```
 
 Then collect activation statistics with the NS4 runtime:
@@ -37,7 +37,7 @@ Then collect activation statistics with the NS4 runtime:
 ```sh
 ./ns4 \
   -m gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf \
-  --imatrix-dataset gguf-tools/imatrix/dataset/rendered_prompts.txt \
+  --imatrix-dataset tools/gguf-tools/imatrix/dataset/rendered_prompts.txt \
   --imatrix-out gguf/DeepSeek-V4-Flash-chat-v2-routed-moe-ns4.dat \
   --ctx 32768
 ```
@@ -69,7 +69,7 @@ you really mean to replace an existing GGUF.
 Q2 routed experts with imatrix:
 
 ```sh
-gguf-tools/deepseek4-quantize \
+tools/gguf-tools/deepseek4-quantize \
   --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Flash \
   --template gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf \
   --out gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
@@ -79,7 +79,7 @@ gguf-tools/deepseek4-quantize \
 Q4 routed experts with imatrix:
 
 ```sh
-gguf-tools/deepseek4-quantize \
+tools/gguf-tools/deepseek4-quantize \
   --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Flash \
   --template gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf \
   --out gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf \
@@ -89,7 +89,7 @@ gguf-tools/deepseek4-quantize \
 True Q8_K routed experts:
 
 ```sh
-gguf-tools/deepseek4-quantize \
+tools/gguf-tools/deepseek4-quantize \
   --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Flash \
   --template gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf \
   --out gguf/DeepSeek-V4-Flash-Q8KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf \
@@ -110,7 +110,7 @@ You can override tensor families:
 Useful checks before writing a full model:
 
 ```sh
-gguf-tools/deepseek4-quantize \
+tools/gguf-tools/deepseek4-quantize \
   --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Flash \
   --template MODEL.gguf \
   --compare-tensor blk.0.attn_q_a.weight
@@ -127,7 +127,7 @@ GGUF, inspect the official index and verify that every DSpark tensor name is
 understood by the converter:
 
 ```sh
-gguf-tools/deepseek4-quantize \
+tools/gguf-tools/deepseek4-quantize \
   --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Flash-0731 \
   --dspark-manifest > /tmp/dspark-manifest.tsv
 ```
@@ -141,7 +141,7 @@ mode writes standalone DSpark metadata plus the packed `mtp.*` tensor payloads;
 it does not require a base-model GGUF template:
 
 ```sh
-gguf-tools/deepseek4-quantize \
+tools/gguf-tools/deepseek4-quantize \
   --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Flash-0731 \
   --dspark-support \
   --out DeepSeek-V4-Flash-DSpark-support-0731.gguf
@@ -157,7 +157,7 @@ defaults match the published Flash DSpark config: block size 5, target layers
 Before a full write, regenerate one support tensor and record its checksum:
 
 ```sh
-gguf-tools/deepseek4-quantize \
+tools/gguf-tools/deepseek4-quantize \
   --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Flash-0731 \
   --dspark-support \
   --compare-tensor mtp.0.main_proj.weight
@@ -186,8 +186,8 @@ enough for the first working 2-bit GGUFs.
 See `quality-testing/README.md`.  The short version is:
 
 ```sh
-python3 gguf-tools/quality-testing/collect_official.py
+python3 tools/gguf-tools/quality-testing/collect_official.py
 make -C gguf-tools quality-score
-gguf-tools/quality-testing/score_official MODEL.gguf gguf-tools/quality-testing/data/manifest.tsv /tmp/model.tsv 4096
-python3 gguf-tools/quality-testing/compare_scores.py /tmp/old.tsv /tmp/new.tsv
+tools/gguf-tools/quality-testing/score_official MODEL.gguf tools/gguf-tools/quality-testing/data/flash/manifest.tsv /tmp/model.tsv 4096
+python3 tools/gguf-tools/quality-testing/compare_scores.py /tmp/old.tsv /tmp/new.tsv
 ```

@@ -19,17 +19,17 @@ more heavily by the actual NS4 inference graph.
 
 ## 1. Build The Calibration Dataset
 
-The tracked dataset is in `gguf-tools/imatrix/dataset/`.  Regenerate it from
+The tracked dataset is in `tools/gguf-tools/imatrix/dataset/`.  Regenerate it from
 the repository root with:
 
 ```sh
-python3 gguf-tools/imatrix/dataset/build_ns4_imatrix_dataset.py
+python3 tools/gguf-tools/imatrix/dataset/build_ds4_imatrix_dataset.py
 ```
 
 The important output is:
 
 ```text
-gguf-tools/imatrix/dataset/rendered_prompts.txt
+tools/gguf-tools/imatrix/dataset/rendered_prompts.txt
 ```
 
 It contains NS4-rendered chat prompts, separated by visible
@@ -44,7 +44,7 @@ It contains NS4-rendered chat prompts, separated by visible
 
 The current tracked dataset has 4682 rendered prompts and roughly 2.91M tokens
 by the coarse bytes/4 estimate.  Check
-`gguf-tools/imatrix/dataset/manifest.json` for the exact generated-file
+`tools/gguf-tools/imatrix/dataset/manifest.json` for the exact generated-file
 summary.
 
 ## 2. Collect The Imatrix
@@ -58,7 +58,7 @@ Flash example:
 ```sh
 ./ns4 \
   -m ../deepseek-v4-quants/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf \
-  --imatrix-dataset gguf-tools/imatrix/dataset/rendered_prompts.txt \
+  --imatrix-dataset tools/gguf-tools/imatrix/dataset/rendered_prompts.txt \
   --imatrix-out ../deepseek-v4-quants/imatrix/DeepSeek-V4-Flash-chat-v2-routed-moe-ns4-1p5m.dat \
   --ctx 32768
 ```
@@ -68,7 +68,7 @@ Pro example with a smaller calibration budget:
 ```sh
 ./ns4 \
   -m ../deepseek-v4-quants/gguf/DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct.gguf \
-  --imatrix-dataset gguf-tools/imatrix/dataset/rendered_prompts.txt \
+  --imatrix-dataset tools/gguf-tools/imatrix/dataset/rendered_prompts.txt \
   --imatrix-out ../deepseek-v4-quants/imatrix/DeepSeek-V4-Pro-Instruct-routed-moe-ns4-small.dat \
   --imatrix-max-prompts 16 \
   --imatrix-max-tokens 32768 \
@@ -80,14 +80,18 @@ Useful smoke-test limits:
 ```sh
 ./ns4 \
   -m MODEL.gguf \
-  --imatrix-dataset gguf-tools/imatrix/dataset/rendered_prompts.txt \
+  --imatrix-dataset tools/gguf-tools/imatrix/dataset/rendered_prompts.txt \
   --imatrix-out /tmp/ns4-test.imatrix.dat \
   --imatrix-max-prompts 1 \
   --imatrix-max-tokens 4096
 ```
 
 The collector hooks the layer-major prefill graph, so it needs the CUDA
-backend.
+backend. Validated on CUDA in the ns4 standalone bring-up: the routed-expert
+observation count comes out exactly tokens x 43 layers x 6 experts, and the
+emitted `.dat` parses as the legacy llama.cpp imatrix format. Do not collect
+under `--cuda-tensor-parallel`: the expert-parallel prefill path bypasses the
+tensor the collector reads.
 It does not change inference math; it reads the already materialized MoE inputs
 and accumulates `sum(x[column]^2)` per routed expert.
 
@@ -104,7 +108,7 @@ Flash's 256.
 
 ## 3. Generate GGUF Files With The Imatrix
 
-The local C quantization tool in `gguf-tools/` supports:
+The local C quantization tool in `tools/gguf-tools/` supports:
 
 ```text
 --imatrix FILE
@@ -114,7 +118,7 @@ The local C quantization tool in `gguf-tools/` supports:
 Example Q4 routed-expert regeneration:
 
 ```sh
-gguf-tools/deepseek4-quantize \
+tools/gguf-tools/deepseek4-quantize \
   --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Flash \
   --template ../deepseek-v4-quants/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf \
   --out ../deepseek-v4-quants/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf \
@@ -124,7 +128,7 @@ gguf-tools/deepseek4-quantize \
 Example Q2 regeneration:
 
 ```sh
-gguf-tools/deepseek4-quantize \
+tools/gguf-tools/deepseek4-quantize \
   --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Flash \
   --template ../deepseek-v4-quants/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf \
   --out ../deepseek-v4-quants/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
@@ -134,7 +138,7 @@ gguf-tools/deepseek4-quantize \
 Example Pro Q2 regeneration from a Pro template:
 
 ```sh
-gguf-tools/deepseek4-quantize \
+tools/gguf-tools/deepseek4-quantize \
   --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Pro \
   --template ../deepseek-v4-quants/gguf/DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct.gguf \
   --out ../deepseek-v4-quants/gguf/DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix-small.gguf \
@@ -157,11 +161,11 @@ Useful local tools:
 
 ```text
 misc/quant_eval.c
-gguf-tools/quality-testing/
+tools/gguf-tools/quality-testing/
 ```
 
 `misc/quant_eval.c` compares local GGUF variants by greedy/top-logit behavior.
-`gguf-tools/quality-testing/` can score local GGUFs against official DeepSeek
+`tools/gguf-tools/quality-testing/` can score local GGUFs against official DeepSeek
 API continuations by target-token negative log likelihood.
 
 The Q4 imatrix file uploaded to Hugging Face was tested on 100 official

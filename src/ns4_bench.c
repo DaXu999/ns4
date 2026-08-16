@@ -682,10 +682,12 @@ int main(int argc, char **argv) {
         /* NS4_BENCH_PROFILER_RANGE=1 brackets the decode loop with
          * cudaProfilerStart/Stop so `nsys -c cudaProfilerApi` can capture just
          * decode (this box's kernel paranoid level breaks nsys --delay). */
+#ifndef NS4_NO_GPU
         extern int cudaProfilerStart(void);
         extern int cudaProfilerStop(void);
         const int profiler_range = getenv("NS4_BENCH_PROFILER_RANGE") != NULL;
         if (profiler_range) (void)cudaProfilerStart();
+#endif
         const double gen_t0 = bench_now_sec();
         double gen_first_sec = 0.0;
         double gen_steady_sec = 0.0;
@@ -725,7 +727,9 @@ int main(int argc, char **argv) {
             gen_done++;
         }
         const double gen_t1 = bench_now_sec();
+#ifndef NS4_NO_GPU
         if (profiler_range) (void)cudaProfilerStop();
+#endif
         if (cfg.show_output && gen_token_buf && gen_token_count > 0) {
             fprintf(stderr, "ns4-bench: gen[ctx=%d] decoded text: \"", frontier);
             for (int i = 0; i < gen_token_count; i++) {

@@ -7,7 +7,7 @@
 /ns4_test
 /ns4flash.gguf
 /TODO.md
-/gguf/
+/gguf
 /core
 /core.*
 /tests/test_engine_mgpu_placement

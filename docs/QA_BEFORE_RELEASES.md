@@ -84,7 +84,7 @@ numbers in the QA report so omissions are visible.
    the configured and protocol limits. It must reject the header before a
    large allocation or payload read, without growing RSS materially.
 4. Run malformed safetensors and GGUF fixtures through the loader and
-   `gguf-tools/deepseek4-quantize` under ASan and UBSan. Truncated files,
+   `tools/gguf-tools/deepseek4-quantize` under ASan and UBSan. Truncated files,
    impossible dimensions, and overflowing tensor sizes must be rejected.
 5. With a checkpoint-matched DSpark drafter, compare temperature-zero output
    against a no-drafter run for 400 and 800 accepted target tokens. Output must
@@ -143,7 +143,7 @@ top-logprob slices, so do not replace them with one sampled chat answer.
   This covers short prompts and long-prompt attention cases. The runner defaults
   to this fixture, but release logs should keep the path explicit.
 - Run the 100-case DeepSeek V4 Flash fixture for every released Flash GGUF:
-  `gguf-tools/quality-testing/score_official /path/to/deepseek-v4-flash.gguf gguf-tools/quality-testing/data/flash/manifest.tsv /tmp/flash.tsv 4096`.
+  `tools/gguf-tools/quality-testing/score_official /path/to/deepseek-v4-flash.gguf tools/gguf-tools/quality-testing/data/flash/manifest.tsv /tmp/flash.tsv 4096`.
   This manifest is also for the 0731 checkpoint. A later checkpoint needs a
   separately named 100-case fixture and must not be scored against this one.
 - Treat the native MXFP4 Flash GGUF as a separate release artifact. Run the
@@ -153,12 +153,12 @@ top-logprob slices, so do not replace them with one sampled chat answer.
   for example `--gpu-vram auto --gpu-devices 0,2,4,6,1,3,5,7
   --cuda-tensor-parallel`.
 - Run the 100-case DeepSeek V4 PRO fixture for every released PRO GGUF:
-  `gguf-tools/quality-testing/score_official /path/to/deepseek-v4-pro.gguf gguf-tools/quality-testing/data/pro/manifest.tsv /tmp/pro.tsv 4096`.
+  `tools/gguf-tools/quality-testing/score_official /path/to/deepseek-v4-pro.gguf tools/gguf-tools/quality-testing/data/pro/manifest.tsv /tmp/pro.tsv 4096`.
 - For SSD streaming, run the same official-continuation scorer once with full
   residency and once with `--ssd-streaming` for the release model.  The summary
   and API agreement should stay in the same quality band.
 - Compare any candidate against the previous release or last-known-good output:
-  `python3 gguf-tools/quality-testing/compare_scores.py /tmp/old.tsv /tmp/new.tsv`.
+  `python3 tools/gguf-tools/quality-testing/compare_scores.py /tmp/old.tsv /tmp/new.tsv`.
   Treat a large first-token-match drop, a clear NLL regression, or a material
   API top-1/pair-order regression as a blocker unless the release notes call out
   an intentional quality tradeoff.
@@ -180,7 +180,7 @@ Use the normal Flash GGUF that 128 GB users run.
   `./ns4 --nothink --temp 0 --dump-logprobs /tmp/ns4-logprobs.json --logprobs-top-k 20 -p "..."`
   and inspect that the continuation is sane.
 - Speed sanity:
-  run `ns4-bench` with `speed-bench/promessi_sposi.txt` and compare prefill,
+  run `ns4-bench` with `bench/promessi_sposi.txt` and compare prefill,
   generation speed, and KV bytes with the last known good numbers for the same
   machine.
 - For native MXFP4 changes, run `make mxfp4-dot-test test-mxfp4-cuda`, then a
