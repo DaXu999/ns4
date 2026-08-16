@@ -43,9 +43,6 @@ typedef struct {
     int gen_tokens;
     int power_percent;
     uint32_t prefill_chunk;
-    uint32_t ssd_streaming_cache_experts;
-    uint64_t ssd_streaming_cache_bytes;
-    uint32_t ssd_streaming_preload_experts;
     uint64_t simulate_used_memory_bytes;
     double step_mul;
     const char *dump_frontier_logits_dir;
@@ -267,24 +264,6 @@ static bench_config parse_options(int argc, char **argv) {
             c.ssd_streaming = true;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             c.ssd_streaming_cold = true;
-        } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
-            uint32_t experts = 0;
-            uint64_t bytes = 0;
-            if (!ns4_parse_streaming_cache_experts_arg(
-                    need_arg(&i, argc, argv, arg), &experts, &bytes)) {
-                fprintf(stderr,
-                        "ns4-bench: --ssd-streaming-cache-experts must be a positive count or <number>GB\n");
-                exit(2);
-            }
-            c.ssd_streaming_cache_experts = experts;
-            c.ssd_streaming_cache_bytes = bytes;
-        } else if (!strcmp(arg, "--ssd-streaming-preload-experts")) {
-            int v = parse_int(need_arg(&i, argc, argv, arg), arg);
-            if (v <= 0) {
-                fprintf(stderr, "ns4-bench: --ssd-streaming-preload-experts must be positive\n");
-                exit(2);
-            }
-            c.ssd_streaming_preload_experts = (uint32_t)v;
         } else if (!strcmp(arg, "--simulate-used-memory")) {
             if (!ns4_parse_gib_arg(need_arg(&i, argc, argv, arg),
                                    &c.simulate_used_memory_bytes)) {
@@ -556,9 +535,6 @@ int main(int argc, char **argv) {
         .n_threads = cfg.threads,
         .context_size = cfg.ctx_alloc,
         .prefill_chunk = cfg.prefill_chunk,
-        .ssd_streaming_cache_experts = cfg.ssd_streaming_cache_experts,
-        .ssd_streaming_cache_bytes = cfg.ssd_streaming_cache_bytes,
-        .ssd_streaming_preload_experts = cfg.ssd_streaming_preload_experts,
         .simulate_used_memory_bytes = cfg.simulate_used_memory_bytes,
         .power_percent = cfg.power_percent,
         .warm_weights = cfg.warm_weights,

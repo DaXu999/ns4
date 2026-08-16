@@ -105,9 +105,6 @@ typedef struct {
     float directional_steering_attn;
     float directional_steering_ffn;
     int power_percent;
-    uint32_t ssd_streaming_cache_experts;
-    uint64_t ssd_streaming_cache_bytes;
-    uint32_t ssd_streaming_preload_experts;
     uint64_t simulate_used_memory_bytes;
     bool warm_weights;
     bool quality;

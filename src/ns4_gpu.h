@@ -123,19 +123,9 @@ int ns4_gpu_lookup_cache(uint64_t source_offset, uint64_t bytes,
                          int *out_device_id, void **out_device_ptr);
 int ns4_gpu_lookup_cache_device(uint64_t source_offset, uint64_t bytes);
 
-int ns4_gpu_pro_q4_expert_table_auto_available(void);
-int ns4_gpu_preload_q4_expert_tables(const void *model_map, uint64_t model_size,
-                                     uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
-                                     uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
-                                     uint32_t n_total_expert);
 int ns4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
 void ns4_gpu_set_quality(bool quality);
 void ns4_gpu_set_ssd_streaming(bool enabled);
-void ns4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
-void ns4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
-uint64_t ns4_gpu_recommended_working_set_size(void);
-uint32_t ns4_gpu_stream_expert_cache_configured_count(void);
-uint32_t ns4_gpu_stream_expert_cache_current_count(void);
 typedef struct ns4_gpu_stream_expert_table {
     const void *model_map;
     uint64_t    model_size;
@@ -151,9 +141,6 @@ typedef struct ns4_gpu_stream_expert_table {
  * cache itself is intentionally kept warm across sessions. */
 void ns4_gpu_stream_expert_cache_reset_route_hotness(void);
 void ns4_gpu_stream_expert_cache_release_resident(void);
-uint32_t ns4_gpu_stream_expert_cache_budget_for_expert_size(
-        uint64_t gate_expert_bytes,
-        uint64_t down_expert_bytes);
 int ns4_gpu_stream_expert_cache_seed_selected(
         const ns4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
@@ -169,11 +156,6 @@ int ns4_gpu_stream_expert_cache_prepare_selected_batch(
         uint32_t                           n_tokens,
         uint32_t                           n_selected);
 #endif
-int ns4_gpu_stream_expert_cache_seed_experts(
-        const ns4_gpu_stream_expert_table *table,
-        const int32_t                     *expert_ids,
-        const uint32_t                    *expert_priorities,
-        uint32_t                           n_experts);
 void ns4_gpu_print_memory_report(const char *label);
 
 /* Skip the whole-file model residency set (TP sharding: only the

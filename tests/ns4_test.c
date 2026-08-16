@@ -98,12 +98,6 @@ static ns4_engine *test_open_engine(bool quality) {
         .quality = quality,
         .ssd_streaming = test_env_bool("NS4_TEST_SSD_STREAMING"),
         .ssd_streaming_cold = test_env_bool("NS4_TEST_SSD_STREAMING_COLD"),
-        .ssd_streaming_cache_experts =
-            test_env_u32("NS4_TEST_SSD_STREAMING_CACHE_EXPERTS"),
-        .ssd_streaming_cache_bytes =
-            test_env_gib("NS4_TEST_SSD_STREAMING_CACHE_GB"),
-        .ssd_streaming_preload_experts =
-            test_env_u32("NS4_TEST_SSD_STREAMING_PRELOAD_EXPERTS"),
         .mtp_path = (mtp && mtp[0] && !quality) ? mtp : NULL,
         .mtp_draft_tokens = (mtp && mtp[0] && !quality) ? 4 : 0,
     };
@@ -1315,12 +1309,6 @@ static void test_official_logprob_vectors(void) {
     test_official_logprob_vectors_run(NULL);
 }
 
-static void test_gpu_ssd_streaming_cache_pressure(void) {
-    fprintf(stderr,
-            "ns4-test: SSD streaming cache-pressure repro skipped "
-            "(Metal-only)\n");
-}
-
 static void test_logits_topk(const float *logits, int n, int *out, int k);
 static bool test_topk_contains(const int *top, int k, int id);
 
@@ -2321,12 +2309,6 @@ static ns4_engine *test_open_dspark_engine(const char *support_path) {
         .quality = false,
         .ssd_streaming = test_env_bool("NS4_TEST_SSD_STREAMING"),
         .ssd_streaming_cold = test_env_bool("NS4_TEST_SSD_STREAMING_COLD"),
-        .ssd_streaming_cache_experts =
-            test_env_u32("NS4_TEST_SSD_STREAMING_CACHE_EXPERTS"),
-        .ssd_streaming_cache_bytes =
-            test_env_gib("NS4_TEST_SSD_STREAMING_CACHE_GB"),
-        .ssd_streaming_preload_experts =
-            test_env_u32("NS4_TEST_SSD_STREAMING_PRELOAD_EXPERTS"),
         .mtp_path = support_path,
         .mtp_draft_tokens = 0,
         .dspark = true,
@@ -2460,7 +2442,6 @@ static const ns4_test_entry test_entries[] = {
     {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
     {"--think-tool-recovery", "think-tool-recovery", "recover a complete tool call emitted inside unclosed reasoning", test_think_tool_recovery},
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison on the standard graph path", test_official_logprob_vectors},
-    {"--ssd-streaming-cache-pressure", "ssd-streaming-cache-pressure", "SSD-streaming layer-batched decode cache-pressure repro for issue #384", test_gpu_ssd_streaming_cache_pressure},
     {"--local-golden-vectors", "local-golden-vectors", "local top-k/logit drift regression for long prefill", test_local_golden_vectors},
     {"--short-prefill", "short-prefill", "ratio-4 short prefill regression", test_gpu_short_prefill_ratio4},
     {"--kernels", "kernels", "isolated GPU kernel numeric regressions", test_gpu_kernel_group},
@@ -2490,8 +2471,6 @@ static void test_print_help(const char *prog) {
     puts("\nEnvironment:");
     puts("  NS4_TEST_MODEL=FILE        Model path. Default: ns4flash.gguf");
     puts("  NS4_TEST_SSD_STREAMING=1   Run model tests through SSD streaming.");
-    puts("  NS4_TEST_SSD_STREAMING_CACHE_GB=N  Streaming routed expert cache in GiB.");
-    puts("  NS4_TEST_SSD_STREAMING_CACHE_EXPERTS=N  Streaming routed expert cache count.");
     puts("  NS4_TEST_SSD_STREAMING_COLD=1  Skip streaming hot expert preload.");
     puts("  NS4_CUDA_DISABLE_STREAMING_COLD_DECODE_PREFILL=1  Force canonical streamed cold prefill.");
     puts("  NS4_TEST_LONG_PROMPT=FILE  Rendered long-context story fact prompt.");

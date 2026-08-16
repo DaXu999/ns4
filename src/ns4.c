@@ -951,8 +951,6 @@ static int ns4_expert_hotlist_sort_cmp(const void *a, const void *b) {
     return 0;
 }
 
-#include "ns4_streaming_hotlist.inc"
-
 static void ns4_json_write_string(FILE *fp, const char *s) {
     fputc('"', fp);
     if (s) {
@@ -4011,69 +4009,6 @@ static bool ns4_streaming_routed_expert_bytes(
     return true;
 }
 
-enum { NS4_STREAMING_PREFILL_HEADROOM_LAYERS = 2 };
-
-static bool ns4_streaming_cacheable_expert_count(
-        const ns4_weights *weights,
-        uint64_t          *experts_out,
-        uint32_t          *layers_out) {
-    if (experts_out) *experts_out = 0;
-    if (layers_out) *layers_out = 0;
-    if (!weights || !experts_out || NS4_N_EXPERT == 0) return false;
-
-    uint64_t slab_bytes = 0;
-    if (!ns4_streaming_routed_expert_bytes(weights, &slab_bytes)) return false;
-
-    uint32_t layers = 0;
-    for (uint32_t il = 0; il < NS4_N_LAYER; il++) {
-        uint64_t per_expert_bytes = 0;
-        if (!streaming_layer_routed_expert_bytes(&weights->layer[il],
-                                                 &per_expert_bytes)) {
-            continue;
-        }
-        if (per_expert_bytes == slab_bytes) layers++;
-    }
-
-    if (layers == 0 ||
-        (uint64_t)layers > UINT64_MAX / (uint64_t)NS4_N_EXPERT) {
-        return false;
-    }
-    *experts_out = (uint64_t)layers * (uint64_t)NS4_N_EXPERT;
-    if (layers_out) *layers_out = layers;
-    return true;
-}
-
-static bool ns4_streaming_prefill_headroom_bytes(
-        const ns4_weights *weights,
-        uint64_t          *bytes_out) {
-    if (bytes_out) *bytes_out = 0;
-    if (!weights || !bytes_out) return false;
-
-    uint64_t per_expert_bytes = 0;
-    uint64_t cacheable_experts = 0;
-    uint32_t cacheable_layers = 0;
-    if (!ns4_streaming_routed_expert_bytes(weights, &per_expert_bytes) ||
-        !ns4_streaming_cacheable_expert_count(weights,
-                                              &cacheable_experts,
-                                              &cacheable_layers)) {
-        return false;
-    }
-    (void)cacheable_experts;
-    const uint32_t reserve_layers =
-        cacheable_layers < NS4_STREAMING_PREFILL_HEADROOM_LAYERS ?
-        cacheable_layers : NS4_STREAMING_PREFILL_HEADROOM_LAYERS;
-    if (per_expert_bytes > UINT64_MAX / (uint64_t)NS4_N_EXPERT) {
-        return false;
-    }
-    const uint64_t layer_bytes =
-        per_expert_bytes * (uint64_t)NS4_N_EXPERT;
-    if (reserve_layers != 0 &&
-        layer_bytes > UINT64_MAX / (uint64_t)reserve_layers) return false;
-
-    *bytes_out = layer_bytes * (uint64_t)reserve_layers;
-    return true;
-}
-
 /*
  * Mixed-precision ("boosted") GGUFs upcast a few layers' routed experts to a
  * bigger quant (e.g. Q4_K among IQ2 layers). The streaming expert cache is a
@@ -4082,7 +4017,7 @@ static bool ns4_streaming_prefill_headroom_bytes(
  * expert weights through the mapped-model views instead. A layer is "uniform"
  * iff its per-expert bytes match the slab class.
  */
-static NS4_MAYBE_UNUSED bool weights_streaming_layer_experts_uniform(
+static bool weights_streaming_layer_experts_uniform(
         const ns4_weights *w,
         uint32_t           il) {
     uint64_t base = 0;
@@ -4092,21 +4027,6 @@ static NS4_MAYBE_UNUSED bool weights_streaming_layer_experts_uniform(
     if (!streaming_layer_routed_expert_bytes(l, &bytes)) return true;
     if (!ns4_streaming_routed_expert_bytes(w, &base)) return true;
     return bytes == base;
-}
-
-static uint32_t ns4_streaming_cache_experts_for_byte_budget(
-        const ns4_weights *weights,
-        uint64_t           bytes,
-        uint64_t          *per_expert_bytes_out) {
-    uint64_t per_expert_bytes = 0;
-    if (per_expert_bytes_out) *per_expert_bytes_out = 0;
-    if (!weights ||
-        bytes == 0 ||
-        !ns4_streaming_routed_expert_bytes(weights, &per_expert_bytes)) {
-        return 0;
-    }
-    if (per_expert_bytes_out) *per_expert_bytes_out = per_expert_bytes;
-    return ns4_ssd_cache_experts_for_byte_budget(bytes, per_expert_bytes);
 }
 
 #ifndef NS4_NO_GPU
@@ -4131,44 +4051,6 @@ static ns4_gpu_stream_expert_table graph_stream_expert_table_make(
     return table;
 }
 #endif
-
-static uint64_t ns4_streaming_manual_cache_safe_bytes(
-        ns4_backend backend,
-        int         ctx_size,
-        uint32_t    prefill_chunk,
-        bool        ssd_streaming) {
-#ifdef NS4_NO_GPU
-    (void)backend;
-    (void)ctx_size;
-    (void)prefill_chunk;
-    (void)ssd_streaming;
-    return 0;
-#else
-    const uint64_t gib = 1024ull * 1024ull * 1024ull;
-    const uint64_t recommended = ns4_gpu_recommended_working_set_size();
-    if (recommended == 0) return 0;
-
-    /*
-     * Explicit NGB budgets name only the routed expert cache. Keep that cache
-     * below the graph backend's working-set recommendation after accounting for
-     * the graph context/KV buffers. This is intentionally not an mlock-derived
-     * cap: crossing too close to the recommended working set makes short
-     * token-major prefill spend most of its time in VM/driver synchronization.
-     */
-    uint64_t target = recommended > UINT64_MAX / 7ull ?
-        UINT64_MAX : (recommended * 7ull) / 8ull;
-    const ns4_context_memory ctx_mem =
-        ns4_context_memory_estimate_with_prefill_mode(backend,
-                                                      ctx_size,
-                                                      prefill_chunk,
-                                                      ssd_streaming);
-    uint64_t safe = 0;
-    if (target > ctx_mem.total_bytes) safe = target - ctx_mem.total_bytes;
-    safe = (safe / gib) * gib;
-    if (safe == 0) safe = gib;
-    return safe;
-#endif
-}
 
 static uint64_t ns4_add_sat_u64(uint64_t a, uint64_t b) {
     return a > UINT64_MAX - b ? UINT64_MAX : a + b;
@@ -5507,26 +5389,6 @@ static NS4_MAYBE_UNUSED uint64_t model_map_span_vec_total_bytes(
         total += bytes;
     }
     return total;
-}
-
-static NS4_MAYBE_UNUSED bool weights_streaming_non_routed_bytes(
-        const ns4_weights *w,
-        uint64_t          *bytes_out) {
-    if (bytes_out) *bytes_out = 0;
-    if (!w || !bytes_out) return false;
-
-    ns4_model_map_span_vec spans;
-    const bool include_token =
-        weights_layer_has_required(&w->layer[0], 0);
-    if (!weights_model_map_decode_static_spans(w,
-                                               include_token,
-                                               weights_have_output_head(w),
-                                               &spans)) {
-        return false;
-    }
-    *bytes_out = model_map_span_vec_total_bytes(&spans);
-    free(spans.v);
-    return true;
 }
 
 static NS4_MAYBE_UNUSED bool weights_model_map_token_spans(
@@ -13410,7 +13272,6 @@ typedef struct {
     uint32_t prefill_selected_profile_layers;
     uint32_t prefill_selected_profile_min_unique;
     uint32_t prefill_selected_profile_max_unique;
-    uint32_t streaming_preload_experts;
     bool ssd_streaming_cold;
     bool streaming_static_decode_map_current;
     float *cpu_router_norm;
@@ -15736,82 +15597,6 @@ static bool metal_graph_stream_prefill_layer_madvise_enabled(
            !graph_env_present("NS4_CUDA_DISABLE_STREAMING_PREFILL_LAYER_MADVISE");
 }
 
-static uint32_t metal_graph_stream_prefill_batch_selected_addr_auto_max(void) {
-    const char *env = graph_env_value("NS4_CUDA_STREAMING_PREFILL_BATCH_SELECTED_ADDR_MAX");
-    if (env && env[0]) {
-        char *end = NULL;
-        const long v = strtol(env, &end, 10);
-        if (end != env) {
-            if (v <= 0) return 0;
-            if ((unsigned long)v > (unsigned long)UINT32_MAX) return UINT32_MAX;
-            return (uint32_t)v;
-        }
-    }
-    if (NS4_MODEL_VARIANT == NS4_VARIANT_PRO) return 800u;
-    if (NS4_MODEL_VARIANT == NS4_VARIANT_FLASH) return 760u;
-    return 0;
-}
-
-static uint32_t metal_graph_stream_prefill_batch_selected_addr_auto_min(void) {
-    const char *env = graph_env_value("NS4_CUDA_STREAMING_PREFILL_BATCH_SELECTED_ADDR_MIN");
-    if (env && env[0]) {
-        char *end = NULL;
-        const long v = strtol(env, &end, 10);
-        if (end != env) {
-            if (v <= 0) return 0;
-            if ((unsigned long)v > (unsigned long)UINT32_MAX) return UINT32_MAX;
-            return (uint32_t)v;
-        }
-    }
-    if (NS4_MODEL_VARIANT == NS4_VARIANT_PRO ||
-        NS4_MODEL_VARIANT == NS4_VARIANT_FLASH) return 2u;
-    return 0;
-}
-
-static bool metal_graph_stream_prefill_batch_selected_addr_enabled(
-        const ns4_gpu_graph *g,
-        const ns4_weights   *weights,
-        uint32_t             n_tokens) {
-    if (!g ||
-        !g->ssd_streaming ||
-        g->quality ||
-        !weights ||
-        n_tokens <= 1 ||
-        graph_env_present("NS4_CUDA_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") ||
-        graph_env_present("NS4_CUDA_DISABLE_STREAMING_EXPERT_ADDR_TABLE") ||
-        graph_env_present("NS4_CUDA_MOE_WRITE_CLAMPED_ACT") ||
-        graph_env_present("NS4_CUDA_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") ||
-        NS4_N_LAYER == 0) {
-        return false;
-    }
-    const ns4_layer_weights *layer = &weights->layer[0];
-    if (!layer->ffn_gate_exps || !layer->ffn_up_exps || !layer->ffn_down_exps) {
-        return false;
-    }
-    if (NS4_N_EXPERT_USED != 6 ||
-        layer->ffn_gate_exps->type != NS4_TENSOR_IQ2_XXS ||
-        layer->ffn_up_exps->type != NS4_TENSOR_IQ2_XXS ||
-        layer->ffn_down_exps->type != NS4_TENSOR_Q2_K) {
-        return false;
-    }
-
-    const uint32_t cache_configured =
-        ns4_gpu_stream_expert_cache_configured_count();
-    if (cache_configured < NS4_N_EXPERT) {
-        return false;
-    }
-
-    if (graph_env_present("NS4_CUDA_ENABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR")) {
-        return true;
-    }
-
-    const uint32_t max_tokens =
-        metal_graph_stream_prefill_batch_selected_addr_auto_max();
-    const uint32_t min_tokens =
-        metal_graph_stream_prefill_batch_selected_addr_auto_min();
-    return max_tokens != 0 && n_tokens >= min_tokens && n_tokens <= max_tokens;
-}
-
 static bool metal_graph_cuda_stream_prefill_batch_selected_addr_enabled(
         const ns4_gpu_graph *g,
         const ns4_weights   *weights,
@@ -17838,11 +17623,7 @@ static bool metal_graph_use_cuda_selected_shared_overlap(const ns4_gpu_graph *g)
 
 static bool metal_graph_q4_non_streaming_opt_in_enabled(void) {
     return getenv("NS4_CUDA_ENABLE_Q4_SELECTED_EXPERT_VIEWS") != NULL ||
-           getenv("NS4_CUDA_ENABLE_PRO_Q4_SELECTED_EXPERT_VIEWS") != NULL ||
-           getenv("NS4_CUDA_ENABLE_Q4_EXPERT_TABLE") != NULL ||
-           getenv("NS4_CUDA_ENABLE_Q4_EXPERT_ADDRESS_TABLE") != NULL ||
-           getenv("NS4_CUDA_ENABLE_PRO_Q4_EXPERT_TABLE_AUTO") != NULL ||
-           getenv("NS4_CUDA_ENABLE_PRO_Q4_EXPERT_ADDRESS_AUTO") != NULL;
+           getenv("NS4_CUDA_ENABLE_PRO_Q4_SELECTED_EXPERT_VIEWS") != NULL;
 }
 
 static bool metal_graph_q4_selected_paths_allowed(const ns4_gpu_graph *g) {
@@ -17871,22 +17652,6 @@ static bool metal_graph_use_iq2_selected_async_early_commit(
            getenv("NS4_CUDA_DISABLE_STREAMING_SELECTED_ASYNC_EARLY_COMMIT") == NULL;
 }
 
-static bool metal_graph_use_pro_q4_expert_table_auto(const ns4_gpu_graph *g) {
-    if (getenv("NS4_CUDA_DISABLE_PRO_Q4_EXPERT_TABLE_AUTO") != NULL ||
-        getenv("NS4_CUDA_DISABLE_Q4_EXPERT_TABLE") != NULL) {
-        return false;
-    }
-    if (!g || (!g->ssd_streaming &&
-               getenv("NS4_CUDA_ENABLE_PRO_Q4_EXPERT_TABLE_AUTO") == NULL)) {
-        return false;
-    }
-#ifndef NS4_NO_GPU
-    return ns4_gpu_pro_q4_expert_table_auto_available() != 0;
-#else
-    return false;
-#endif
-}
-
 static bool metal_graph_decode_cpu_router_applicable(
         const ns4_gpu_graph     *g,
         const ns4_layer_weights *layer) {
@@ -17913,40 +17678,11 @@ static bool metal_graph_decode_cpu_router_applicable(
     return pro_q4 || streaming_iq2;
 }
 
-static bool metal_graph_decode_pro_q4_expert_table_expected(
-        const ns4_gpu_graph     *g,
-        const ns4_layer_weights *layer,
-        uint64_t                 gate_tensor_bytes,
-        uint64_t                 down_tensor_bytes) {
-    const uint64_t q4_selected_min_tensor_bytes = 2ull * 1024ull * 1024ull * 1024ull;
-    return !g->quality &&
-           NS4_MODEL_VARIANT == NS4_VARIANT_PRO &&
-           metal_graph_q4_selected_paths_allowed(g) &&
-           layer->ffn_gate_exps->type == NS4_TENSOR_Q4_K &&
-           layer->ffn_up_exps->type == NS4_TENSOR_Q4_K &&
-           layer->ffn_down_exps->type == NS4_TENSOR_Q4_K &&
-           NS4_N_EXPERT == 384 &&
-           NS4_N_EXPERT_USED == 6 &&
-           gate_tensor_bytes >= q4_selected_min_tensor_bytes &&
-           down_tensor_bytes >= q4_selected_min_tensor_bytes &&
-           !graph_env_present("NS4_CUDA_MOE_WRITE_CLAMPED_ACT") &&
-           !graph_env_present("NS4_CUDA_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") &&
-           (metal_graph_use_pro_q4_expert_table_auto(g) ||
-            getenv("NS4_CUDA_ENABLE_Q4_EXPERT_TABLE") != NULL) &&
-           getenv("NS4_CUDA_DISABLE_PRO_Q4_EXPERT_TABLE_AUTO") == NULL &&
-           getenv("NS4_CUDA_DISABLE_Q4_EXPERT_TABLE") == NULL;
-}
-
 static bool metal_graph_decode_q4_selected_slots_expected(
         const ns4_gpu_graph     *g,
         const ns4_layer_weights *layer,
         uint64_t                 gate_tensor_bytes,
         uint64_t                 down_tensor_bytes) {
-    if (metal_graph_decode_pro_q4_expert_table_expected(g, layer,
-                                                        gate_tensor_bytes,
-                                                        down_tensor_bytes)) {
-        return false;
-    }
     const uint64_t q4_selected_min_tensor_bytes = 2ull * 1024ull * 1024ull * 1024ull;
     return !g->quality &&
            metal_graph_q4_selected_paths_allowed(g) &&
@@ -18076,192 +17812,6 @@ static uint32_t metal_graph_streaming_prefill_cache_seed_k(const ns4_gpu_graph *
 
 static bool metal_graph_streaming_prefill_cache_seed_enabled(const ns4_gpu_graph *g) {
     return metal_graph_streaming_prefill_cache_seed_k(g) != 0;
-}
-
-static bool metal_graph_streaming_expert_hotlist_enabled(const ns4_gpu_graph *g) {
-    return g &&
-           g->ssd_streaming &&
-           !g->ssd_streaming_cold &&
-           !graph_env_present("NS4_CUDA_DISABLE_STREAMING_EXPERT_HOTLIST");
-}
-
-static bool metal_graph_streaming_expert_hotlist_add(
-        uint32_t    layer,
-        uint32_t    expert,
-        uint32_t    priority,
-        int32_t     experts[NS4_MAX_LAYER][NS4_MAX_EXPERT],
-        uint32_t    priorities[NS4_MAX_LAYER][NS4_MAX_EXPERT],
-        uint32_t    counts[NS4_MAX_LAYER],
-        bool        seen[NS4_MAX_LAYER][NS4_MAX_EXPERT],
-        uint32_t   *loaded) {
-    if (layer >= NS4_N_LAYER || expert >= NS4_N_EXPERT) return true;
-    if (layer >= NS4_MAX_LAYER || expert >= NS4_MAX_EXPERT) return true;
-    if (seen[layer][expert]) return true;
-    if (counts[layer] >= NS4_MAX_EXPERT) return false;
-    seen[layer][expert] = true;
-    if (priority == 0) priority = 1;
-    priorities[layer][counts[layer]] = priority;
-    experts[layer][counts[layer]++] = (int32_t)expert;
-    (*loaded)++;
-    return true;
-}
-
-static bool metal_graph_streaming_expert_hotlist_load_file(
-        const char *path,
-        uint32_t    max_entries,
-        int32_t     experts[NS4_MAX_LAYER][NS4_MAX_EXPERT],
-        uint32_t    priorities[NS4_MAX_LAYER][NS4_MAX_EXPERT],
-        uint32_t    counts[NS4_MAX_LAYER],
-        bool        seen[NS4_MAX_LAYER][NS4_MAX_EXPERT],
-        uint32_t   *loaded_out) {
-    if (!path || !path[0] || max_entries == 0 ||
-        !experts || !priorities || !counts || !seen || !loaded_out) {
-        return false;
-    }
-    FILE *fp = fopen(path, "rb");
-    if (!fp) {
-        fprintf(stderr,
-                "ns4: failed to open streaming expert hotlist %s: %s\n",
-                path,
-                strerror(errno));
-        return false;
-    }
-
-    char line[256];
-    uint64_t lineno = 0;
-    uint32_t loaded = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        if (loaded >= max_entries) break;
-        lineno++;
-        char *p = line;
-        while (*p && isspace((unsigned char)*p)) p++;
-        if (*p == '\0' || *p == '#') continue;
-
-        errno = 0;
-        char *end = NULL;
-        unsigned long layer = strtoul(p, &end, 10);
-        if (end == p || errno != 0) goto bad_line;
-        p = end;
-        while (*p && isspace((unsigned char)*p)) p++;
-
-        errno = 0;
-        unsigned long expert = strtoul(p, &end, 10);
-        if (end == p || errno != 0) goto bad_line;
-        p = end;
-        while (*p && isspace((unsigned char)*p)) p++;
-
-        errno = 0;
-        unsigned long long hits = strtoull(p, &end, 10);
-        if (end == p || errno != 0) goto bad_line;
-        if (hits == 0) continue;
-        const uint32_t priority =
-            hits > UINT32_MAX ? UINT32_MAX : (uint32_t)hits;
-        if (!metal_graph_streaming_expert_hotlist_add((uint32_t)layer,
-                                                      (uint32_t)expert,
-                                                      priority,
-                                                      experts,
-                                                      priorities,
-                                                      counts,
-                                                      seen,
-                                                      &loaded)) {
-            goto bad_line;
-        }
-        continue;
-
-bad_line:
-        fprintf(stderr,
-                "ns4: invalid streaming expert hotlist line %" PRIu64 " in %s\n",
-                lineno,
-                path);
-        fclose(fp);
-        return false;
-    }
-    if (ferror(fp)) {
-        fprintf(stderr,
-                "ns4: failed to read streaming expert hotlist %s: %s\n",
-                path,
-                strerror(errno));
-        fclose(fp);
-        return false;
-    }
-    fclose(fp);
-
-    if (loaded == 0) {
-        fprintf(stderr, "ns4: streaming expert hotlist %s had no usable nonzero entries\n", path);
-    }
-    *loaded_out = loaded;
-    return true;
-}
-
-static bool metal_graph_streaming_expert_hotlist_load_default(
-        uint32_t    max_entries,
-        int32_t     experts[NS4_MAX_LAYER][NS4_MAX_EXPERT],
-        uint32_t    priorities[NS4_MAX_LAYER][NS4_MAX_EXPERT],
-        uint32_t    counts[NS4_MAX_LAYER],
-        bool        seen[NS4_MAX_LAYER][NS4_MAX_EXPERT],
-        uint32_t   *loaded_out) {
-    if (max_entries == 0 || !experts || !priorities || !counts || !seen || !loaded_out) {
-        return false;
-    }
-    const uint16_t (*hotlist)[2] = NULL;
-    uint32_t hotlist_count = 0;
-    if (g_ns4_shape.variant == NS4_VARIANT_PRO) {
-        hotlist = ns4_default_streaming_hotlist_pro;
-        hotlist_count = ns4_default_streaming_hotlist_pro_count;
-    } else if (g_ns4_shape.variant == NS4_VARIANT_FLASH) {
-        hotlist = ns4_default_streaming_hotlist_flash;
-        hotlist_count = ns4_default_streaming_hotlist_flash_count;
-    } else {
-        *loaded_out = 0;
-        return true;
-    }
-    uint32_t loaded = 0;
-    for (uint32_t i = 0;
-         i < hotlist_count && loaded < max_entries;
-         i++) {
-        if (!metal_graph_streaming_expert_hotlist_add(
-                hotlist[i][0],
-                hotlist[i][1],
-                max_entries - loaded,
-                experts,
-                priorities,
-                counts,
-                seen,
-                &loaded)) {
-            return false;
-        }
-    }
-    *loaded_out = loaded;
-    return true;
-}
-
-static uint32_t metal_graph_streaming_expert_preload_count(
-        const ns4_gpu_graph *g,
-        uint32_t             cache_budget) {
-    if (!g || cache_budget == 0) return 0;
-    uint32_t preload = g->streaming_preload_experts;
-    if (preload == 0) {
-        preload = cache_budget;
-        const char *env = graph_env_value("NS4_CUDA_STREAMING_EXPERT_AUTO_PRELOAD_CAP");
-        /* Auto mode is a hot seed, not a request to synchronously fill the
-         * whole cache. Large Flash caches can otherwise spend startup doing
-         * thousands of preads into shared Metal buffers and trip the system
-         * watchdog before decode begins. Explicit CLI preload counts and
-         * auto-preload env caps bypass the cap. */
-        uint32_t cap = 4096;
-        if (env && env[0]) {
-            char *end = NULL;
-            unsigned long v = strtoul(env, &end, 10);
-            if (end != env && *end == '\0') {
-                cap = v > UINT32_MAX ? UINT32_MAX : (uint32_t)v;
-            }
-        }
-        if (cap != 0 && preload > cap) preload = cap;
-    }
-    if (preload > cache_budget) preload = cache_budget;
-    const uint64_t max_possible = (uint64_t)NS4_N_LAYER * NS4_N_EXPERT;
-    if ((uint64_t)preload > max_possible) preload = (uint32_t)max_possible;
-    return preload;
 }
 
 
@@ -26508,143 +26058,6 @@ static bool metal_graph_seed_streaming_expert_cache_from_prefill(
     return true;
 }
 
-static bool metal_graph_seed_streaming_expert_cache_from_hotlist(
-        ns4_gpu_graph     *g,
-        const ns4_model   *model,
-        const ns4_weights *weights) {
-    if (!metal_graph_streaming_expert_hotlist_enabled(g)) return true;
-    if (!model || !weights) return false;
-
-    uint32_t cache_budget = 0;
-    for (uint32_t il = 0; il < NS4_N_LAYER; il++) {
-        const ns4_layer_weights *layer = &weights->layer[il];
-        if (!metal_graph_streaming_expert_cache_seed_layer_expected(g, layer)) {
-            continue;
-        }
-
-        const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
-        const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
-        if (layer->ffn_gate_exps->dim[1] > UINT64_MAX / gate_row_bytes ||
-            layer->ffn_down_exps->dim[1] > UINT64_MAX / down_row_bytes) {
-            fprintf(stderr, "ns4: streaming expert hotlist budget byte size overflow at layer %u\n", il);
-            return false;
-        }
-        const uint64_t gate_expert_bytes = layer->ffn_gate_exps->dim[1] * gate_row_bytes;
-        const uint64_t down_expert_bytes = layer->ffn_down_exps->dim[1] * down_row_bytes;
-        cache_budget = ns4_gpu_stream_expert_cache_budget_for_expert_size(
-                gate_expert_bytes,
-                down_expert_bytes);
-        break;
-    }
-    if (cache_budget == 0) return true;
-    const uint32_t preload_count =
-        metal_graph_streaming_expert_preload_count(g, cache_budget);
-    if (preload_count == 0) return true;
-    const uint32_t current_count =
-        ns4_gpu_stream_expert_cache_current_count();
-    const char *path = graph_env_value("NS4_CUDA_STREAMING_EXPERT_HOTLIST");
-    const bool from_file = path && path[0];
-    const bool profile =
-        graph_env_present("NS4_CUDA_STREAMING_EXPERT_HOTLIST_PROFILE");
-    if (!from_file && current_count >= preload_count) {
-        if (profile) {
-            fprintf(stderr,
-                    "ns4: streaming expert hotlist seed skipped preload=%u current=%u\n",
-                    preload_count,
-                    current_count);
-        }
-        return true;
-    }
-
-    int32_t experts[NS4_MAX_LAYER][NS4_MAX_EXPERT];
-    uint32_t priorities[NS4_MAX_LAYER][NS4_MAX_EXPERT];
-    uint32_t counts[NS4_MAX_LAYER];
-    bool seen[NS4_MAX_LAYER][NS4_MAX_EXPERT];
-    memset(experts, 0, sizeof(experts));
-    memset(priorities, 0, sizeof(priorities));
-    memset(counts, 0, sizeof(counts));
-    memset(seen, 0, sizeof(seen));
-
-    uint32_t loaded = 0;
-    if (from_file) {
-        if (!metal_graph_streaming_expert_hotlist_load_file(path,
-                                                           preload_count,
-                                                           experts,
-                                                           priorities,
-                                                           counts,
-                                                           seen,
-                                                           &loaded)) {
-            return false;
-        }
-    } else if (!metal_graph_streaming_expert_hotlist_load_default(preload_count,
-                                                                  experts,
-                                                                  priorities,
-                                                                  counts,
-                                                                  seen,
-                                                                  &loaded)) {
-        return false;
-    }
-    if (loaded == 0) return true;
-
-    const double t0 = profile ? now_sec() : 0.0;
-    uint32_t seeded_layers = 0;
-    uint32_t seeded_experts = 0;
-    for (uint32_t il = 0; il < NS4_N_LAYER; il++) {
-        const uint32_t n = counts[il];
-        if (n == 0) continue;
-        const ns4_layer_weights *layer = &weights->layer[il];
-        if (!metal_graph_streaming_expert_cache_seed_layer_expected(g, layer)) {
-            continue;
-        }
-
-        const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
-        const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
-        if (layer->ffn_gate_exps->dim[1] > UINT64_MAX / gate_row_bytes ||
-            layer->ffn_down_exps->dim[1] > UINT64_MAX / down_row_bytes) {
-            fprintf(stderr, "ns4: streaming expert hotlist seed byte size overflow at layer %u\n", il);
-            return false;
-        }
-        const uint64_t gate_expert_bytes = layer->ffn_gate_exps->dim[1] * gate_row_bytes;
-        const uint64_t down_expert_bytes = layer->ffn_down_exps->dim[1] * down_row_bytes;
-        const ns4_gpu_stream_expert_table table =
-            graph_stream_expert_table_make(model,
-                                           layer,
-                                           il,
-                                           gate_expert_bytes,
-                                           down_expert_bytes);
-        if (ns4_gpu_stream_expert_cache_seed_experts(
-                    &table,
-                    experts[il],
-                    priorities[il],
-                    n) == 0) {
-            return false;
-        }
-        seeded_layers++;
-        seeded_experts += n;
-    }
-    if (profile) {
-        const char *source_name = NULL;
-        if (from_file) {
-            source_name = path;
-        } else if (g_ns4_shape.variant == NS4_VARIANT_FLASH) {
-            source_name = "built-in-flash";
-        } else if (g_ns4_shape.variant == NS4_VARIANT_PRO) {
-            source_name = "built-in-pro";
-        } else {
-            source_name = "built-in";
-        }
-        fprintf(stderr,
-                "ns4: streaming expert hotlist seed source=%s preload=%u loaded=%u layers=%u experts=%u time=%.3f ms\n",
-                source_name,
-                preload_count,
-                loaded,
-                seeded_layers,
-                seeded_experts,
-                (now_sec() - t0) * 1000.0);
-    }
-    return true;
-}
-
 typedef struct {
     int id0;
     int id1;
@@ -30025,7 +29438,6 @@ static bool metal_graph_prefill_layer_major(
         layer_prepare && layer_prepare_overlap ?
         metal_graph_stream_prefill_layer_prepare_ahead() : 1u;
     const bool batch_selected_addr =
-        metal_graph_stream_prefill_batch_selected_addr_enabled(g, weights, n_tokens) ||
         metal_graph_cuda_stream_prefill_batch_selected_addr_enabled(g, weights, n_tokens);
     if (g->ssd_streaming && NS4_N_LAYER > 0) {
         const bool layer_selected_addr =
@@ -30339,9 +29751,6 @@ static bool metal_graph_prefill_layer_major(
     }
     if (show_progress) fputc('\n', stderr);
     metal_graph_stream_prefill_selected_profile_summary(g);
-    if (!metal_graph_seed_streaming_expert_cache_from_hotlist(g, model, weights)) {
-        return false;
-    }
     if (!metal_graph_seed_streaming_expert_cache_from_prefill(g, model, weights)) {
         return false;
     }
@@ -31643,10 +31052,6 @@ struct ns4_engine {
     float directional_steering_ffn_scale;
     int power_percent;
     uint32_t prefill_chunk;
-    uint32_t ssd_streaming_cache_experts;
-    uint64_t ssd_streaming_cache_bytes;
-    uint64_t ssd_streaming_prefill_headroom_bytes;
-    uint32_t ssd_streaming_preload_experts;
     uint64_t startup_model_span_bytes;
     ns4_ssd_memory_lock simulated_memory;
     bool quality;
@@ -31682,25 +31087,6 @@ struct ns4_engine {
     int            placement_ctx_hint;
 };
 
-static uint64_t ns4_engine_dynamic_expert_cache_bytes(
-        const ns4_engine *e) {
-    if (!e || !e->ssd_streaming) return 0;
-    if (e->ssd_streaming_cache_bytes != 0) {
-        return e->ssd_streaming_cache_bytes;
-    }
-    if (e->ssd_streaming_cache_experts == 0) return 0;
-
-    uint64_t per_expert_bytes = 0;
-    if (!ns4_streaming_routed_expert_bytes(&e->weights,
-                                           &per_expert_bytes)) {
-        return 0;
-    }
-    if (e->ssd_streaming_cache_experts > UINT64_MAX / per_expert_bytes) {
-        return UINT64_MAX;
-    }
-    return (uint64_t)e->ssd_streaming_cache_experts * per_expert_bytes;
-}
-
 static void ns4_engine_print_startup_memory(
         const ns4_engine *e,
         int               ctx_size) {
@@ -31713,15 +31099,9 @@ static void ns4_engine_print_startup_memory(
                                                       e->ssd_streaming);
     const uint64_t kv_bytes =
         ns4_add_sat_u64(mem.raw_bytes, mem.compressed_bytes);
-    const uint64_t dynamic_expert_cache_bytes =
-        ns4_engine_dynamic_expert_cache_bytes(e);
-    const uint64_t expert_reserved_bytes =
-        e->ssd_streaming_prefill_headroom_bytes;
     uint64_t total = kv_bytes;
     total = ns4_add_sat_u64(total, mem.scratch_bytes);
     total = ns4_add_sat_u64(total, e->startup_model_span_bytes);
-    total = ns4_add_sat_u64(total, dynamic_expert_cache_bytes);
-    total = ns4_add_sat_u64(total, expert_reserved_bytes);
 
     const bool color = ns4_log_is_tty(stderr);
     const char *green = color ? "\x1b[32m" : "";
@@ -31737,16 +31117,6 @@ static void ns4_engine_print_startup_memory(
             ns4_bytes_to_gib(mem.compressed_bytes),
             ns4_bytes_to_gib(mem.scratch_bytes),
             ns4_bytes_to_gib(e->startup_model_span_bytes));
-    if (dynamic_expert_cache_bytes != 0) {
-        fprintf(stderr,
-                " + expert cache %.2f GiB",
-                ns4_bytes_to_gib(dynamic_expert_cache_bytes));
-    }
-    if (expert_reserved_bytes != 0) {
-        fprintf(stderr,
-                " + prefill expert reserve %.2f GiB",
-                ns4_bytes_to_gib(expert_reserved_bytes));
-    }
     fprintf(stderr,
             " = %s%.2f GiB planned%s\n",
             bright_green,
@@ -33167,7 +32537,6 @@ static int generate_metal_graph_raw_swa(
         bool                quality,
         bool                ssd_streaming,
         bool                ssd_streaming_cold,
-        uint32_t            ssd_streaming_preload_experts,
         int                 power_percent,
         uint32_t            prefill_chunk,
         const char        * directional_steering_file,
@@ -33205,7 +32574,6 @@ static int generate_metal_graph_raw_swa(
     g.quality = quality;
     g.ssd_streaming = ssd_streaming;
     g.ssd_streaming_cold = ssd_streaming_cold;
-    g.streaming_preload_experts = ssd_streaming_preload_experts;
     g.power_percent = power_percent > 0 ? (uint32_t)power_percent : 100u;
     if (!metal_graph_load_directional_steering(&g,
                                                directional_steering_file,
@@ -36198,7 +35566,6 @@ int ns4_engine_collect_imatrix(ns4_engine *e,
     g.quality = e->quality;
     g.ssd_streaming = e->ssd_streaming;
     g.ssd_streaming_cold = e->ssd_streaming_cold;
-    g.streaming_preload_experts = e->ssd_streaming_preload_experts;
     g.power_percent = (uint32_t)e->power_percent;
 
     ns4_imatrix_collector collector;
@@ -37029,7 +36396,6 @@ int ns4_engine_generate_argmax(
                                             n_predict, ctx_size, e->quality,
                                             e->ssd_streaming,
                                             e->ssd_streaming_cold,
-                                            e->ssd_streaming_preload_experts,
                                             e->power_percent,
                                             e->prefill_chunk,
                                             e->directional_steering_file,
@@ -37242,103 +36608,6 @@ int ns4_engine_first_token_test(ns4_engine *e, const ns4_tokens *prompt) {
     free(logits);
     free(hc);
     return 0;
-}
-
-static bool ns4_engine_configure_streaming_cache_budget(ns4_engine *e) {
-#ifdef NS4_NO_GPU
-    (void)e;
-    return true;
-#else
-    if (!e || !e->ssd_streaming) return true;
-
-    uint64_t per_expert_bytes = 0;
-    const bool need_expert_bytes =
-        e->ssd_streaming_cache_experts != 0 ||
-        e->ssd_streaming_cache_bytes != 0;
-    if (need_expert_bytes &&
-        !ns4_streaming_routed_expert_bytes(&e->weights,
-                                           &per_expert_bytes)) {
-        fprintf(stderr,
-                "ns4: SSD streaming could not measure routed expert size\n");
-        return false;
-    }
-    uint64_t max_cache_experts_u64 = 0;
-    if (need_expert_bytes &&
-        !ns4_streaming_cacheable_expert_count(&e->weights,
-                                              &max_cache_experts_u64,
-                                              NULL)) {
-        fprintf(stderr,
-                "ns4: SSD streaming could not count local cacheable experts\n");
-        return false;
-    }
-    const uint32_t max_cache_experts = max_cache_experts_u64 > UINT32_MAX ?
-        UINT32_MAX : (uint32_t)max_cache_experts_u64;
-    if (e->ssd_streaming_cache_bytes == 0 &&
-        max_cache_experts != 0 &&
-        e->ssd_streaming_cache_experts > max_cache_experts) {
-        fprintf(stderr,
-                "ns4: SSD streaming expert cache capped from %u to %u "
-                "experts cacheable by this layer slice\n",
-                e->ssd_streaming_cache_experts,
-                max_cache_experts);
-        e->ssd_streaming_cache_experts = max_cache_experts;
-    }
-
-    uint64_t total_cache_bytes = e->ssd_streaming_cache_bytes;
-    uint64_t prefill_headroom_bytes = 0;
-    uint64_t budget_after_prefill_headroom = total_cache_bytes;
-    if (total_cache_bytes != 0) {
-        if (!ns4_streaming_prefill_headroom_bytes(&e->weights,
-                                                  &prefill_headroom_bytes)) {
-            fprintf(stderr,
-                    "ns4: SSD streaming prefill headroom byte accounting failed\n");
-            return false;
-        }
-        if (prefill_headroom_bytes >= total_cache_bytes) {
-            fprintf(stderr,
-                    "ns4: --ssd-streaming-cache-experts byte budget %.2f GiB "
-                    "is too small: routed prefill headroom needs %.2f GiB\n",
-                    (double)total_cache_bytes / 1073741824.0,
-                    (double)prefill_headroom_bytes / 1073741824.0);
-            return false;
-        }
-        budget_after_prefill_headroom =
-            total_cache_bytes - prefill_headroom_bytes;
-    }
-    e->ssd_streaming_prefill_headroom_bytes = prefill_headroom_bytes;
-    if (total_cache_bytes != 0) {
-        const uint64_t dynamic_cache_bytes = budget_after_prefill_headroom;
-        uint64_t budget_expert_bytes = 0;
-        uint32_t budget =
-            ns4_streaming_cache_experts_for_byte_budget(
-                    &e->weights,
-                    dynamic_cache_bytes,
-                    &budget_expert_bytes);
-        if (max_cache_experts != 0 && budget > max_cache_experts) {
-            budget = max_cache_experts;
-        }
-        if (budget == 0 || budget_expert_bytes == 0) {
-            fprintf(stderr,
-                    "ns4: --ssd-streaming-cache-experts byte budget is too small or invalid for this model\n");
-            return false;
-        }
-        e->ssd_streaming_cache_experts = budget;
-        e->ssd_streaming_cache_bytes =
-            (uint64_t)budget * budget_expert_bytes;
-
-        fprintf(stderr,
-                "ns4: %s SSD streaming total expert budget %.2f GiB = "
-                "%.2f GiB prefill headroom + %.2f GiB dynamic cache "
-                "(%u experts, %.2f MiB each)\n",
-                ns4_backend_name(e->backend),
-                (double)total_cache_bytes / 1073741824.0,
-                (double)prefill_headroom_bytes / 1073741824.0,
-                (double)e->ssd_streaming_cache_bytes / 1073741824.0,
-                budget,
-                (double)budget_expert_bytes / 1048576.0);
-    }
-    return true;
-#endif
 }
 
 /* =========================================================================
@@ -38531,9 +37800,6 @@ static int ns4_engine_open_internal(ns4_engine **out,
     e->prefill_chunk =
         ns4_effective_prefill_chunk(opt->cuda_tensor_parallel,
                                     opt->prefill_chunk);
-    e->ssd_streaming_cache_experts = opt->ssd_streaming_cache_experts;
-    e->ssd_streaming_cache_bytes = opt->ssd_streaming_cache_bytes;
-    e->ssd_streaming_preload_experts = opt->ssd_streaming_preload_experts;
     if (e->power_percent > 100) e->power_percent = 100;
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
     if (e->mtp_draft_tokens > 16) e->mtp_draft_tokens = 16;
@@ -38654,24 +37920,6 @@ static int ns4_engine_open_internal(ns4_engine **out,
 
     if (!opt->inspect_only) {
         vocab_load(&e->vocab, &e->model);
-    }
-    if (e->ssd_streaming && e->ssd_streaming_cache_bytes != 0) {
-        const uint64_t requested_cache_bytes = e->ssd_streaming_cache_bytes;
-        const uint64_t safe_cache_bytes =
-            ns4_streaming_manual_cache_safe_bytes(e->backend,
-                                                  opt->context_size,
-                                                  e->prefill_chunk,
-                                                  e->ssd_streaming);
-        if (safe_cache_bytes != 0 &&
-            e->ssd_streaming_cache_bytes > safe_cache_bytes) {
-            e->ssd_streaming_cache_bytes = safe_cache_bytes;
-            fprintf(stderr,
-                    "ns4: %s SSD streaming cache budget %.2f GiB capped to %.2f GiB "
-                    "to stay below the graph working-set pressure budget\n",
-                    ns4_backend_name(e->backend),
-                    (double)requested_cache_bytes / 1073741824.0,
-                    (double)e->ssd_streaming_cache_bytes / 1073741824.0);
-        }
     }
     if (opt->inspect_only) {
         if (opt->mtp_path && opt->mtp_path[0] &&
@@ -38877,22 +38125,13 @@ static int ns4_engine_open_internal(ns4_engine **out,
         }
         ns4_gpu_set_quality(e->quality);
         ns4_gpu_set_ssd_streaming(e->ssd_streaming);
-        if (!ns4_engine_configure_streaming_cache_budget(e)) {
-            ns4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
-        ns4_gpu_set_streaming_expert_cache_budget(e->ssd_streaming_cache_experts);
         if (e->ssd_streaming) {
-            /*
-             * Pin the expert cache's slab size class to the model's uniform
-             * per-expert bytes, and count mixed-precision (boosted) layers:
-             * those are served through mapped model views instead of the
-             * cache (see weights_streaming_layer_experts_uniform).
-             */
+            /* Count mixed-precision (boosted) layers: their routed experts are
+             * off the dominant per-expert size class and are served through
+             * mapped model views instead of the selected-expert cache (see
+             * weights_streaming_layer_experts_uniform). */
             uint64_t slab_expert_bytes = 0;
             if (ns4_streaming_routed_expert_bytes(&e->weights, &slab_expert_bytes)) {
-                ns4_gpu_set_streaming_expert_cache_expert_bytes(slab_expert_bytes);
                 uint32_t routed = 0, boosted = 0;
                 for (uint32_t il = 0; il < NS4_N_LAYER; il++) {
                     const ns4_layer_weights *l = &e->weights.layer[il];
@@ -38903,41 +38142,9 @@ static int ns4_engine_open_internal(ns4_engine **out,
                 if (boosted > 0) {
                     fprintf(stderr,
                             "ns4: SSD streaming mixed-precision model: %u/%u routed layers "
-                            "off the slab size class will bypass the expert cache and read "
-                            "experts via mapped model views\n",
+                            "off the dominant expert size class will read experts via "
+                            "mapped model views\n",
                             boosted, routed);
-                }
-                if (boosted * 2 > routed) {
-                    fprintf(stderr,
-                            "ns4: WARNING: the majority of routed layers (%u/%u) are off the "
-                            "slab size class (is the FIRST routed layer itself boosted?); "
-                            "expert-cache hit rate will be catastrophic\n",
-                            boosted, routed);
-                }
-                /*
-                 * Below one token's routed working set (uniform routed layers
-                 * x experts used) every token evicts entries it is about to
-                 * reuse, and prefill serves layer overflow through mapped
-                 * model views.  Output stays byte-identical at any budget
-                 * (the addr-table kernels read the same bytes either way);
-                 * only throughput collapses, so warn instead of refusing.
-                 */
-                const uint64_t min_experts =
-                    (uint64_t)(routed - boosted) * NS4_N_EXPERT_USED;
-                if (min_experts != 0 &&
-                    e->ssd_streaming_cache_experts != 0 &&
-                    e->ssd_streaming_cache_experts < 2u * min_experts) {
-                    fprintf(stderr,
-                            "ns4: WARNING: SSD streaming expert cache (%u experts) is "
-                            "under twice the per-token routed working set (%u layers "
-                            "x %u experts = %llu); expect heavy thrashing below "
-                            "%.2f GiB\n",
-                            e->ssd_streaming_cache_experts,
-                            routed - boosted,
-                            NS4_N_EXPERT_USED,
-                            (unsigned long long)min_experts,
-                            (double)(2u * min_experts * slab_expert_bytes) /
-                                1073741824.0);
                 }
             }
         }
@@ -39453,7 +38660,6 @@ int ns4_session_create(ns4_session **out, ns4_engine *e, int ctx_size) {
     s->graph.quality = e->quality;
     s->graph.ssd_streaming = e->ssd_streaming;
     s->graph.ssd_streaming_cold = e->ssd_streaming_cold;
-    s->graph.streaming_preload_experts = e->ssd_streaming_preload_experts;
     s->graph.power_percent = (uint32_t)e->power_percent;
     if (!metal_graph_load_directional_steering(&s->graph,
                                                e->directional_steering_file,
@@ -40039,8 +39245,7 @@ int ns4_session_eval_layer_slice(ns4_session *s,
     const bool batch_selected_addr =
         g->ssd_streaming &&
         layer_start == 0 &&
-        (metal_graph_stream_prefill_batch_selected_addr_enabled(g, &e->weights, n_tokens) ||
-         metal_graph_cuda_stream_prefill_batch_selected_addr_enabled(g, &e->weights, n_tokens));
+        metal_graph_cuda_stream_prefill_batch_selected_addr_enabled(g, &e->weights, n_tokens);
     if (g->ssd_streaming) {
         for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
             g->streaming_static_decode_map_current = false;

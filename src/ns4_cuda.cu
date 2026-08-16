@@ -29328,17 +29328,6 @@ extern "C" int ns4_gpu_matmul_quant_tensor(
     }
 }
 
-extern "C" uint64_t ns4_gpu_recommended_working_set_size(void) {
-    /* Graph memory guard: on this backend the model weights are
-     * distributed across all devices by the multi-tier placement, so the
-     * relevant budget is the aggregate VRAM. */
-    int n = 0;
-    if (cudaGetDeviceCount(&n) != cudaSuccess || n <= 0) return 0;
-    size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return 0;
-    return (uint64_t)total_b * (uint64_t)n;
-}
-
 extern "C" int ns4_gpu_routed_moe_set_selected_override(const int32_t *selected, uint32_t n_selected) {
     (void)selected;
     (void)n_selected;
@@ -29557,14 +29546,6 @@ extern "C" int ns4_gpu_stream_expert_cache_begin_selected_load(
                                                  n_selected);
 }
 
-extern "C" uint32_t ns4_gpu_stream_expert_cache_budget_for_expert_size(
-        uint64_t gate_expert_bytes,
-        uint64_t down_expert_bytes) {
-    (void)gate_expert_bytes;
-    (void)down_expert_bytes;
-    return 0;
-}
-
 extern "C" int ns4_gpu_tensor_copy_f32_to_f16(ns4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ns4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count) {
@@ -29651,43 +29632,10 @@ extern "C" int ns4_gpu_set_model_fd_for_map(int fd, const void *model_map) {
     return ok;
 }
 
-extern "C" int ns4_gpu_pro_q4_expert_table_auto_available(void) {
-    return 0;
-}
-
-extern "C" int ns4_gpu_preload_q4_expert_tables(
-        const void *model_map, uint64_t model_size,
-        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
-        uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
-        uint32_t n_total_expert) {
-    (void)model_map; (void)model_size;
-    (void)gate_offset; (void)up_offset; (void)down_offset;
-    (void)gate_expert_bytes; (void)down_expert_bytes;
-    (void)n_total_expert;
-    return 1;
-}
-
 extern "C" void ns4_gpu_set_ssd_streaming(bool enabled) {
     g_ssd_streaming_mode = enabled ? 1 : 0;
     cuda_stream_selected_cache_invalidate();
     if (!g_ssd_streaming_mode) cuda_stream_selected_cache_release();
-}
-
-extern "C" void ns4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
-    (void)experts;
-}
-
-extern "C" void ns4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
-    (void)bytes;
-}
-
-extern "C" uint32_t ns4_gpu_stream_expert_cache_configured_count(void) {
-    return 0;
-}
-
-extern "C" uint32_t ns4_gpu_stream_expert_cache_current_count(void) {
-    return g_stream_selected_cache.valid ?
-        g_stream_selected_cache.compact_count : 0;
 }
 
 extern "C" void ns4_gpu_stream_expert_cache_reset_route_hotness(void) {
@@ -29716,15 +29664,6 @@ extern "C" int ns4_gpu_stream_expert_cache_prepare_selected_batch(
     }
     return cuda_stream_selected_cache_begin_load(
             table, selected_ids, n_tokens * n_selected);
-}
-
-extern "C" int ns4_gpu_stream_expert_cache_seed_experts(
-        const ns4_gpu_stream_expert_table *table,
-        const int32_t *expert_ids,
-        const uint32_t *expert_priorities,
-        uint32_t n_experts) {
-    (void)table; (void)expert_ids; (void)expert_priorities; (void)n_experts;
-    return 1;
 }
 
 extern "C" int ns4_gpu_argmax_tensor(
