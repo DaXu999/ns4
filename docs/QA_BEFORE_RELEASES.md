@@ -40,7 +40,7 @@ system.
   only after receiving permission for `192.168.60.250`.
 - Run whitespace checks before committing:
   `git diff --check`.
-- Confirm `./ds4 --help`, `./ds4-server --help`, and `./ds4-agent --help` render
+- Confirm `./ns4 --help`, `./ns4-server --help`, and `./ns4-agent --help` render
   cleanly, with readable section colors and no broken wrapping.
 
 ## 2. Core Regression Tests
@@ -51,22 +51,22 @@ system.
   parsing or multi-GPU placement. Invalid values and device/budget count
   mismatches must reach the shared GPU parser in all four binaries; an
   `unknown option` response from a binary that advertises the flag is a
-  release blocker. On CUDA, also start `ds4-server` once with
+  release blocker. On CUDA, also start `ns4-server` once with
   `--gpu-vram auto` and the intended `--gpu-devices` list and preserve the
   resolved layout line.
 - Run the vector checks explicitly after any tokenizer, template, KV, kernel,
   quantization, or prompt-rendering change:
-  `DS4_TEST_MODEL=/path/to/0731.gguf
-  DS4_TEST_VECTOR_FILE=tests/test-vectors/flash-0731/official.vec
-  ./ds4_test --logprob-vectors`
+  `NS4_TEST_MODEL=/path/to/0731.gguf
+  NS4_TEST_VECTOR_FILE=tests/test-vectors/flash-0731/official.vec
+  ./ns4_test --logprob-vectors`
   and
-  `DS4_TEST_MODEL=/path/to/0731.gguf
-  DS4_TEST_LOCAL_GOLDEN_FILE=tests/test-vectors/flash-0731/local-golden.vec
-  ./ds4_test --local-golden-vectors`.
+  `NS4_TEST_MODEL=/path/to/0731.gguf
+  NS4_TEST_LOCAL_GOLDEN_FILE=tests/test-vectors/flash-0731/local-golden.vec
+  ./ns4_test --local-golden-vectors`.
 - Run server tests when HTTP, SSE, prompt rendering, cache policy, or tool-call
   replay changed:
-  `./ds4_test --server`.
-- Run `./ds4-eval --self-test-extractors`.
+  `./ns4_test --server`.
+- Run `./ns4-eval --self-test-extractors`.
 
 ### Critical Input And Server Regression Pass
 
@@ -76,7 +76,7 @@ numbers in the QA report so omissions are visible.
 
 1. Send malformed OpenAI, Responses, and Anthropic requests with repeated
    owned string or array fields under ASan. Each request must fail cleanly and
-   a following valid request must still work. Run `./ds4_test --server` too.
+   a following valid request must still work. Run `./ns4_test --server` too.
 2. Replay at least 4,096 assistant/tool-result pairs through the Responses and
    Anthropic validators. Validation must remain linear-time and preserve the
    same accepted and rejected histories as a short replay.
@@ -108,11 +108,11 @@ numbers in the QA report so omissions are visible.
     request must report `cache_source: memory-rewind`, reuse through one token
     before the prompt boundary, and produce the same greedy output as a fresh
     session.
-12. Run `./ds4_test --think-tool-recovery`, then repeat through all three HTTP
+12. Run `./ns4_test --think-tool-recovery`, then repeat through all three HTTP
     APIs. A complete tool block inside unclosed reasoning must be recovered
     once, preceding prose must remain reasoning, and no synthetic continuation
     may be generated.
-13. Run `./ds4_agent_test` under ASan with agent-cache strings whose declared
+13. Run `./ns4_agent_test` under ASan with agent-cache strings whose declared
     lengths exceed the remaining file. Loading must fail without allocating
     the declared size, and a valid cache must still load.
 14. Run the server parser tests under UBSan with `NaN`, positive infinity, and
@@ -137,9 +137,9 @@ top-logprob slices, so do not replace them with one sampled chat answer.
   fixture. Checkpoint-labelled GGUFs such as `-0731` must use the fixture with
   the same label.
 - Run the tracked DeepSeek V4 Flash 0731 smoke vectors:
-  `DS4_TEST_MODEL=/path/to/0731.gguf
-  DS4_TEST_VECTOR_FILE=tests/test-vectors/flash-0731/official.vec
-  ./ds4_test --logprob-vectors`.
+  `NS4_TEST_MODEL=/path/to/0731.gguf
+  NS4_TEST_VECTOR_FILE=tests/test-vectors/flash-0731/official.vec
+  ./ns4_test --logprob-vectors`.
   This covers short prompts and long-prompt attention cases. The runner defaults
   to this fixture, but release logs should keep the path explicit.
 - Run the 100-case DeepSeek V4 Flash fixture for every released Flash GGUF:
@@ -170,17 +170,17 @@ top-logprob slices, so do not replace them with one sampled chat answer.
 Use the normal Flash GGUF that 128 GB users run.
 
 - One-shot CLI:
-  `./ds4 -m ds4flash.gguf --ctx 32768 --nothink -p "Explain C pointers in one paragraph."`
+  `./ns4 -m ns4flash.gguf --ctx 32768 --nothink -p "Explain C pointers in one paragraph."`
 - Thinking and max-thinking prompts:
   run one short coding prompt with default thinking and one with max thinking.
 - Long-context recall:
   run the long name/number or archive recall test used for catching attention
   and MoE routing drift.
 - Logprob sanity:
-  `./ds4 --nothink --temp 0 --dump-logprobs /tmp/ds4-logprobs.json --logprobs-top-k 20 -p "..."`
+  `./ns4 --nothink --temp 0 --dump-logprobs /tmp/ns4-logprobs.json --logprobs-top-k 20 -p "..."`
   and inspect that the continuation is sane.
 - Speed sanity:
-  run `ds4-bench` with `speed-bench/promessi_sposi.txt` and compare prefill,
+  run `ns4-bench` with `speed-bench/promessi_sposi.txt` and compare prefill,
   generation speed, and KV bytes with the last known good numbers for the same
   machine.
 - For native MXFP4 changes, run `make mxfp4-dot-test test-mxfp4-cuda`, then a
@@ -199,21 +199,21 @@ from another checkpoint can have plausible acceptance statistics while
 producing a different greedy continuation.
 
 - Default greedy acceptance fixture:
-  `DS4_DSPARK_MODEL=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf DS4_DSPARK_SUPPORT=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-acceptance`.
+  `NS4_DSPARK_MODEL=/Users/antirez/ns4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf NS4_DSPARK_SUPPORT=/Users/antirez/ns4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-acceptance`.
 - 64-token guardrail:
-  `DS4_DSPARK_FIXTURE_TOKENS=64 DS4_DSPARK_MODEL=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf DS4_DSPARK_SUPPORT=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-acceptance`.
+  `NS4_DSPARK_FIXTURE_TOKENS=64 NS4_DSPARK_MODEL=/Users/antirez/ns4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf NS4_DSPARK_SUPPORT=/Users/antirez/ns4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-acceptance`.
 - Fixed-block partial-accept fallback:
-  `DS4_DSPARK_FIXTURE_CONFIDENCE=0 DS4_DSPARK_FIXTURE_TOKENS=8 DS4_DSPARK_FIXTURE_REQUIRE_PARTIAL=1 DS4_DSPARK_MODEL=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf DS4_DSPARK_SUPPORT=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-acceptance`.
+  `NS4_DSPARK_FIXTURE_CONFIDENCE=0 NS4_DSPARK_FIXTURE_TOKENS=8 NS4_DSPARK_FIXTURE_REQUIRE_PARTIAL=1 NS4_DSPARK_MODEL=/Users/antirez/ns4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf NS4_DSPARK_SUPPORT=/Users/antirez/ns4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-acceptance`.
 - DSpark verifier invariant smoke:
-  `DS4_TEST_MODEL=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf DS4_DSPARK_SUPPORT=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-verify-depth`.
+  `NS4_TEST_MODEL=/Users/antirez/ns4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf NS4_DSPARK_SUPPORT=/Users/antirez/ns4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-verify-depth`.
 - If shared support-model or verifier structures changed, also run legacy MTP:
-  `make mtp-verify-depth` with `DS4_TEST_MTP` set to a one-stage MTP support
+  `make mtp-verify-depth` with `NS4_TEST_MTP` set to a one-stage MTP support
   GGUF, or confirm the target skips only because the optional file is missing.
 - Record `c_add` `accepted_draft`, `errors=0`, `verify_layer`, and `net_saved`
   for both 32-token and 64-token runs.  A faster run with lower proposal
   quality is a regression unless it was an intentional scheduler change.
 - If verifier MoE kernels changed, run one diagnostic `c_add` profile with
-  `DS4_DSPARK_VERIFY_SELECTED_PROFILE=1` or the MoE stage profiler and
+  `NS4_DSPARK_VERIFY_SELECTED_PROFILE=1` or the MoE stage profiler and
   record the selected-expert footprint or stage timing in the DSpark log.
 
 ### Session Microbatching
@@ -223,8 +223,8 @@ prefill/decode, QKV projection, shared or routed experts, tensor parallelism,
 or backend fallback selection changes.
 
 - Run the CUDA session-batch and mixed-batch oracles:
-  `DS4_TEST_MODEL=/path/to/ds4flash.gguf make test-cuda-session-batch` and
-  `DS4_TEST_MODEL=/path/to/ds4flash.gguf make test-cuda-mixed-batch`.
+  `NS4_TEST_MODEL=/path/to/ns4flash.gguf make test-cuda-session-batch` and
+  `NS4_TEST_MODEL=/path/to/ns4flash.gguf make test-cuda-mixed-batch`.
 - The oracle must cover reversed row ordering, at least six decode steps, and a
   mixed prefill/decode call. Any nonzero differing-logit count is a blocker;
   argmax-only agreement is insufficient.
@@ -253,12 +253,12 @@ PRO support is experimental, but release builds must not break it silently.
 SSD streaming is a capacity path, so test both correctness and user experience.
 
 - Flash q2/q2-q4 streaming:
-  `./ds4 -m ds4flash.gguf --ssd-streaming --ssd-streaming-cache-experts 32GB -p "..."`
+  `./ns4 -m ns4flash.gguf --ssd-streaming --ssd-streaming-cache-experts 32GB -p "..."`
 - Regression test mixed-quant Flash SSD streaming. Use the mixed q2/q4 GGUF
   with boosted Q4 routed-expert layers and a prompt long enough to exercise the
   selected-address prefill path; it must not fail with "model range is not
   covered by mapped model views":
-  `./ds4 -m gguf/DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf --ssd-streaming --ssd-streaming-cache-experts 16GB --ctx 4096 --tokens 1 --nothink --prompt-file /tmp/ds4_600tok_prompt.txt`.
+  `./ns4 -m gguf/DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf --ssd-streaming --ssd-streaming-cache-experts 16GB --ctx 4096 --tokens 1 --nothink --prompt-file /tmp/ns4_600tok_prompt.txt`.
 - Cold streaming measurement:
   run once with `--ssd-streaming-cold` and verify no deadlock, missing expert,
   or impossible slowdown.
@@ -298,7 +298,7 @@ release-ready without this pass.
 - Run a longer prompt that exercises routed experts past a few thousand tokens.
 - With explicit permission for this QA pass, run the full-vocabulary decode
   oracle on the eight-GPU CUDA host:
-  `DS4_TEST_MODEL=/path/to/flash.gguf make test-cuda-session-batch`.
+  `NS4_TEST_MODEL=/path/to/flash.gguf make test-cuda-session-batch`.
   Preserve the per-batch timing for 2, 4, and 8 rows and require
   `nonexact_logits=0`. Run the released Q4 file and the reduced-precision Q2
   file: Q4 exercises grouped routed/shared stages, while unsupported Q2 native
@@ -307,20 +307,20 @@ release-ready without this pass.
   attention-core, QKV, KV-store, and attention-post by default and remain
   full-vocabulary exact against isolated decode. On the eight-L40S host, the
   16-row decode step must remain above 110 aggregate tokens/s. Repeat once with
-  `DS4_CUDA_TP_ATTN=0` only as rollback coverage; it is not the production
+  `NS4_CUDA_TP_ATTN=0` only as rollback coverage; it is not the production
   configuration.
 - Run native mixed prefill/decode at the default frontier and at compressed
   context:
-  `DS4_TEST_MODEL=/path/to/flash.gguf make test-cuda-mixed-batch` and
-  `DS4_TEST_CONTEXT=4096 DS4_TEST_MIXED_INITIAL=2048 DS4_TEST_MIXED_ROUNDS=8
-  DS4_TEST_MODEL=/path/to/flash.gguf make test-cuda-mixed-batch`.
+  `NS4_TEST_MODEL=/path/to/flash.gguf make test-cuda-mixed-batch` and
+  `NS4_TEST_CONTEXT=4096 NS4_TEST_MIXED_INITIAL=2048 NS4_TEST_MIXED_ROUNDS=8
+  NS4_TEST_MODEL=/path/to/flash.gguf make test-cuda-mixed-batch`.
   Every round must report exact logits and `mode=native`; a serialized fallback
   is a failure for the eight-GPU TP/EP topology. Under CUDA TP attention, the
   native mixed step must use the same exact grouped decode stages when their
   capability checks pass; record correctness and speedup separately. Also
   force an 800-row prefill quantum with
-  `DS4_TEST_ALLOW_FALLBACK=1`; it must report the serialized safety fallback.
-- With explicit permission for the eight-GPU host, start `ds4-server` with 8
+  `NS4_TEST_ALLOW_FALLBACK=1`; it must report the serialized safety fallback.
+- With explicit permission for the eight-GPU host, start `ns4-server` with 8
   and 16 batched sessions and issue at least that many simultaneous requests
   with mixed prompt lengths. Verify no session mix-up, deadlock, or starvation
   and record aggregate generation throughput.
@@ -351,7 +351,7 @@ loading code changes.
 Disk KV cache bugs are high impact for server users.
 
 - Start the server with:
-  `./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192`.
+  `./ns4-server --ctx 100000 --kv-disk-dir /tmp/ns4-kv --kv-disk-space-mb 8192`.
 - Run the same request twice and verify the second request hits cache.
 - Fill the cache enough to trigger eviction; verify the newly-written entry is
   not evicted and useful anchors are retained.
@@ -371,13 +371,13 @@ clients.
 - Test SSE streaming with thinking enabled and disabled.
 - Test keepalive during long prefill and confirm clients do not time out.
 - Only after receiving explicit permission for this QA pass, start
-  `ds4-server` on the eight-L40S CUDA TP target with the release TP options and
+  `ns4-server` on the eight-L40S CUDA TP target with the release TP options and
   verify all 16 100k-context sessions allocate. Startup must report a
   2048-token prefill cap; a silent fallback to 4096 is an OOM regression.
 - Test `--trace` and confirm rendered prompts, cache decisions, generated text,
   and tool-parser events are useful without leaking unrelated state.
 
-## 11. ds4-agent
+## 11. ns4-agent
 
 The agent is the most stateful component.  Test it manually, not only by build.
 
@@ -391,7 +391,7 @@ The agent is the most stateful component.  Test it manually, not only by build.
   create a temp project, ask for edits, verify old/new and `[upto]` anchored
   edits fail safely on ambiguous matches and do not require retyping whole files.
 - Real coding edit loop:
-  delete `/tmp/mymandel`, ask ds4-agent to create a small C ASCII Mandelbrot
+  delete `/tmp/mymandel`, ask ns4-agent to create a small C ASCII Mandelbrot
   program there, build and run it, then in a second user turn ask for a small
   modification that should naturally use the edit tool, such as changing the
   ASCII character ramp or output dimensions.  Verify the agent edits the
@@ -420,7 +420,7 @@ The agent is the most stateful component.  Test it manually, not only by build.
 
 ## 13. Performance And Power
 
-- Run `ds4-bench` on the release machine and compare with tracked CSV baselines.
+- Run `ns4-bench` on the release machine and compare with tracked CSV baselines.
 - Test `--power 100` is not throttled.
 - Test `--power 50` visibly reduces duty cycle in CLI, server, agent, eval, and
   bench where practical.
@@ -441,7 +441,7 @@ tests, record aggregate and per-session decode speed.
 - A slowdown over 5% requires a clean rerun and investigation.
 - A repeatable slowdown over 10% in prefill, decode, or aggregate batched
   decode is a release blocker unless the change and tradeoff are documented.
-- Keep the complete `ds4-bench` CSV. A single short-prompt average is not enough
+- Keep the complete `ns4-bench` CSV. A single short-prompt average is not enough
   to detect a context-dependent regression.
 - Compare startup time and peak memory as well as tokens per second when model
   loading, caches, streaming, or temporary arenas changed.

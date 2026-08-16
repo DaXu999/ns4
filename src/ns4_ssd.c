@@ -1,4 +1,4 @@
-#include "ds4_ssd.h"
+#include "ns4_ssd.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -13,9 +13,9 @@
 #define MAP_ANONYMOUS MAP_ANON
 #endif
 
-static const uint64_t DS4_GIB = 1024ull * 1024ull * 1024ull;
+static const uint64_t NS4_GIB = 1024ull * 1024ull * 1024ull;
 
-bool ds4_parse_gib_arg(const char *s, uint64_t *bytes) {
+bool ns4_parse_gib_arg(const char *s, uint64_t *bytes) {
     if (bytes) *bytes = 0;
     if (!s || !s[0] || !bytes) return false;
 
@@ -37,13 +37,13 @@ bool ds4_parse_gib_arg(const char *s, uint64_t *bytes) {
 
     errno = 0;
     unsigned long long v = strtoull(numbuf, NULL, 10);
-    if (errno != 0 || v == 0 || v > UINT64_MAX / DS4_GIB) return false;
+    if (errno != 0 || v == 0 || v > UINT64_MAX / NS4_GIB) return false;
 
-    *bytes = (uint64_t)v * DS4_GIB;
+    *bytes = (uint64_t)v * NS4_GIB;
     return true;
 }
 
-bool ds4_parse_streaming_cache_experts_arg(const char *s,
+bool ns4_parse_streaming_cache_experts_arg(const char *s,
                                            uint32_t   *experts,
                                            uint64_t   *bytes) {
     if (experts) *experts = 0;
@@ -54,7 +54,7 @@ bool ds4_parse_streaming_cache_experts_arg(const char *s,
     if (len > 2 &&
         (s[len - 2] == 'g' || s[len - 2] == 'G') &&
         (s[len - 1] == 'b' || s[len - 1] == 'B')) {
-        return ds4_parse_gib_arg(s, bytes);
+        return ns4_parse_gib_arg(s, bytes);
     }
 
     for (size_t i = 0; i < len; i++) {
@@ -69,7 +69,7 @@ bool ds4_parse_streaming_cache_experts_arg(const char *s,
     return true;
 }
 
-uint32_t ds4_ssd_cache_experts_for_byte_budget(uint64_t bytes,
+uint32_t ns4_ssd_cache_experts_for_byte_budget(uint64_t bytes,
                                                uint64_t per_expert_bytes) {
     if (bytes == 0 || per_expert_bytes == 0) return 0;
     const uint64_t experts = bytes / per_expert_bytes;
@@ -77,8 +77,8 @@ uint32_t ds4_ssd_cache_experts_for_byte_budget(uint64_t bytes,
     return (uint32_t)experts;
 }
 
-static uint64_t ds4_ssd_auto_cache_percent(void) {
-    const char *env = getenv("DS4_SSD_AUTO_CACHE_PCT");
+static uint64_t ns4_ssd_auto_cache_percent(void) {
+    const char *env = getenv("NS4_SSD_AUTO_CACHE_PCT");
     if (env && env[0]) {
         errno = 0;
         char *end = NULL;
@@ -88,7 +88,7 @@ static uint64_t ds4_ssd_auto_cache_percent(void) {
             return (uint64_t)v;
         }
         fprintf(stderr,
-                "ds4: invalid DS4_SSD_AUTO_CACHE_PCT=%s (want 50..95); "
+                "ns4: invalid NS4_SSD_AUTO_CACHE_PCT=%s (want 50..95); "
                 "using default\n",
                 env);
     }
@@ -100,21 +100,21 @@ static uint64_t ds4_ssd_auto_cache_percent(void) {
      * spikes (pinned read/upload staging, the prefill headroom, cache growth)
      * ride on top of the steady-state plan.  Pushing the split too high runs
      * the machine out of RAM and trips the Linux OOM killer.  80% was measured
-     * safe here; opt into more only deliberately via DS4_SSD_AUTO_CACHE_PCT.
+     * safe here; opt into more only deliberately via NS4_SSD_AUTO_CACHE_PCT.
      */
     return 80;
 }
 
-bool ds4_ssd_auto_cache_plan(uint64_t            recommended_bytes,
+bool ns4_ssd_auto_cache_plan(uint64_t            recommended_bytes,
                              uint64_t            non_routed_bytes,
                              uint64_t            per_expert_bytes,
                              uint64_t            max_model_experts,
-                             ds4_ssd_cache_plan *out) {
+                             ns4_ssd_cache_plan *out) {
     if (!out) return false;
     memset(out, 0, sizeof(*out));
     if (recommended_bytes == 0 || per_expert_bytes == 0) return false;
 
-    const uint64_t pct = ds4_ssd_auto_cache_percent();
+    const uint64_t pct = ns4_ssd_auto_cache_percent();
     out->model_target_bytes =
         recommended_bytes > UINT64_MAX / pct ?
             UINT64_MAX : (recommended_bytes * pct) / 100ull;
@@ -134,7 +134,7 @@ bool ds4_ssd_auto_cache_plan(uint64_t            recommended_bytes,
     return out->cache_experts != 0;
 }
 
-bool ds4_ssd_memory_lock_acquire(ds4_ssd_memory_lock *lock,
+bool ns4_ssd_memory_lock_acquire(ns4_ssd_memory_lock *lock,
                                  uint64_t             bytes) {
     if (!lock) return false;
     lock->ptr = NULL;
@@ -142,7 +142,7 @@ bool ds4_ssd_memory_lock_acquire(ds4_ssd_memory_lock *lock,
     if (bytes == 0) return true;
     if (bytes > (uint64_t)SIZE_MAX) {
         fprintf(stderr,
-                "ds4: --simulate-used-memory is too large for this process\n");
+                "ns4: --simulate-used-memory is too large for this process\n");
         return false;
     }
 
@@ -154,8 +154,8 @@ bool ds4_ssd_memory_lock_acquire(ds4_ssd_memory_lock *lock,
                      0);
     if (ptr == MAP_FAILED) {
         fprintf(stderr,
-                "ds4: --simulate-used-memory mmap %.2f GiB failed: %s\n",
-                (double)bytes / (double)DS4_GIB,
+                "ns4: --simulate-used-memory mmap %.2f GiB failed: %s\n",
+                (double)bytes / (double)NS4_GIB,
                 strerror(errno));
         return false;
     }
@@ -182,9 +182,9 @@ bool ds4_ssd_memory_lock_acquire(ds4_ssd_memory_lock *lock,
 
         if (mlock((void *)(p + off), (size_t)len) != 0) {
             fprintf(stderr,
-                    "ds4: --simulate-used-memory mlock failed after %.2f/%.2f GiB: %s\n",
-                    (double)locked / (double)DS4_GIB,
-                    (double)bytes / (double)DS4_GIB,
+                    "ns4: --simulate-used-memory mlock failed after %.2f/%.2f GiB: %s\n",
+                    (double)locked / (double)NS4_GIB,
+                    (double)bytes / (double)NS4_GIB,
                     strerror(errno));
             if (locked != 0) munlock(ptr, (size_t)locked);
             munmap(ptr, (size_t)bytes);
@@ -196,12 +196,12 @@ bool ds4_ssd_memory_lock_acquire(ds4_ssd_memory_lock *lock,
     lock->ptr = ptr;
     lock->bytes = bytes;
     fprintf(stderr,
-            "ds4: simulated used memory: locked %.2f GiB before model load\n",
-            (double)bytes / (double)DS4_GIB);
+            "ns4: simulated used memory: locked %.2f GiB before model load\n",
+            (double)bytes / (double)NS4_GIB);
     return true;
 }
 
-void ds4_ssd_memory_lock_release(ds4_ssd_memory_lock *lock) {
+void ns4_ssd_memory_lock_release(ns4_ssd_memory_lock *lock) {
     if (!lock || !lock->ptr || lock->bytes == 0) return;
     munlock(lock->ptr, (size_t)lock->bytes);
     munmap(lock->ptr, (size_t)lock->bytes);

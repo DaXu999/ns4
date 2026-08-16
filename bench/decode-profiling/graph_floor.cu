@@ -1,6 +1,6 @@
 /* Does a CUDA graph amortise this box's ~5.5us launch floor?
  * Compares N individual launches against one graph replay containing the same
- * N nodes, for chain lengths that bracket ds4's decode islands (a handful of
+ * N nodes, for chain lengths that bracket ns4's decode islands (a handful of
  * kernels) and a whole decode layer (~37) and a whole token (~1600). */
 #include <cstdio>
 #include <vector>

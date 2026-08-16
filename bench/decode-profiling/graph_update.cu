@@ -1,7 +1,7 @@
 /* What it costs to keep a captured graph usable when a scalar argument
  * changes every replay.
  *
- * The decode islands ds4 captures today are the position-INdependent parts of
+ * The decode islands ns4 captures today are the position-INdependent parts of
  * a layer.  The ~600 launches per token that no island covers are the middle
  * of the layer -- rope, the KV store, the DSA compressor, attention -- and
  * they are uncovered for exactly one reason: they take `pos` / `n_kv` as
@@ -119,7 +119,7 @@ int main(int argc, char **argv) {
     const double dev_ms = (now_ms() - t0) / iters;
 
     /* ---- C: re-capture every token, then cudaGraphExecUpdate ----
-     * The interesting one for ds4: the encode path is untouched, it just runs
+     * The interesting one for ns4: the encode path is untouched, it just runs
      * in capture mode exactly as islands 0/1 already do.  Whatever `pos` the
      * kernels bake in is whatever this token's capture recorded, so the
      * position dependence that keeps the middle of the layer out of a graph

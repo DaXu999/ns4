@@ -1,8 +1,8 @@
 # Agent Notes
 
-`ds4.c` is a DeepSeek V4 Flash specific inference engine. It is not a generic
+`ns4.c` is a DeepSeek V4 Flash specific inference engine. It is not a generic
 GGUF runner. The goal is a small, readable, high-performance C codebase with
-CUDA kernels in `ds4_cuda.cu`.
+CUDA kernels in `ns4_cuda.cu`.
 
 ## Goals
 
@@ -30,12 +30,12 @@ CUDA kernels in `ds4_cuda.cu`.
 
 ## Layout
 
-- `ds4.c`: model loading, tokenizer, CPU reference code, graph scheduling,
+- `ns4.c`: model loading, tokenizer, CPU reference code, graph scheduling,
   sessions, disk-cache payload serialization.
-- `ds4_cli.c`: command line, linenoise REPL, interactive transcript handling.
-- `ds4_server.c`: OpenAI/Anthropic compatible HTTP API, worker queue, streaming,
+- `ns4_cli.c`: command line, linenoise REPL, interactive transcript handling.
+- `ns4_server.c`: OpenAI/Anthropic compatible HTTP API, worker queue, streaming,
   tool-call mapping, disk KV cache policy.
-- `ds4_cuda.cu`: CUDA runtime and compute kernels.
+- `ns4_cuda.cu`: CUDA runtime and compute kernels.
 - `tests/`: unit and live integration tests.
 - `misc/`: ignored notes, experiments, and old planning material.
 

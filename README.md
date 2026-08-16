@@ -25,7 +25,7 @@ workstations. A model may be removed when a better replacement arrives.
 # So, what can I do with this software?
 
 * You can run a very capable model on your own CUDA hardware, a DGX Spark for example. Even if you have not enough VRAM, with SSD streaming, you can run it at a decent speed.
-* Using the CUDA multi-GPU support and with ds4-server micro batching of decoding and generation, you can turn a server with old-ish CUDA cards (Ada Lovelace architecture), no longer supported for new models by vLLM, into a multi-user LLM server for your company. We tested this setup with 8xL40S NVIDIA cards and multiple sessions with very good results. 120 t/s aggreated generation, 2000 t/s prefill.
+* Using the CUDA multi-GPU support and with ns4-server micro batching of decoding and generation, you can turn a server with old-ish CUDA cards (Ada Lovelace architecture), no longer supported for new models by vLLM, into a multi-user LLM server for your company. We tested this setup with 8xL40S NVIDIA cards and multiple sessions with very good results. 120 t/s aggreated generation, 2000 t/s prefill.
 * You can also use pipeline paralellism to glue together multiple systems to sum their RAM and run larger models.
 
 ## Motivations
@@ -41,7 +41,7 @@ workstations. A model may be removed when a better replacement arrives.
 
 ## Acknowledgements to llama.cpp and GGML
 
-`ds4.c` does not link against GGML, but it **exists thanks to the path opened by the
+`ns4.c` does not link against GGML, but it **exists thanks to the path opened by the
 llama.cpp project and the kernels, quantization formats, GGUF ecosystem, and hard-won
 engineering knowledge developed there**.
 We are thankful and indebted to [`llama.cpp`](https://github.com/ggml-org/llama.cpp)
@@ -132,9 +132,9 @@ For the full PRO Q4 distributed run, download one half on each machine:
 
 The script downloads from `https://huggingface.co/antirez/deepseek-v4-gguf`,
 stores files under `./gguf/`, resumes partial downloads with `curl -C -`, and
-updates `./ds4flash.gguf` to point at the selected main model.
+updates `./ns4flash.gguf` to point at the selected main model.
 The `pro-q4-layers00-30`, `pro-q4-layers31-output`, and `pro-q4-split` targets
-download distributed PRO Q4 pieces and do not update `./ds4flash.gguf`.
+download distributed PRO Q4 pieces and do not update `./ns4flash.gguf`.
 Authentication is optional for public downloads, but `--token TOKEN`,
 `HF_TOKEN`, or the local Hugging Face token cache are used when present.
 
@@ -154,9 +154,9 @@ make cuda CUDA_ARCH=sm_120   # CUDA with an explicit nvcc -arch
 make cpu              # CPU-only diagnostics build
 ```
 
-`./ds4flash.gguf` is the default model path used by both binaries. Pass `-m` to
-select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
-`./ds4-server --help` for the full flag list.
+`./ns4flash.gguf` is the default model path used by both binaries. Pass `-m` to
+select another supported GGUF from `./gguf/`. Run `./ns4 --help` and
+`./ns4-server --help` for the full flag list.
 
 ## DSpark Speculative Decoding
 
@@ -191,7 +191,7 @@ support model for that run rather than stacking with it.
 Run it with greedy decoding:
 
 ```sh
-./ds4 -m ds4flash.gguf \
+./ns4 -m ns4flash.gguf \
   --mtp gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
   --dspark --temp 0
 ```
@@ -241,14 +241,14 @@ routes through experts again.
 Set the routed expert cache explicitly:
 
 ```sh
-./ds4 -m ./ds4flash.gguf --ssd-streaming --ssd-streaming-cache-experts 32GB
+./ns4 -m ./ns4flash.gguf --ssd-streaming --ssd-streaming-cache-experts 32GB
 ```
 
 The automatic cache budget was Metal-only and went with that backend, so on
 CUDA the size must be given. See
 [METAL_FEATURES_PORTING_NOTES.md](METAL_FEATURES_PORTING_NOTES.md) — the
 budget math is the cheapest of the Metal features to port back, because
-`ds4_gpu_recommended_working_set_size()` already exists for CUDA.
+`ns4_gpu_recommended_working_set_size()` already exists for CUDA.
 
 The `32GB` value is a routed-expert memory budget, not a generic byte cache.
 DwarfStar first reserves headroom for the two full routed layers used by
@@ -271,8 +271,8 @@ requested dynamic cache:
 ```sh
 ./download_model.sh ds4f-q2
 
-./ds4 \
-  -m ./ds4flash.gguf \
+./ns4 \
+  -m ./ns4flash.gguf \
   --ssd-streaming \
   --ssd-streaming-cache-experts 32GB \
   --ctx 32768 \
@@ -286,7 +286,7 @@ thinking with a conservative generation limit once the machine is stable:
 ```sh
 ./download_model.sh pro-q2-imatrix
 
-./ds4 \
+./ns4 \
   -m gguf/DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix.gguf \
   --ssd-streaming \
   --ssd-streaming-cache-experts 48GB \
@@ -396,14 +396,14 @@ Minimal two-host configuration:
 
 ```sh
 # Machine A: coordinator, owns tokenization, sampling, the prompt, and layers 0..30.
-./ds4 \
+./ns4 \
   -m gguf/DeepSeek-V4-Pro-Q4K-Layers00-30.gguf \
   --role coordinator \
   --layers 0:30 \
   --listen 169.254.43.68 1234
 
 # Machine B: worker, connects to A and owns layers 31..output.
-./ds4 \
+./ns4 \
   -m gguf/DeepSeek-V4-Pro-Q4K-Layers-31-output.gguf \
   --role worker \
   --layers 31:output \
@@ -437,16 +437,16 @@ still useful for collective testing: multiple people can temporarily combine
 machines to run a larger model that would not fit on any single host, accepting
 slow decode in exchange for being able to inspect the model at all.
 
-Use the coordinator exactly like normal `./ds4`: interactive chat, `/read`,
+Use the coordinator exactly like normal `./ns4`: interactive chat, `/read`,
 and ordinary generation go through the same high-level session API. The same
-distributed options are also wired into `ds4-agent`, `ds4-eval`, and
-`ds4-bench`. For benchmarks, workers should already be running; `ds4-bench`
+distributed options are also wired into `ns4-agent`, `ns4-eval`, and
+`ns4-bench`. For benchmarks, workers should already be running; `ns4-bench`
 waits until a complete route is available.
 
 Useful tuning and diagnostics:
 
 ```sh
-./ds4-bench \
+./ns4-bench \
   -m gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf \
   --prompt-file speed-bench/promessi_sposi.txt \
   --ctx-start 32768 \
@@ -549,7 +549,7 @@ This is the interactive-agent setup used on the eight-L40S server:
 ```sh
 MODEL=gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf
 
-./ds4-agent --cuda --cuda-tensor-parallel \
+./ns4-agent --cuda --cuda-tensor-parallel \
   --gpu-vram auto \
   --gpu-devices 0,2,4,6,1,3,5,7 \
   --model "$MODEL" \
@@ -560,7 +560,7 @@ For serving, keep multiple KV sessions resident so decode rows can be grouped
 across requests. The tested host is configured for up to 16 resident sessions:
 
 ```sh
-./ds4-server --cuda --cuda-tensor-parallel \
+./ns4-server --cuda --cuda-tensor-parallel \
   --gpu-vram auto \
   --gpu-devices 0,2,4,6,1,3,5,7 \
   --model "$MODEL" \
@@ -571,11 +571,11 @@ across requests. The tested host is configured for up to 16 resident sessions:
 
 The equivalent local launchers are `./run-nvidia-tp-agent.sh` and
 `./run-nvidia-tp-server.sh`. The server launcher also enables the on-disk KV
-cache and defaults to the native 0731 MXFP4 GGUF. Set `DS4_MODEL` to use the Q4
+cache and defaults to the native 0731 MXFP4 GGUF. Set `NS4_MODEL` to use the Q4
 file above instead. Reduce the session count or context size if the requested
 resident KV caches do not fit after model loading. CUDA TP, half-resident expert
 ownership, output sharding, pipelined prefill, and compatible grouped decode are
-selected by `--cuda-tensor-parallel`; no `DS4_CUDA_*` environment tuning is required.
+selected by `--cuda-tensor-parallel`; no `NS4_CUDA_*` environment tuning is required.
 Without an explicit `--prefill-chunk`, this mode uses 2048-token chunks so the
 tested 16-session, 100k-context layout retains enough VRAM for resident KV
 caches. An explicit `--prefill-chunk` remains an override for other topologies.
@@ -607,9 +607,9 @@ The option is available on the CLI, server, agent, eval, and benchmark tools.
 For example:
 
 ```sh
-./ds4 --power 50
-./ds4-agent --power 70
-./ds4-server --power 40 --ctx 100000
+./ns4 --power 50
+./ns4-agent --power 70
+./ns4-server --power 40 --ctx 100000
 ```
 
 ## Native agent
@@ -628,7 +628,7 @@ few advantages:
 * Everything is tuned for this model.
 * Ability to switch saved sessions with `/list` and `/switch`; full KV sessions resume without a prefill stage.
 
-Agent sessions are stored in `~/.ds4/kvcache`. Use `/save` to persist the
+Agent sessions are stored in `~/.ns4/kvcache`. Use `/save` to persist the
 current session, `/list` to show saved sessions sorted by recent update time,
 and `/switch <sha>` to resume one of them. The session ID is stable across
 future saves and is derived from the first user prompt and creation time.
@@ -636,7 +636,7 @@ future saves and is derived from the first user prompt and creation time.
 conversation text and title but removes the heavy KV payload; switching to a
 stripped session rebuilds the KV cache by prefilling the saved text.
 
-Use `--chdir /path/to/ds4` when launching `ds4-agent` from another directory,
+Use `--chdir /path/to/ns4` when launching `ns4-agent` from another directory,
 so relative runtime files resolve from the project tree.
 
 However while the system already works, there is a lot of work to do
@@ -646,7 +646,7 @@ session-based protocol that can recreate all that in a client-server way.
 
 ## Benchmarking
 
-`ds4-bench` measures instantaneous prefill and generation throughput at context
+`ns4-bench` measures instantaneous prefill and generation throughput at context
 frontiers instead of reporting one whole-run average. It loads the model once,
 walks a fixed token sequence to frontiers such as 2048, 4096, 6144, and uses
 incremental prefill so each row measures only the newly-added token interval.
@@ -654,8 +654,8 @@ After each frontier it saves the live KV state to memory, generates a fixed
 greedy non-EOS probe, restores the memory snapshot, and continues prefill.
 
 ```sh
-./ds4-bench \
-  -m ds4flash.gguf \
+./ns4-bench \
+  -m ns4flash.gguf \
   --prompt-file speed-bench/promessi_sposi.txt \
   --ctx-start 2048 \
   --ctx-max 65536 \
@@ -682,7 +682,7 @@ per-layer chunk dispatch path.
 
 ## Capability Evaluation
 
-`ds4-eval` is a small real-model integration benchmark. It is not a leaderboard
+`ns4-eval` is a small real-model integration benchmark. It is not a leaderboard
 runner and should not be reported as an official GPQA, SuperGPQA, AIME, or
 security benchmark score: the questions are an embedded 92-item subset chosen
 to make local regression testing useful and visually inspectable. The program
@@ -691,12 +691,12 @@ the final answer, and prints a per-question report with prompt tokens,
 generated tokens, pass/fail state, the model answer, and the correct answer.
 
 ```sh
-./ds4-eval -m ds4flash.gguf --trace /tmp/ds4-eval.txt
+./ns4-eval -m ns4flash.gguf --trace /tmp/ns4-eval.txt
 ```
 
 The default run uses `--tokens 16000`, thinking mode enabled, and a soft/hard
 `</think>` budget cutoff so the model has room to produce a visible answer.
-`ds4-eval` sizes the context internally from the largest selected prompt plus
+`ns4-eval` sizes the context internally from the largest selected prompt plus
 the generation budget, and refuses runs that would need more than 1M context
 tokens. Press `p` to pause, `q` to exit and print the report, Up/Down to
 inspect or select another question, and Enter to run the selected question next.
@@ -712,8 +712,8 @@ For inference changes that can affect generation drift, keep this deterministic
 q1..q4 token-count gate in the test plan:
 
 ```sh
-./ds4-eval \
-  -m ds4flash.gguf \
+./ns4-eval \
+  -m ns4flash.gguf \
   --plain \
   --questions 4 \
   --tokens 2048 \
@@ -764,7 +764,7 @@ a pass/fail unit test.
   to identify the best source line where the defensive code flaw is introduced,
   or return `0` for a safe function.
 
-In practice this means `ds4-eval` should not be expected to produce a perfect
+In practice this means `ns4-eval` should not be expected to produce a perfect
 92/92 run. It is meant to answer a more useful engineering question: after a
 kernel, quantization, prompt-rendering, KV-cache, or tool-streaming change, does
 DeepSeek V4 Flash still solve a representative mix of hard science, broad
@@ -776,21 +776,21 @@ path users run?
 One-shot prompt:
 
 ```sh
-./ds4 -p "Explain Redis streams in one paragraph."
+./ns4 -p "Explain Redis streams in one paragraph."
 ```
 
 No `-p` starts the interactive prompt:
 
 ```sh
-./ds4
-ds4>
+./ns4
+ns4>
 ```
 
 The interactive CLI is a real multi-turn chat. It keeps the rendered chat
 transcript and the live graph KV checkpoint, so each turn extends the previous
 conversation. Useful commands are `/help`, `/think`, `/think-max`, `/nothink`,
 `/ctx N`, `/read FILE`, and `/quit`. Ctrl+C interrupts the current generation
-and returns to `ds4>`.
+and returns to `ns4>`.
 
 The CLI defaults to thinking mode. Use `/nothink` or `--nothink` for direct
 answers. `--mtp MTP.gguf --mtp-draft 2` enables the optional MTP speculative
@@ -803,10 +803,10 @@ experimental slight-speedup path.
 Start a local OpenAI/Anthropic-compatible server:
 
 ```sh
-./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
+./ns4-server --ctx 100000 --kv-disk-dir /tmp/ns4-kv --kv-disk-space-mb 8192
 ```
 
-Use `--chdir /path/to/ds4` when launching `ds4-server` from another directory,
+Use `--chdir /path/to/ns4` when launching `ns4-server` from another directory,
 so relative runtime files resolve from the project tree.
 
 By default the server keeps one mutable backend/KV checkpoint in memory, so
@@ -943,12 +943,12 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 ### Agent Client Usage
 
-`ds4-server` can be used by local coding agents that speak OpenAI-compatible
+`ns4-server` can be used by local coding agents that speak OpenAI-compatible
 chat completions. Start the server first, and set the client context limit no
 higher than the `--ctx` value you started the server with:
 
 ```sh
-./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
+./ns4-server --ctx 100000 --kv-disk-dir /tmp/ns4-kv --kv-disk-space-mb 8192
 ```
 
 You can use larger context and larger cache if you wish. Full context of
@@ -971,8 +971,8 @@ For **opencode**, add a provider and agent entry to
 {
   "$schema": "https://opencode.ai/config.json",
   "provider": {
-    "ds4": {
-      "name": "ds4.c (local)",
+    "ns4": {
+      "name": "ns4.c (local)",
       "npm": "@ai-sdk/openai-compatible",
       "options": {
         "baseURL": "http://127.0.0.1:8000/v1",
@@ -980,7 +980,7 @@ For **opencode**, add a provider and agent entry to
       },
       "models": {
         "deepseek-v4-flash": {
-          "name": "DeepSeek V4 Flash (ds4.c local)",
+          "name": "DeepSeek V4 Flash (ns4.c local)",
           "limit": {
             "context": 100000,
             "output": 384000
@@ -990,9 +990,9 @@ For **opencode**, add a provider and agent entry to
     }
   },
   "agent": {
-    "ds4": {
-      "description": "DeepSeek V4 Flash served by local ds4-server",
-      "model": "ds4/deepseek-v4-flash",
+    "ns4": {
+      "description": "DeepSeek V4 Flash served by local ns4-server",
+      "model": "ns4/deepseek-v4-flash",
       "temperature": 0
     }
   }
@@ -1004,8 +1004,8 @@ For **Pi**, add a provider to `~/.pi/agent/models.json`:
 ```json
 {
   "providers": {
-    "ds4": {
-      "name": "ds4.c local",
+    "ns4": {
+      "name": "ns4.c local",
       "baseUrl": "http://127.0.0.1:8000/v1",
       "api": "openai-completions",
       "apiKey": "dsv4-local",
@@ -1022,7 +1022,7 @@ For **Pi**, add a provider to `~/.pi/agent/models.json`:
       "models": [
         {
           "id": "deepseek-v4-flash",
-          "name": "DeepSeek V4 Flash (ds4.c local)",
+          "name": "DeepSeek V4 Flash (ns4.c local)",
           "reasoning": true,
           "thinkingLevelMap": {
             "off": null,
@@ -1052,7 +1052,7 @@ Optionally make it the default Pi model in `~/.pi/agent/settings.json`:
 
 ```json
 {
-  "defaultProvider": "ds4",
+  "defaultProvider": "ns4",
   "defaultModel": "deepseek-v4-flash"
 }
 ```
@@ -1060,8 +1060,8 @@ Optionally make it the default Pi model in `~/.pi/agent/settings.json`:
 For **Codex CLI**, use the Responses wire API:
 
 ```toml
-[model_providers.ds4]
-name = "DS4"
+[model_providers.ns4]
+name = "NS4"
 base_url = "http://127.0.0.1:8000/v1"
 wire_api = "responses"
 stream_idle_timeout_ms = 1000000
@@ -1070,11 +1070,11 @@ stream_idle_timeout_ms = 1000000
 Then run:
 
 ```sh
-codex --model deepseek-v4-flash -c model_provider=ds4
+codex --model deepseek-v4-flash -c model_provider=ns4
 ```
 
 For **Claude Code**, use the Anthropic-compatible endpoint. A wrapper like this
-matches the local `~/bin/claude-ds4` setup:
+matches the local `~/bin/claude-ns4` setup:
 
 ```sh
 #!/bin/sh
@@ -1085,8 +1085,8 @@ export ANTHROPIC_AUTH_TOKEN="dsv4-local"
 export ANTHROPIC_MODEL="deepseek-v4-flash"
 
 export ANTHROPIC_CUSTOM_MODEL_OPTION="deepseek-v4-flash"
-export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="DeepSeek V4 Flash local ds4"
-export ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="ds4.c local GGUF"
+export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="DeepSeek V4 Flash local ns4"
+export ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="ns4.c local GGUF"
 
 export ANTHROPIC_DEFAULT_SONNET_MODEL="deepseek-v4-flash"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="deepseek-v4-flash"
@@ -1119,7 +1119,7 @@ non-thinking model alias such as `deepseek-chat`.
 ## Disk KV Cache
 
 Chat/completion APIs are stateless: agent clients usually resend the whole
-conversation every request. `ds4-server` first tries the cheap exact token-prefix
+conversation every request. `ns4-server` first tries the cheap exact token-prefix
 check, then falls back to comparing rendered prompt bytes with decoded
 checkpoint bytes. The live in-memory checkpoint covers the current session; the
 disk KV cache makes useful prefixes survive session switches and server
@@ -1134,11 +1134,11 @@ different sessions.
 Enable it with:
 
 ```sh
-./ds4-server --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
+./ns4-server --kv-disk-dir /tmp/ns4-kv --kv-disk-space-mb 8192
 ```
 
 The cache key is the SHA1 of the rendered byte prefix, and files are named
-`<sha1>.kv`. The DS4 payload still stores the exact token IDs and graph state
+`<sha1>.kv`. The NS4 payload still stores the exact token IDs and graph state
 for that prefix. This matters for continued chats: the model may have generated
 one token whose decoded text is later sent back by a client as two canonical
 prompt tokens. A rendered byte-prefix hit can still reuse the checkpoint and
@@ -1159,7 +1159,7 @@ On disk, a cache file is:
 KVC fixed header, 48 bytes
 u32 rendered_text_bytes
 rendered_text_bytes of UTF-8-ish token text
-DS4 session payload, payload_bytes from the KVC header
+NS4 session payload, payload_bytes from the KVC header
 optional tool-id map section
 ```
 
@@ -1178,13 +1178,13 @@ The fixed header is little-endian:
 20  u8[4]  reserved
 24  u64    creation Unix time
 32  u64    last-used Unix time
-40  u64    DS4 session payload byte count
+40  u64    NS4 session payload byte count
 ```
 
 The rendered text is the tokenizer-decoded text for the cached token prefix.
 It is both the human-inspectable prefix and the lookup identity: its SHA1 is
 the filename, and a file is reusable only when those bytes are a prefix of the
-incoming rendered prompt. After load, the exact checkpoint tokens from the DS4
+incoming rendered prompt. After load, the exact checkpoint tokens from the NS4
 payload remain authoritative, and only the incoming text suffix after the cached
 bytes is tokenized.
 
@@ -1217,7 +1217,7 @@ client history and load just those mappings, so an exact DSML replay can survive
 server restarts even when the matching KV snapshot is not the one ultimately
 used for the rendered-prefix hit.
 
-The DS4 session payload starts with thirteen little-endian `u32` fields:
+The NS4 session payload starts with thirteen little-endian `u32` fields:
 
 ```text
 0   magic = "DSV4"
@@ -1248,7 +1248,7 @@ Then it stores:
 - For ratio-4 compressed layers: live indexer compressed rows and indexer
   frontier tensors.
 
-The logits are raw IEEE-754 `float32` values from the host `ds4_session`
+The logits are raw IEEE-754 `float32` values from the host `ns4_session`
 buffer. They are saved immediately after the checkpoint tokens so a loaded
 snapshot can sample or continue from the exact next-token distribution without
 running one extra decode step. MTP draft logits/state are not persisted; after
@@ -1261,8 +1261,8 @@ tensor stream; during load the coordinator splits that stream into the current
 route and pushes the relevant layer tensors back to the workers. The saved file
 does not retain the distributed topology.
 
-The tensor payload is DS4-specific KV/session state, not a generic inference
-graph dump. It is expected to be portable only across compatible `ds4.c`
+The tensor payload is NS4-specific KV/session state, not a generic inference
+graph dump. It is expected to be portable only across compatible `ns4.c`
 builds for this model layout.
 
 The cache stores checkpoints at four moments:
@@ -1305,7 +1305,7 @@ the kv cache files include the verbatim prompt cached.
 The graph backend is CUDA:
 
 ```sh
-./ds4 -p "Hello" --cuda
+./ns4 -p "Hello" --cuda
 ```
 
 On Linux, plain `make` prints the available build targets instead of selecting a
@@ -1330,7 +1330,7 @@ Without `--cuda-tensor-parallel`, CUDA uses normal layer placement across the
 listed devices:
 
 ```sh
-./ds4 -m ./ds4flash.gguf \
+./ns4 -m ./ns4flash.gguf \
   --gpu-vram auto --gpu-devices 0,2,4,6,1,3,5,7 \
   --ctx 32768 -p "Hello"
 ```
@@ -1341,13 +1341,13 @@ For the DeepSeek Flash tensor/expert-parallel layout, see
 There is also a CPU reference/debug path:
 
 ```sh
-./ds4 -p "Hello" --cpu
+./ns4 -p "Hello" --cpu
 make cpu
-./ds4
-./ds4 -p "Hello"
+./ns4
+./ns4 -p "Hello"
 ```
 
-Do not treat the CPU path as the production target. The CLI and `ds4-server`
+Do not treat the CPU path as the production target. The CLI and `ns4-server`
 support the CPU backend for reference/debug use and share the same KV session
 and snapshot format as CUDA, but normal inference should use CUDA.
 
@@ -1368,25 +1368,25 @@ willingness to provide dual-use or offensive security guidance.
 captured from the official DeepSeek V4 Flash API. The requests use
 `deepseek-v4-flash`, greedy decoding, thinking disabled, and the maximum
 `top_logprobs` slice exposed by the API. Local vectors are generated with
-`./ds4 --dump-logprobs` and compared by token bytes, so tokenizer/template or
+`./ns4 --dump-logprobs` and compared by token bytes, so tokenizer/template or
 attention regressions show up before they become long generation failures. The
 C runner pins a 2048-token prefill chunk for this strict API-vector comparison.
 
-The core local tests are driven by the C runner, with a small `ds4-eval`
+The core local tests are driven by the C runner, with a small `ns4-eval`
 extractor self-test run first:
 
 ```sh
-make test                  # ./ds4-eval --self-test-extractors && ./ds4_test --all
-./ds4_test --logprob-vectors
-./ds4_test --server
+make test                  # ./ns4-eval --self-test-extractors && ./ns4_test --all
+./ns4_test --logprob-vectors
+./ns4_test --server
 ```
 
 The batching tests are model-backed and must run on the matching GPU backend:
 
 ```sh
 # CUDA multi-GPU Flash.
-DS4_TEST_MODEL=/path/to/model.gguf make test-cuda-session-batch
-DS4_TEST_MODEL=/path/to/model.gguf make test-cuda-mixed-batch
+NS4_TEST_MODEL=/path/to/model.gguf make test-cuda-session-batch
+NS4_TEST_MODEL=/path/to/model.gguf make test-cuda-mixed-batch
 ```
 
 The official 100-case
@@ -1400,20 +1400,20 @@ When a generation looks wrong, three small tools are usually enough to get a
 first answer:
 
 ```sh
-./ds4 --dump-tokens -p "..."
-./ds4 --dump-logprobs /tmp/out.json --logprobs-top-k 20 --temp 0 -p "..."
-./ds4 --dump-logits /tmp/logits.json --nothink --prompt-file prompt.txt
-./ds4-server --trace /tmp/ds4-trace.txt ...
+./ns4 --dump-tokens -p "..."
+./ns4 --dump-logprobs /tmp/out.json --logprobs-top-k 20 --temp 0 -p "..."
+./ns4 --dump-logits /tmp/logits.json --nothink --prompt-file prompt.txt
+./ns4-server --trace /tmp/ns4-trace.txt ...
 ```
 
 - `--dump-tokens` tokenizes the `-p` or `--prompt-file` string exactly as
-  written, recognizes DS4 protocol specials, and then exits before inference
+  written, recognizes NS4 protocol specials, and then exits before inference
   starts. For example, the DSML tool close marker starts as two tokens: `</`
   and `｜DSML｜`.
 - `--dump-logprobs` stores a greedy continuation with the top local
   alternatives at each step, which helps separate sampling choices from
   logit/model issues.
-- `ds4-server --trace` writes the rendered prompts, cache decisions, generated
+- `ns4-server --trace` writes the rendered prompts, cache decisions, generated
   text, and tool-parser events for a whole agent session.
 
 ## Logo

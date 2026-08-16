@@ -3,8 +3,8 @@
  * Two of the three most expensive kernels in a decode token launch ONE block
  * on a 188-SM GPU, because their grid is `rows` and decode has one row:
  *
- *     rms_norm_plain_batch8_kernel            <<<1, 256>>>   ds4_cuda.cu:16718
- *     hc_split_weighted_sum_norm_fused_kernel <<<n_rows,256>>> ds4_cuda.cu:26264
+ *     rms_norm_plain_batch8_kernel            <<<1, 256>>>   ns4_cuda.cu:16718
+ *     hc_split_weighted_sum_norm_fused_kernel <<<n_rows,256>>> ns4_cuda.cu:26264
  *
  * kprof ranks them at 17.6 and 27.8 us/call, but kprof brackets each launch
  * with events and a 1-block grid absorbs WDDM submission backpressure into
@@ -47,7 +47,7 @@
     fprintf(stderr, "%s:%d %s -> %s\n", __FILE__, __LINE__, #x, \
             cudaGetErrorString(e_)); exit(1); } } while (0)
 
-/* ---------------- baselines, copied verbatim from ds4_cuda.cu ------------- */
+/* ---------------- baselines, copied verbatim from ns4_cuda.cu ------------- */
 
 __global__ static void rms_norm_plain_batch8_kernel(float *out, const float *x, uint32_t n, uint32_t rows, float eps) {
     uint32_t row = blockIdx.x;

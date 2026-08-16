@@ -16,9 +16,9 @@ NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 QUALITY_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
-QUALITY_TARGETS := src/ds4.o src/ds4_cuda.o src/ds4_distributed.o src/ds4_ssd.o src/ds4_layer_pack.o vendor/rax.o src/ds4_gpu_args.o \
-	src/cuda/mmq/ds4_ggml_stubs.o src/cuda/mmq/ds4_mmq.o src/cuda/mmq/ds4_mmq_d2r.o \
-	src/cuda/mmq/quantize.o src/cuda/mmq/mmid.o src/cuda/mmq/mmvq.o src/cuda/mmq/ds4_repack.o
+QUALITY_TARGETS := src/ns4.o src/ns4_cuda.o src/ns4_distributed.o src/ns4_ssd.o src/ns4_layer_pack.o vendor/rax.o src/ns4_gpu_args.o \
+	src/cuda/mmq/ns4_ggml_stubs.o src/cuda/mmq/ns4_mmq.o src/cuda/mmq/ns4_mmq_d2r.o \
+	src/cuda/mmq/quantize.o src/cuda/mmq/mmid.o src/cuda/mmq/mmvq.o src/cuda/mmq/ns4_repack.o
 QUALITY_OBJS := $(addprefix ../../,$(QUALITY_TARGETS))
 QUALITY_LINK := $(NVCC) $(NVCCFLAGS) -I../../src -I../../vendor -o
 LLAMA_CPP_LDLIBS ?= -L$(LLAMA_CPP_BIN) -Wl,-rpath,$(abspath $(LLAMA_CPP_BIN)) \

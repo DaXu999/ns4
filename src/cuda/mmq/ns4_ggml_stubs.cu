@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
-// Implementations of the ggml-API stubs declared in ds4_ggml_stubs.h plus
+// Implementations of the ggml-API stubs declared in ns4_ggml_stubs.h plus
 // the bodies of ggml_backend_cuda_context / ggml_cuda_info /
 // new_pool_for_device that the vendored common.cuh declares without
 // defining.
 //
 // Phase 0: pool is plain cudaMallocAsync / cudaFreeAsync. Phase 4 swaps
-// in ds4's existing cuda_tmp_alloc slab allocator.
+// in ns4's existing cuda_tmp_alloc slab allocator.
 
-#include "common.cuh"   // pulls in ds4_ggml_stubs.h via redirect headers
+#include "common.cuh"   // pulls in ns4_ggml_stubs.h via redirect headers
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
@@ -100,36 +100,36 @@ int64_t ggml_time_us() {
 
 namespace {
 
-/* Thread-local stream that ds4_naive_pool uses for cudaMallocAsync /
+/* Thread-local stream that ns4_naive_pool uses for cudaMallocAsync /
  * cudaFreeAsync.  Defaults to cudaStreamPerThread (preserves prior
  * behaviour).  Step 8 / CUDA Graphs sets this to the capture stream
  * before allocating, so the alloc node lives on the captured stream
- * and capture is not invalidated.  Set via ds4_pool_set_stream() from
- * ds4_mmq.cu wrappers; an explicit stream=0 means the legacy default
+ * and capture is not invalidated.  Set via ns4_pool_set_stream() from
+ * ns4_mmq.cu wrappers; an explicit stream=0 means the legacy default
  * stream so pool ops stay ordered with legacy-stream kernels. */
-static thread_local cudaStream_t t_ds4_pool_stream = cudaStreamPerThread;
+static thread_local cudaStream_t t_ns4_pool_stream = cudaStreamPerThread;
 
 } // anonymous namespace
 
-extern "C" void ds4_pool_set_stream(cudaStream_t stream) {
-    t_ds4_pool_stream = stream;
+extern "C" void ns4_pool_set_stream(cudaStream_t stream) {
+    t_ns4_pool_stream = stream;
 }
 
-extern "C" cudaStream_t ds4_pool_get_stream(void) {
-    return t_ds4_pool_stream;
+extern "C" cudaStream_t ns4_pool_get_stream(void) {
+    return t_ns4_pool_stream;
 }
 
 namespace {
 
-struct ds4_naive_pool : public ggml_cuda_pool {
+struct ns4_naive_pool : public ggml_cuda_pool {
     int device;
 
-    explicit ds4_naive_pool(int device) : device(device) {}
+    explicit ns4_naive_pool(int device) : device(device) {}
 
     void * alloc(size_t size, size_t * actual_size) override {
         ggml_cuda_set_device(device);
         void * ptr = nullptr;
-        CUDA_CHECK(cudaMallocAsync(&ptr, size, t_ds4_pool_stream));
+        CUDA_CHECK(cudaMallocAsync(&ptr, size, t_ns4_pool_stream));
         if (actual_size) *actual_size = size;
         return ptr;
     }
@@ -137,14 +137,14 @@ struct ds4_naive_pool : public ggml_cuda_pool {
     void free(void * ptr, size_t /*size*/) override {
         if (!ptr) return;
         ggml_cuda_set_device(device);
-        CUDA_CHECK(cudaFreeAsync(ptr, t_ds4_pool_stream));
+        CUDA_CHECK(cudaFreeAsync(ptr, t_ns4_pool_stream));
     }
 };
 
 } // anonymous namespace
 
 std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(int device, int /*stream_no*/) {
-    return std::unique_ptr<ggml_cuda_pool>(new ds4_naive_pool(device));
+    return std::unique_ptr<ggml_cuda_pool>(new ns4_naive_pool(device));
 }
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
@@ -154,7 +154,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     }
     // streams[][], cublas_handles[], and pools[][] are owned-by-value
     // (cudaStream_t and cublasHandle_t are opaque handles - destroying the
-    // context "should" tear them down, but in our shim ds4 manages streams
+    // context "should" tear them down, but in our shim ns4 manages streams
     // externally and we leave them alone. The pools auto-destruct via
     // unique_ptr.).
 }

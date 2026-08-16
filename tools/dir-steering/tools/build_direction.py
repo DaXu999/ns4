@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Build a DS4 directional-steering vector from paired prompt sets.
+"""Build a NS4 directional-steering vector from paired prompt sets.
 
-The extractor asks ds4 to dump one 4096-wide activation row per layer, averages
+The extractor asks ns4 to dump one 4096-wide activation row per layer, averages
 the target and control rows, and writes a flat f32 file with 43 layer vectors.
-At runtime ds4 applies:
+At runtime ns4 applies:
 
     y = y - scale * direction[layer] * dot(direction[layer], y)
 
@@ -45,8 +45,8 @@ def read_prompt_file(path: Path) -> list[str]:
     return prompts
 
 
-def render_ds4_prompt(system: str, user: str, think: bool) -> str:
-    """Render the minimal DS4 chat prefix used for activation capture."""
+def render_ns4_prompt(system: str, user: str, think: bool) -> str:
+    """Render the minimal NS4 chat prefix used for activation capture."""
     pieces = [SPECIALS["bos"]]
     if system:
         pieces.append(system)
@@ -72,7 +72,7 @@ def dot(a: list[float], b: list[float]) -> float:
 
 
 def run_capture(
-    ds4: Path,
+    ns4: Path,
     model: Path,
     prompt: str,
     system: str,
@@ -81,24 +81,24 @@ def run_capture(
     component: str,
     work: Path,
 ) -> list[list[float]]:
-    """Run ds4 once and return the last prompt-row dump for every layer."""
+    """Run ns4 once and return the last prompt-row dump for every layer."""
     prompt_path = work / "prompt.txt"
-    prompt_path.write_text(render_ds4_prompt(system, prompt, think), encoding="utf-8")
+    prompt_path.write_text(render_ns4_prompt(system, prompt, think), encoding="utf-8")
     dump_prefix = work / "dump"
 
     env = os.environ.copy()
-    env["DS4_CUDA_GRAPH_DUMP_PREFIX"] = str(dump_prefix)
-    env["DS4_CUDA_GRAPH_DUMP_NAME"] = component
-    env["DS4_CUDA_GRAPH_DUMP_POS"] = "0"
+    env["NS4_CUDA_GRAPH_DUMP_PREFIX"] = str(dump_prefix)
+    env["NS4_CUDA_GRAPH_DUMP_NAME"] = component
+    env["NS4_CUDA_GRAPH_DUMP_POS"] = "0"
 
     cmd = [
-        str(ds4),
+        str(ns4),
         "-m", str(model),
         "--ctx", str(ctx),
         "--prompt-file", str(prompt_path),
         "-n", "1",
     ]
-    subprocess.run(cmd, cwd=ds4.parent, env=env, check=True,
+    subprocess.run(cmd, cwd=ns4.parent, env=env, check=True,
                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
     rows: list[list[float]] = []
@@ -123,8 +123,8 @@ def add_rows(total: list[list[float]], rows: list[list[float]]) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ds4", default="./ds4", help="path to the ds4 CLI")
-    ap.add_argument("--model", default="ds4flash.gguf", help="GGUF model path")
+    ap.add_argument("--ns4", default="./ns4", help="path to the ns4 CLI")
+    ap.add_argument("--model", default="ns4flash.gguf", help="GGUF model path")
     ap.add_argument("--good-file", required=True,
                     help="desired/target prompts, one per line")
     ap.add_argument("--bad-file", required=True,
@@ -144,7 +144,7 @@ def main() -> None:
                     help="do not remove the component parallel to the control mean")
     args = ap.parse_args()
 
-    ds4 = Path(args.ds4).resolve()
+    ns4 = Path(args.ns4).resolve()
     model = Path(args.model).resolve()
     good_prompts = read_prompt_file(Path(args.good_file))
     bad_prompts = read_prompt_file(Path(args.bad_file))
@@ -156,7 +156,7 @@ def main() -> None:
     bad_sum = [[0.0] * N_EMBD for _ in range(N_LAYER)]
     pair_sum = [[0.0] * N_EMBD for _ in range(N_LAYER)]
 
-    with tempfile.TemporaryDirectory(prefix="ds4-dir-steer-") as td:
+    with tempfile.TemporaryDirectory(prefix="ns4-dir-steer-") as td:
         root = Path(td)
         for i, (good, bad) in enumerate(zip(good_prompts, bad_prompts), 1):
             print(f"pair {i}/{n}", flush=True)
@@ -164,9 +164,9 @@ def main() -> None:
             bw = root / f"bad-{i}"
             gw.mkdir()
             bw.mkdir()
-            good_rows = run_capture(ds4, model, good, args.system, args.think,
+            good_rows = run_capture(ns4, model, good, args.system, args.think,
                                     args.ctx, args.component, gw)
-            bad_rows = run_capture(ds4, model, bad, args.system, args.think,
+            bad_rows = run_capture(ns4, model, bad, args.system, args.think,
                                    args.ctx, args.component, bw)
             add_rows(good_sum, good_rows)
             add_rows(bad_sum, bad_rows)
@@ -202,7 +202,7 @@ def main() -> None:
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "format": "ds4-directional-steering-v1",
+        "format": "ns4-directional-steering-v1",
         "shape": [N_LAYER, N_EMBD],
         "component": args.component,
         "thinking": bool(args.think),

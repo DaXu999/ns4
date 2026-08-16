@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Run a small steering scale sweep through ds4.
+"""Run a small steering scale sweep through ns4.
 
 This is intentionally thin: it exercises the same public CLI options users
-will use in production and leaves all inference behavior inside ds4.
+will use in production and leaves all inference behavior inside ns4.
 """
 
 import argparse
@@ -23,8 +23,8 @@ def read_prompts(path: Path) -> list[str]:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ds4", default="./ds4")
-    ap.add_argument("--model", default="ds4flash.gguf")
+    ap.add_argument("--ns4", default="./ns4")
+    ap.add_argument("--model", default="ns4flash.gguf")
     ap.add_argument("--direction", required=True,
                     help="flat f32 vector file produced by build_direction.py")
     ap.add_argument("--prompts", required=True)
@@ -45,7 +45,7 @@ def main() -> None:
             print("-" * 80)
             print(f"FFN scale: {scale:g}")
             cmd = [
-                args.ds4,
+                args.ns4,
                 "-m", args.model,
                 "--ctx", str(args.ctx),
                 "-n", str(args.tokens),

@@ -2,11 +2,11 @@
 
 Here we collect prefill and generation speed obtained with different hardware.
 
-Run `ds4-bench` as:
+Run `ns4-bench` as:
 
 ```
-./ds4-bench \
-  -m ds4flash.gguf \
+./ns4-bench \
+  -m ns4flash.gguf \
   --prompt-file speed-bench/promessi_sposi.txt \
   --ctx-start 2048 \
   --ctx-max 65536 \

@@ -101,7 +101,7 @@ island does not cover stays on the legacy NULL stream -- and the legacy stream
 implicitly synchronises with blocking streams both ways, forcing ~86 pipeline
 drains per token. `cudaGraphLaunch` may target the legacy stream even though
 capture may not, so replaying there keeps decode on one stream. Fixed in
-`acf4a5e`; `DS4_CUDA_DECODE_GRAPH_OWN_STREAM=1` restores the old behaviour.
+`acf4a5e`; `NS4_CUDA_DECODE_GRAPH_OWN_STREAM=1` restores the old behaviour.
 
 | ctx  | graphs ON, legacy stream | graphs ON, own stream | graphs OFF |
 |------|-------------------------:|----------------------:|-----------:|
@@ -161,7 +161,7 @@ about read size, grid width or block width -- not kernel quality.
 
 **kprof is blind to cuBLAS.** It hooks `cuLaunchKernel`, but CUDA 13's cuBLAS
 dispatches through `cuLaunchKernelEx`, so its kernels land in the idle-gap
-column instead. The live instance is the router: `ds4_gpu_matmul_f16_tensor`
+column instead. The live instance is the router: `ns4_gpu_matmul_f16_tensor`
 takes the `cublas_one_token` branch for `ffn_gate_inp`, so 90 MB/token never
 appears above.
 
@@ -219,7 +219,7 @@ given here. The hc Sinkhorn rewrite was 1.87x standalone and converted to
 +0.85%, because those kernels are submission-bound rather than execution-bound.
 
 **What is left is the exactness contract, not the loads.**
-`matmul_f16_pair_wide_kernel` (opt-in, `DS4_CUDA_F16_PAIR_WIDE=128|256|512`)
+`matmul_f16_pair_wide_kernel` (opt-in, `NS4_CUDA_F16_PAIR_WIDE=128|256|512`)
 gives a row NT threads instead of 32 and reaches 95-100% of the achievable
 ceiling at all three shapes, against 50-82% for the bit-identical form. It is
 off by default on cost, not accuracy: worth 1.17% of a token, inside this box's

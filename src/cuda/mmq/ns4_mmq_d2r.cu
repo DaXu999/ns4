@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
-// ds4_mmq_d2r.cu - gated D2R Q2_K MoE down-GEMM production path.
+// ns4_mmq_d2r.cu - gated D2R Q2_K MoE down-GEMM production path.
 //
 // The fused gate/up+SwiGLU+Q8 prefill pipeline (FusedGateUpSmem,
 // iq2_gateup_fused_mainloop, gateup_iq2_swiglu_q8_d2r_kernel and its
 // launcher) is Portions Copyright (c) 2026 Marco Palaferri (MIT), adapted
-// from xangel82/DS4-GB10-GX10-DSpark-CUDA commit 910501e (v0.5 inc-9; the
+// from xangel82/NS4-GB10-GX10-DSpark-CUDA commit 910501e (v0.5 inc-9; the
 // launch decomposition was re-derived for this fork's serving profile).
 
-#include "ds4_mmq_d2r.cuh"
+#include "ns4_mmq_d2r.cuh"
 
 #include <type_traits>
 
@@ -24,13 +24,13 @@
 
 namespace {
 
-// Debug-only fill telemetry for the partial-tile lever (DS4_MMQ_D2R_STATS=1):
+// Debug-only fill telemetry for the partial-tile lever (NS4_MMQ_D2R_STATS=1):
 // per-launch column/tile fill summary from expert_bounds.  Synchronizes the
 // stream - never enable on perf legs.
 static bool d2r_stats_enabled() {
     static int cached = -1;
     if (cached < 0) {
-        const char *env = getenv("DS4_MMQ_D2R_STATS");
+        const char *env = getenv("NS4_MMQ_D2R_STATS");
         cached = (env && env[0] == '1') ? 1 : 0;
     }
     return cached != 0;
@@ -85,7 +85,7 @@ static void d2r_print_fill_stats(const char *tag, const int32_t *expert_bounds_d
         if (tail > 0) tail_hist[(tail - 1) / 8]++;
     }
     fprintf(stderr,
-            "ds4: D2R fill %s: rows=%lld cols=%lld live=%d/%d tiles=%d full=%d "
+            "ns4: D2R fill %s: rows=%lld cols=%lld live=%d/%d tiles=%d full=%d "
             "tail_hist[1-8..57-64]=[%d %d %d %d %d %d %d %d]\n",
             tag, (long long)ne_get_rows, cols, live, n_experts, tiles, full,
             tail_hist[0], tail_hist[1], tail_hist[2], tail_hist[3],
@@ -2736,7 +2736,7 @@ static int64_t d2r_work_capacity(int64_t ncols_max, int n_experts) {
 
 } // namespace
 
-bool ds4_mmq_q2_K_moe_d2r_available(int cc) {
+bool ns4_mmq_q2_K_moe_d2r_available(int cc) {
     static int cached_cc = -1;
     static int cached = 0;
     if (cached_cc != cc) {
@@ -2747,7 +2747,7 @@ bool ds4_mmq_q2_K_moe_d2r_available(int cc) {
     return cached != 0;
 }
 
-bool ds4_mmq_iq2_xxs_moe_d2r_available(int cc) {
+bool ns4_mmq_iq2_xxs_moe_d2r_available(int cc) {
     static int cached_cc = -1;
     static int cached = 0;
     if (cached_cc != cc) {
@@ -2758,7 +2758,7 @@ bool ds4_mmq_iq2_xxs_moe_d2r_available(int cc) {
     return cached != 0;
 }
 
-size_t ds4_mmq_q2_K_moe_d2r_scratch_bytes(int64_t ncols_max, int n_experts) {
+size_t ns4_mmq_q2_K_moe_d2r_scratch_bytes(int64_t ncols_max, int n_experts) {
     const int64_t capacity = d2r_work_capacity(ncols_max, n_experts);
     if (capacity <= 0 || capacity > (int64_t)(INT_MAX - 1)) {
         return 0;
@@ -2766,7 +2766,7 @@ size_t ds4_mmq_q2_K_moe_d2r_scratch_bytes(int64_t ncols_max, int n_experts) {
     return (size_t)capacity * sizeof(int) + sizeof(int);
 }
 
-size_t ds4_mmq_iq2_xxs_moe_d2r_pair_scratch_bytes(int64_t ncols_max, int n_experts) {
+size_t ns4_mmq_iq2_xxs_moe_d2r_pair_scratch_bytes(int64_t ncols_max, int n_experts) {
     const int64_t capacity = d2r_work_capacity(ncols_max, n_experts);
     if (capacity <= 0 || capacity > (int64_t)(INT_MAX - 1)) {
         return 0;
@@ -2774,7 +2774,7 @@ size_t ds4_mmq_iq2_xxs_moe_d2r_pair_scratch_bytes(int64_t ncols_max, int n_exper
     return (size_t)capacity * sizeof(int) + sizeof(int);
 }
 
-size_t ds4_mmq_iq2_xxs_moe_d2r_fused_scratch_bytes(
+size_t ns4_mmq_iq2_xxs_moe_d2r_fused_scratch_bytes(
         int64_t ncols_max, int n_experts) {
     const int64_t capacity =
         d2r_work_capacity_for_tile(ncols_max, n_experts, kFusedNTile);
@@ -2784,7 +2784,7 @@ size_t ds4_mmq_iq2_xxs_moe_d2r_fused_scratch_bytes(
     return (size_t)capacity * sizeof(int) + sizeof(int);
 }
 
-int ds4_mmq_q2_K_moe_d2r_launch(const void *W_soa,
+int ns4_mmq_q2_K_moe_d2r_launch(const void *W_soa,
                                 int64_t soa_blocks,
                                 const void *q8,
                                 const int32_t *ids_dst,
@@ -2797,10 +2797,10 @@ int ds4_mmq_q2_K_moe_d2r_launch(const void *W_soa,
                                 void *worklist_scratch,
                                 size_t worklist_scratch_bytes,
                                 cudaStream_t stream) {
-    const char *tag = "ds4_mmq_q2_K_moe_d2r_launch";
+    const char *tag = "ns4_mmq_q2_K_moe_d2r_launch";
     const int dev = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[dev].cc;
-    if (!ds4_mmq_q2_K_moe_d2r_available(cc)) {
+    if (!ns4_mmq_q2_K_moe_d2r_available(cc)) {
         return 1;
     }
     if (!W_soa || !q8 || !ids_dst || !expert_bounds || !out || !worklist_scratch ||
@@ -2866,7 +2866,7 @@ int ds4_mmq_q2_K_moe_d2r_launch(const void *W_soa,
     return 0;
 }
 
-int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(const void *gate_soa,
+int ns4_mmq_iq2_xxs_moe_d2r_pair_launch(const void *gate_soa,
                                          const void *up_soa,
                                          int64_t soa_blocks,
                                          const void *q8,
@@ -2881,10 +2881,10 @@ int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(const void *gate_soa,
                                          void *worklist_scratch,
                                          size_t worklist_scratch_bytes,
                                          cudaStream_t stream) {
-    const char *tag = "ds4_mmq_iq2_xxs_moe_d2r_pair_launch";
+    const char *tag = "ns4_mmq_iq2_xxs_moe_d2r_pair_launch";
     const int dev = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[dev].cc;
-    if (!ds4_mmq_iq2_xxs_moe_d2r_available(cc)) {
+    if (!ns4_mmq_iq2_xxs_moe_d2r_available(cc)) {
         return 1;
     }
     if (!gate_soa || !up_soa || !q8 || !ids_dst || !expert_bounds || !out_gate || !out_up ||
@@ -2933,7 +2933,7 @@ int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(const void *gate_soa,
     return 0;
 }
 
-int ds4_mmq_iq2_xxs_moe_d2r_fused_launch(
+int ns4_mmq_iq2_xxs_moe_d2r_fused_launch(
         const void *gate_soa,
         const void *up_soa,
         int64_t soa_blocks,
@@ -2952,10 +2952,10 @@ int ds4_mmq_iq2_xxs_moe_d2r_fused_launch(
         void *worklist_scratch,
         size_t worklist_scratch_bytes,
         cudaStream_t stream) {
-    const char *tag = "ds4_mmq_iq2_xxs_moe_d2r_fused_launch";
+    const char *tag = "ns4_mmq_iq2_xxs_moe_d2r_fused_launch";
     const int dev = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[dev].cc;
-    if (!ds4_mmq_iq2_xxs_moe_d2r_available(cc)) {
+    if (!ns4_mmq_iq2_xxs_moe_d2r_available(cc)) {
         return 1;
     }
     if (!gate_soa || !up_soa || !input_q8 || !ids_dst || !expert_bounds ||
@@ -3029,7 +3029,7 @@ int ds4_mmq_iq2_xxs_moe_d2r_fused_launch(
 
 // ============================================================================
 // Dense Q8_0 D2R (2026-07-09, proto_gemm_dense_q8_d2r.cu passes 0-5; arc
-// record in local/docs/ds4_d2r_decomposition_analysis_2026-07-08.md "DENSE-Q8
+// record in local/docs/ns4_d2r_decomposition_analysis_2026-07-08.md "DENSE-Q8
 // D2R PROTO ARC").
 //
 // Reads the kind-5 aligned artifact (CUDA_DERIVED_Q8_0_ALIGNED_DENSE, weight
@@ -3052,7 +3052,7 @@ int ds4_mmq_iq2_xxs_moe_d2r_fused_launch(
 // vs production mul_mat_q<8,128,0> per-launch (cmttmixnsys15.sqlite): down
 // [4096x2048] 3.2x, gate/up [2048x4096] 1.37x, q_b [32768x1024] 1.17x f32.
 // o_proj [4096x8192] measured SLOWER (0.81x) - mmq is strong at deep K; the
-// dispatch in ds4_cuda.cu keeps K=8192 on mmq.
+// dispatch in ns4_cuda.cu keeps K=8192 on mmq.
 // ============================================================================
 
 namespace {
@@ -3310,7 +3310,7 @@ void dense_q8_d2r_kernel(const char * __restrict__ wd_plane,
 } // namespace dq8
 } // anonymous namespace
 
-bool ds4_mmq_q8_0_dense_d2r_available(int cc) {
+bool ns4_mmq_q8_0_dense_d2r_available(int cc) {
     static int cached_cc = -1;
     static int cached = 0;
     if (cached_cc != cc) {
@@ -3325,14 +3325,14 @@ bool ds4_mmq_q8_0_dense_d2r_available(int cc) {
 // (D4 layout, [k128][col] with stride N, over-allocated by >= 128 blocks for
 // the guarded last col tile - the mmq Y buffer's own mmq_x_max slack covers
 // this).  out is column-major [N][M] f32, every element written.
-int ds4_mmq_q8_0_dense_d2r_launch(
+int ns4_mmq_q8_0_dense_d2r_launch(
         const void *W_aligned, const void *q8, float *out,
         int M, int N, int K, cudaStream_t stream) {
     using namespace dq8;
     if (!W_aligned || !q8 || !out ||
         M <= 0 || (M % kDqMTile) != 0 || N <= 0 || K <= 0 ||
         (K % 1024) != 0 || (K >> 6) < kDqStages) {
-        fprintf(stderr, "ds4_mmq_q8_0_dense_d2r_launch: bad args M=%d N=%d K=%d\n", M, N, K);
+        fprintf(stderr, "ns4_mmq_q8_0_dense_d2r_launch: bad args M=%d N=%d K=%d\n", M, N, K);
         return -1;
     }
     static int smem_opted = 0;
@@ -3341,7 +3341,7 @@ int ds4_mmq_q8_0_dense_d2r_launch(
             dense_q8_d2r_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
             (int)kDqSmemTotalBytes);
         if (aerr != cudaSuccess) {
-            fprintf(stderr, "ds4_mmq_q8_0_dense_d2r_launch: smem opt-in failed: %s\n",
+            fprintf(stderr, "ns4_mmq_q8_0_dense_d2r_launch: smem opt-in failed: %s\n",
                     cudaGetErrorString(aerr));
             return -2;
         }
@@ -3362,7 +3362,7 @@ int ds4_mmq_q8_0_dense_d2r_launch(
         wd_plane, wq_plane, (const block_q8_1_mmq *)q8, out, M, N, K, group_m);
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "ds4_mmq_q8_0_dense_d2r_launch: launch failed: %s\n",
+        fprintf(stderr, "ns4_mmq_q8_0_dense_d2r_launch: launch failed: %s\n",
                 cudaGetErrorString(err));
         return -3;
     }

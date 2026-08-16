@@ -12,7 +12,7 @@ PRO_Q4_LAYERS31_OUTPUT_FILE="DeepSeek-V4-Pro-Q4K-Layers-31-output.gguf"
 DS4F_DSPARK_FILE="DeepSeek-V4-Flash-DSpark-support-0731.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
+OUT_DIR=${NS4_GGUF_DIR:-"$ROOT/gguf"}
 case "$OUT_DIR" in
     /*) ;;
     *) OUT_DIR="$ROOT/$OUT_DIR" ;;
@@ -57,7 +57,7 @@ Targets:
 
   ds4f-dspark
        Optional DSpark speculative decoding support GGUF for Flash 0731, about
-       6 GB. Enable it with --dspark and --mtp when running ds4 or ds4-server.
+       6 GB. Enable it with --dspark and --mtp when running ns4 or ns4-server.
 
   pro-q2-imatrix
        DeepSeek V4 PRO q2 imatrix quant, as a single GGUF file. About 430 GB
@@ -74,25 +74,25 @@ Targets:
 
   pro-q4-split
        Downloads both PRO Q4 split files into the download directory. About
-       838 GB total. This target does not update ./ds4flash.gguf.
+       838 GB total. This target does not update ./ns4flash.gguf.
 
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
                  cache is used if present.
 
 Environment:
-  DS4_GGUF_DIR   Directory used for downloaded GGUF files.
+  NS4_GGUF_DIR   Directory used for downloaded GGUF files.
                  Default: ./gguf
 
 After main-model downloads the script updates:
-  ./ds4flash.gguf -> <download directory>/<selected model>
+  ./ns4flash.gguf -> <download directory>/<selected model>
 
 Then the default commands work:
-  ./ds4 -p "Hello"
-  ./ds4-server --ctx 100000
+  ./ns4 -p "Hello"
+  ./ns4-server --ctx 100000
 
 After downloading DSpark support, enable it explicitly in greedy mode:
-  ./ds4 --dspark --mtp <download directory>/$DS4F_DSPARK_FILE --temp 0
+  ./ns4 --dspark --mtp <download directory>/$DS4F_DSPARK_FILE --temp 0
 
 PRO files are downloaded with the official Hugging Face downloader
 because they are too large, sharded, or nested for the curl path used by the
@@ -296,15 +296,15 @@ fi
 if [ "$MODEL" = "ds4f-dspark" ]; then
     echo
     echo "DSpark support downloaded. Enable it explicitly in greedy mode:"
-    echo "  ./ds4 --dspark -m ./ds4flash.gguf --mtp $OUT_DIR/$DS4F_DSPARK_FILE --temp 0"
+    echo "  ./ns4 --dspark -m ./ns4flash.gguf --mtp $OUT_DIR/$DS4F_DSPARK_FILE --temp 0"
 elif [ "$MODEL" = "pro-q4-layers00-30" ] || [ "$MODEL" = "pro-q4-layers31-output" ] || [ "$MODEL" = "pro-q4-split" ]; then
     echo
     echo "Downloaded PRO Q4 distributed split file(s). Use them with --layers,"
     echo "for example coordinator layers 0:30 and worker layers 31:output."
 elif [ "$LINK_MODEL" -eq 1 ]; then
     cd "$ROOT"
-    ln -sfn "$OUT_DIR/$MODEL_FILE" ds4flash.gguf
-    echo "Linked ./ds4flash.gguf -> $OUT_DIR/$MODEL_FILE"
+    ln -sfn "$OUT_DIR/$MODEL_FILE" ns4flash.gguf
+    echo "Linked ./ns4flash.gguf -> $OUT_DIR/$MODEL_FILE"
 fi
 
 echo

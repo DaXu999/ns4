@@ -1,13 +1,13 @@
-#include "ds4.h"
-#include "ds4_distributed.h"
-#include "ds4_gpu_args.h"
-#include "ds4_help.h"
+#include "ns4.h"
+#include "ns4_distributed.h"
+#include "ns4_gpu_args.h"
+#include "ns4_help.h"
 #include "linenoise.h"
 
-/* ds4 CLI.
+/* ns4 CLI.
  *
  * One-shot mode builds a single model-family chat prompt and exits.  Interactive
- * mode keeps a rendered token transcript plus one ds4_session, so follow-up
+ * mode keeps a rendered token transcript plus one ns4_session, so follow-up
  * turns reuse the live Metal KV checkpoint just like the server does.  The CLI
  * deliberately keeps policy here and leaves graph/cache mechanics inside the
  * engine API. */
@@ -33,18 +33,18 @@ static bool cli_env_flag_enabled(const char *name, bool defval) {
 }
 
 static bool cli_splitkv_spec_requested(void) {
-    if (cli_env_flag_enabled("DS4_CUDA_NO_SPLITKV_SPEC", false)) return false;
-    return cli_env_flag_enabled("DS4_CUDA_SPLITKV_SPEC", false);
+    if (cli_env_flag_enabled("NS4_CUDA_NO_SPLITKV_SPEC", false)) return false;
+    return cli_env_flag_enabled("NS4_CUDA_SPLITKV_SPEC", false);
 }
 
 static bool cli_greedy_fast_attention_requested(void) {
-    if (!cli_env_flag_enabled("DS4_CUDA_NO_GREEDY_SPLITKV", false) &&
-        cli_env_flag_enabled("DS4_CUDA_GREEDY_SPLITKV", false))
+    if (!cli_env_flag_enabled("NS4_CUDA_NO_GREEDY_SPLITKV", false) &&
+        cli_env_flag_enabled("NS4_CUDA_GREEDY_SPLITKV", false))
     {
         return true;
     }
-    if (!cli_env_flag_enabled("DS4_CUDA_NO_GREEDY_VEC4", false) &&
-        cli_env_flag_enabled("DS4_CUDA_GREEDY_VEC4", false))
+    if (!cli_env_flag_enabled("NS4_CUDA_NO_GREEDY_VEC4", false) &&
+        cli_env_flag_enabled("NS4_CUDA_GREEDY_VEC4", false))
     {
         return true;
     }
@@ -54,7 +54,7 @@ static bool cli_greedy_fast_attention_requested(void) {
 static bool cli_greedy_argmax_requested(bool speculative_requested) {
     if (cli_greedy_fast_attention_requested()) return true;
     if (speculative_requested) return false;
-    return cli_env_flag_enabled("DS4_CUDA_GREEDY_TOP1", true);
+    return cli_env_flag_enabled("NS4_CUDA_GREEDY_TOP1", true);
 }
 
 typedef struct {
@@ -80,7 +80,7 @@ typedef struct {
     const char *imatrix_output_path;
     int imatrix_max_prompts;
     int imatrix_max_tokens;
-    ds4_think_mode think_mode;
+    ns4_think_mode think_mode;
     bool head_test;
     bool first_token_test;
     bool graph_test;
@@ -89,8 +89,8 @@ typedef struct {
 } cli_generation_options;
 
 typedef struct {
-    ds4_engine_options engine;
-    ds4_dist_options *dist;
+    ns4_engine_options engine;
+    ns4_dist_options *dist;
     cli_generation_options gen;
     char *prompt_owned;
     bool inspect;
@@ -105,7 +105,7 @@ static volatile sig_atomic_t cli_dist_busy;
 static volatile sig_atomic_t cli_dist_notice_printed;
 
 static const char cli_dist_drain_msg[] =
-    "\nds4: stopping after the distributed cluster finishes the current token/chunk...\n";
+    "\nns4: stopping after the distributed cluster finishes the current token/chunk...\n";
 
 static void cli_sigint_handler(int sig) {
     (void)sig;
@@ -129,7 +129,7 @@ static void cli_interrupt_clear(void) {
 }
 
 static bool cli_distributed_coordinator(const cli_config *cfg) {
-    return cfg && cfg->engine.distributed.role == DS4_DISTRIBUTED_COORDINATOR;
+    return cfg && cfg->engine.distributed.role == NS4_DISTRIBUTED_COORDINATOR;
 }
 
 static void cli_dist_busy_set(const cli_config *cfg, bool busy) {
@@ -138,7 +138,7 @@ static void cli_dist_busy_set(const cli_config *cfg, bool busy) {
     if (!busy) cli_dist_notice_printed = 0;
 }
 
-static int cli_wait_distributed_route(const cli_config *cfg, ds4_session *session) {
+static int cli_wait_distributed_route(const cli_config *cfg, ns4_session *session) {
     if (!cli_distributed_coordinator(cfg)) return 0;
 
     char err[256] = {0};
@@ -147,21 +147,21 @@ static int cli_wait_distributed_route(const cli_config *cfg, ds4_session *sessio
     const struct timespec delay = {0, 250000000L};
 
     for (;;) {
-        int ready = ds4_session_distributed_route_ready(session, err, sizeof(err));
+        int ready = ns4_session_distributed_route_ready(session, err, sizeof(err));
         if (ready > 0) {
-            if (ticks) fprintf(stderr, "ds4: distributed route ready\n");
+            if (ticks) fprintf(stderr, "ns4: distributed route ready\n");
             return 0;
         }
         if (ready < 0) {
             fprintf(stderr,
-                    "ds4: distributed route readiness failed: %s\n",
+                    "ns4: distributed route readiness failed: %s\n",
                     err[0] ? err : "unknown error");
             return 1;
         }
 
         const char *why = err[0] ? err : "route incomplete";
         if (strcmp(last, why) != 0 || (ticks % 20u) == 0) {
-            fprintf(stderr, "ds4: waiting for distributed route: %s\n", why);
+            fprintf(stderr, "ns4: waiting for distributed route: %s\n", why);
             snprintf(last, sizeof(last), "%s", why);
         }
         nanosleep(&delay, NULL);
@@ -170,14 +170,14 @@ static int cli_wait_distributed_route(const cli_config *cfg, ds4_session *sessio
 }
 
 static void usage(FILE *fp, const char *topic) {
-    ds4_help_print(fp, DS4_HELP_DS4, topic);
+    ns4_help_print(fp, NS4_HELP_NS4, topic);
 }
 
 static int parse_int(const char *s, const char *opt) {
     char *end = NULL;
     long v = strtol(s, &end, 10);
     if (s[0] == '\0' || *end != '\0' || v <= 0 || v > INT32_MAX) {
-        fprintf(stderr, "ds4: invalid value for %s: %s\n", opt, s);
+        fprintf(stderr, "ns4: invalid value for %s: %s\n", opt, s);
         exit(2);
     }
     return (int)v;
@@ -187,7 +187,7 @@ static uint64_t parse_u64(const char *s, const char *opt) {
     char *end = NULL;
     unsigned long long v = strtoull(s, &end, 10);
     if (s[0] == '\0' || *end != '\0' || v == 0) {
-        fprintf(stderr, "ds4: invalid value for %s: %s\n", opt, s);
+        fprintf(stderr, "ns4: invalid value for %s: %s\n", opt, s);
         exit(2);
     }
     return (uint64_t)v;
@@ -197,45 +197,45 @@ static float parse_float_range(const char *s, const char *opt, float min, float 
     char *end = NULL;
     float v = strtof(s, &end);
     if (s[0] == '\0' || *end != '\0' || !isfinite(v) || v < min || v > max) {
-        fprintf(stderr, "ds4: invalid value for %s: %s\n", opt, s);
+        fprintf(stderr, "ns4: invalid value for %s: %s\n", opt, s);
         exit(2);
     }
     return v;
 }
 
-static ds4_backend parse_backend(const char *s) {
-    if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
-    if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
-    fprintf(stderr, "ds4: invalid backend: %s\n", s);
-    fprintf(stderr, "ds4: valid backends are: cuda, cpu\n");
+static ns4_backend parse_backend(const char *s) {
+    if (!strcmp(s, "cuda")) return NS4_BACKEND_CUDA;
+    if (!strcmp(s, "cpu")) return NS4_BACKEND_CPU;
+    fprintf(stderr, "ns4: invalid backend: %s\n", s);
+    fprintf(stderr, "ns4: valid backends are: cuda, cpu\n");
     exit(2);
 }
 
-static ds4_backend default_backend(void) {
-#ifdef DS4_NO_GPU
-    return DS4_BACKEND_CPU;
+static ns4_backend default_backend(void) {
+#ifdef NS4_NO_GPU
+    return NS4_BACKEND_CPU;
 #else
-    return DS4_BACKEND_CUDA;
+    return NS4_BACKEND_CUDA;
 #endif
 }
 
-static void log_context_memory(ds4_backend backend,
+static void log_context_memory(ns4_backend backend,
                                int         ctx_size,
                                uint32_t    prefill_chunk,
                                bool        ssd_streaming) {
-    ds4_context_memory m =
-        ds4_context_memory_estimate_with_prefill_mode(backend,
+    ns4_context_memory m =
+        ns4_context_memory_estimate_with_prefill_mode(backend,
                                                       ctx_size,
                                                       prefill_chunk,
                                                       ssd_streaming);
     const uint64_t kv_bytes = m.raw_bytes + m.compressed_bytes;
     const uint64_t total_bytes = kv_bytes + m.scratch_bytes;
-    const bool color = ds4_log_is_tty(stderr);
+    const bool color = ns4_log_is_tty(stderr);
     const char *green = color ? "\x1b[32m" : "";
     const char *bright_green = color ? "\x1b[1;32m" : "";
     const char *reset = color ? "\x1b[0m" : "";
     fprintf(stderr,
-            "%sds4: memory: KV %.2f GiB (raw %.2f + compressed %.2f) "
+            "%sns4: memory: KV %.2f GiB (raw %.2f + compressed %.2f) "
             "+ buffers %.2f GiB = %s%.2f GiB context%s\n",
             green,
             (double)kv_bytes / 1073741824.0,
@@ -246,33 +246,33 @@ static void log_context_memory(ds4_backend backend,
             (double)total_bytes / 1073741824.0,
             reset);
     fprintf(stderr,
-            "%sds4: memory detail: ctx=%d prefill_cap=%u raw_kv_rows=%u "
+            "%sns4: memory detail: ctx=%d prefill_cap=%u raw_kv_rows=%u "
             "compressed_kv_rows=%u backend=%s%s\n",
             green,
             ctx_size,
             m.prefill_cap,
             m.raw_cap,
             m.comp_cap,
-            ds4_backend_name(backend),
+            ns4_backend_name(backend),
             reset);
 }
 
-static ds4_think_mode cli_effective_think_mode(const cli_generation_options *gen) {
-    return ds4_think_mode_for_context(gen->think_mode, gen->ctx_size);
+static ns4_think_mode cli_effective_think_mode(const cli_generation_options *gen) {
+    return ns4_think_mode_for_context(gen->think_mode, gen->ctx_size);
 }
 
 static bool cli_think_max_downgraded(const cli_generation_options *gen) {
-    return gen->think_mode == DS4_THINK_MAX &&
-           cli_effective_think_mode(gen) != DS4_THINK_MAX;
+    return gen->think_mode == NS4_THINK_MAX &&
+           cli_effective_think_mode(gen) != NS4_THINK_MAX;
 }
 
 static void cli_warn_think_max_downgraded(const cli_generation_options *gen, const char *name) {
     if (!cli_think_max_downgraded(gen)) return;
-    ds4_log(stderr,
-        DS4_LOG_WARNING,
-        "ds4: warning: %s needs --ctx >= %u; ctx=%d uses normal thinking instead\n",
+    ns4_log(stderr,
+        NS4_LOG_WARNING,
+        "ns4: warning: %s needs --ctx >= %u; ctx=%d uses normal thinking instead\n",
         name,
-        ds4_think_max_min_context(),
+        ns4_think_max_min_context(),
         gen->ctx_size);
 }
 
@@ -311,8 +311,8 @@ static void cli_prefill_progress_cb(void *ud, const char *event, int current, in
 
     if (p->use_color) {
         fputc('\r', stderr);
-        ds4_log(stderr,
-                DS4_LOG_PREFILL,
+        ns4_log(stderr,
+                NS4_LOG_PREFILL,
                 "processing %d input tokens: %d/%d (%.1f%%)",
                 p->input_tokens,
                 processed,
@@ -352,7 +352,7 @@ static bool is_rendered_chat_prompt(const char *prompt) {
 }
 
 typedef struct {
-    ds4_engine *engine;
+    ns4_engine *engine;
     FILE *fp;
     bool format_thinking;
     bool in_think;
@@ -469,74 +469,74 @@ static void token_printer_write_text(token_printer *p, const char *text, size_t 
 static void print_generated_token(void *ud, int token) {
     token_printer *p = ud;
     size_t len = 0;
-    char *text = ds4_token_text(p->engine, token, &len);
+    char *text = ns4_token_text(p->engine, token, &len);
     token_printer_write_text(p, text, len);
     fflush(p->fp);
     free(text);
 }
 
-static void build_prompt(ds4_engine *engine, const cli_generation_options *gen, ds4_tokens *out) {
+static void build_prompt(ns4_engine *engine, const cli_generation_options *gen, ns4_tokens *out) {
     if (gen->raw_prompt) {
-        ds4_tokenize_text(engine, gen->prompt ? gen->prompt : "", out);
+        ns4_tokenize_text(engine, gen->prompt ? gen->prompt : "", out);
     } else if (is_rendered_chat_prompt(gen->prompt)) {
-        ds4_tokenize_rendered_chat(engine, gen->prompt, out);
+        ns4_tokenize_rendered_chat(engine, gen->prompt, out);
     } else {
-        ds4_encode_chat_prompt(engine, gen->system, gen->prompt,
+        ns4_encode_chat_prompt(engine, gen->system, gen->prompt,
                                cli_effective_think_mode(gen), out);
     }
 }
 
-static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
-    ds4_session *session = NULL;
-    if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
-        fprintf(stderr, "ds4: sampled CLI generation requires a session backend\n");
+static int run_sampled_generation(ns4_engine *engine, const cli_config *cfg, const ns4_tokens *prompt) {
+    ns4_session *session = NULL;
+    if (ns4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
+        fprintf(stderr, "ns4: sampled CLI generation requires a session backend\n");
         return 1;
     }
     if (cli_wait_distributed_route(cfg, session) != 0) {
-        ds4_session_free(session);
+        ns4_session_free(session);
         return 1;
     }
     /* Pay the one-time first-submission GPU cost before the prefill timer
      * starts (matches the TP worker's startup warmup). */
-    ds4_session_gpu_warmup(session);
+    ns4_session_gpu_warmup(session);
 
     char err[160];
-    ds4_think_mode think_mode = cli_effective_think_mode(&cfg->gen);
+    ns4_think_mode think_mode = cli_effective_think_mode(&cfg->gen);
     token_printer printer = {
         .engine = engine,
         .fp = stdout,
-        .format_thinking = ds4_think_mode_enabled(think_mode),
-        .in_think = ds4_think_mode_enabled(think_mode),
+        .format_thinking = ns4_think_mode_enabled(think_mode),
+        .in_think = ns4_think_mode_enabled(think_mode),
         .use_color = isatty(fileno(stdout)) != 0,
         .last_output_newline = true,
     };
     cli_prefill_progress progress = {
         .base_tokens = 0,
         .input_tokens = prompt->len,
-        .use_color = ds4_log_is_tty(stderr),
+        .use_color = ns4_log_is_tty(stderr),
     };
 
     const double t_prefill0 = cli_now_sec();
-    ds4_session_set_progress(session, cli_prefill_progress_cb, &progress);
-    ds4_session_set_display_progress(session,
+    ns4_session_set_progress(session, cli_prefill_progress_cb, &progress);
+    ns4_session_set_display_progress(session,
                                      progress.use_color ? cli_prefill_progress_cb : NULL,
                                      progress.use_color ? &progress : NULL);
     cli_dist_busy_set(cfg, true);
-    int sync_rc = ds4_session_sync(session, prompt, err, sizeof(err));
+    int sync_rc = ns4_session_sync(session, prompt, err, sizeof(err));
     cli_dist_busy_set(cfg, false);
     if (sync_rc != 0) {
-        ds4_session_set_progress(session, NULL, NULL);
-        ds4_session_set_display_progress(session, NULL, NULL);
-        fprintf(stderr, "ds4: prompt processing failed: %s\n", err);
-        ds4_session_free(session);
+        ns4_session_set_progress(session, NULL, NULL);
+        ns4_session_set_display_progress(session, NULL, NULL);
+        fprintf(stderr, "ns4: prompt processing failed: %s\n", err);
+        ns4_session_free(session);
         return 1;
     }
-    ds4_session_set_progress(session, NULL, NULL);
-    ds4_session_set_display_progress(session, NULL, NULL);
+    ns4_session_set_progress(session, NULL, NULL);
+    ns4_session_set_display_progress(session, NULL, NULL);
     const double t_prefill1 = cli_now_sec();
 
     int max_tokens = cfg->gen.n_predict;
-    int room = ds4_session_ctx(session) - ds4_session_pos(session);
+    int room = ns4_session_ctx(session) - ns4_session_pos(session);
     if (room <= 1) max_tokens = 0;
     else if (max_tokens > room - 1) max_tokens = room - 1;
 
@@ -544,8 +544,8 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
     int generated = 0;
     const bool speculative_argmax = cfg->gen.temperature <= 0.0f &&
-        ((ds4_engine_mtp_draft_tokens(engine) > 1 &&
-          getenv("DS4_MTP_SPEC_DISABLE") == NULL) ||
+        ((ns4_engine_mtp_draft_tokens(engine) > 1 &&
+          getenv("NS4_MTP_SPEC_DISABLE") == NULL) ||
          cli_splitkv_spec_requested());
     const bool greedy_argmax = cfg->gen.temperature <= 0.0f &&
         cli_greedy_argmax_requested(speculative_argmax);
@@ -558,33 +558,33 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             token = greedy_next;
             have_greedy_next = false;
         } else {
-            token = ds4_session_sample(session, cfg->gen.temperature, 0,
+            token = ns4_session_sample(session, cfg->gen.temperature, 0,
                                        cfg->gen.top_p, cfg->gen.min_p, &rng);
         }
-        if (ds4_token_is_stop_for_think_mode(engine, token, think_mode)) break;
+        if (ns4_token_is_stop_for_think_mode(engine, token, think_mode)) break;
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+        if (cfg->gen.temperature <= 0.0f && ns4_engine_mtp_draft_tokens(engine) > 1 &&
+            getenv("NS4_MTP_SPEC_DISABLE") == NULL) {
             cli_dist_busy_set(cfg, true);
-            ntok = ds4_session_eval_speculative_argmax(session,
+            ntok = ns4_session_eval_speculative_argmax(session,
                                                        token,
                                                        max_tokens - generated,
-                                                       ds4_token_eos(engine),
+                                                       ns4_token_eos(engine),
                                                        toks,
                                                        (int)(sizeof(toks) / sizeof(toks[0])),
                                                        err,
                                                        sizeof(err));
             cli_dist_busy_set(cfg, false);
             if (ntok < 0) {
-                fprintf(stderr, "ds4: decode failed: %s\n", err);
-                ds4_session_free(session);
+                fprintf(stderr, "ns4: decode failed: %s\n", err);
+                ns4_session_free(session);
                 return 1;
             }
         } else {
             size_t piece_len = 0;
-            char *piece = ds4_token_text(engine, token, &piece_len);
+            char *piece = ns4_token_text(engine, token, &piece_len);
             token_printer_write_text(&printer, piece, piece_len);
             fflush(stdout);
             free(piece);
@@ -594,11 +594,11 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             }
 
             cli_dist_busy_set(cfg, true);
-            int eval_rc = ds4_session_eval(session, token, err, sizeof(err));
+            int eval_rc = ns4_session_eval(session, token, err, sizeof(err));
             cli_dist_busy_set(cfg, false);
             if (eval_rc != 0) {
-                fprintf(stderr, "ds4: decode failed: %s\n", err);
-                ds4_session_free(session);
+                fprintf(stderr, "ns4: decode failed: %s\n", err);
+                ns4_session_free(session);
                 return 1;
             }
             continue;
@@ -606,12 +606,12 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
         bool stop = false;
         for (int j = 0; j < ntok; j++) {
-            if (ds4_token_is_stop_for_think_mode(engine, toks[j], think_mode)) {
+            if (ns4_token_is_stop_for_think_mode(engine, toks[j], think_mode)) {
                 stop = true;
                 break;
             }
             size_t piece_len = 0;
-            char *piece = ds4_token_text(engine, toks[j], &piece_len);
+            char *piece = ns4_token_text(engine, toks[j], &piece_len);
             token_printer_write_text(&printer, piece, piece_len);
             fflush(stdout);
             free(piece);
@@ -626,13 +626,13 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
     const double prefill_s = t_prefill1 - t_prefill0;
     const double decode_s = t_decode1 - t_decode0;
-    ds4_log(stderr,
-            DS4_LOG_TIMING,
-            "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
+    ns4_log(stderr,
+            NS4_LOG_TIMING,
+            "ns4: prefill: %.2f t/s, generation: %.2f t/s\n",
             prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
             decode_s > 0.0 ? (double)generated / decode_s : 0.0);
 
-    ds4_session_free(session);
+    ns4_session_free(session);
     return 0;
 }
 
@@ -688,9 +688,9 @@ static void json_write_string(FILE *fp, const char *s, size_t n) {
     fputc('"', fp);
 }
 
-static void json_write_token(FILE *fp, ds4_engine *engine, int token) {
+static void json_write_token(FILE *fp, ns4_engine *engine, int token) {
     size_t n = 0;
-    char *text = ds4_token_text(engine, token, &n);
+    char *text = ns4_token_text(engine, token, &n);
     fprintf(fp, "{\"id\":%d,\"text\":", token);
     json_write_string(fp, text, n);
     fputs(",\"bytes\":[", fp);
@@ -703,14 +703,14 @@ static void json_write_token(FILE *fp, ds4_engine *engine, int token) {
     free(text);
 }
 
-static int run_logits_dump(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
-    ds4_session *session = NULL;
-    if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
-        fprintf(stderr, "ds4: --dump-logits requires a graph session backend\n");
+static int run_logits_dump(ns4_engine *engine, const cli_config *cfg, const ns4_tokens *prompt) {
+    ns4_session *session = NULL;
+    if (ns4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
+        fprintf(stderr, "ns4: --dump-logits requires a graph session backend\n");
         return 1;
     }
     if (cli_wait_distributed_route(cfg, session) != 0) {
-        ds4_session_free(session);
+        ns4_session_free(session);
         return 1;
     }
 
@@ -718,54 +718,54 @@ static int run_logits_dump(ds4_engine *engine, const cli_config *cfg, const ds4_
     cli_prefill_progress progress = {
         .base_tokens = 0,
         .input_tokens = prompt->len,
-        .use_color = ds4_log_is_tty(stderr),
+        .use_color = ns4_log_is_tty(stderr),
     };
-    ds4_session_set_progress(session, cli_prefill_progress_cb, &progress);
-    ds4_session_set_display_progress(session,
+    ns4_session_set_progress(session, cli_prefill_progress_cb, &progress);
+    ns4_session_set_display_progress(session,
                                      progress.use_color ? cli_prefill_progress_cb : NULL,
                                      progress.use_color ? &progress : NULL);
-    if (ds4_session_sync(session, prompt, err, sizeof(err)) != 0) {
-        ds4_session_set_progress(session, NULL, NULL);
-        ds4_session_set_display_progress(session, NULL, NULL);
-        fprintf(stderr, "ds4: prompt processing failed: %s\n", err);
-        ds4_session_free(session);
+    if (ns4_session_sync(session, prompt, err, sizeof(err)) != 0) {
+        ns4_session_set_progress(session, NULL, NULL);
+        ns4_session_set_display_progress(session, NULL, NULL);
+        fprintf(stderr, "ns4: prompt processing failed: %s\n", err);
+        ns4_session_free(session);
         return 1;
     }
-    ds4_session_set_progress(session, NULL, NULL);
-    ds4_session_set_display_progress(session, NULL, NULL);
+    ns4_session_set_progress(session, NULL, NULL);
+    ns4_session_set_display_progress(session, NULL, NULL);
 
-    const int vocab = ds4_engine_vocab_size(engine);
+    const int vocab = ns4_engine_vocab_size(engine);
     float *logits = malloc((size_t)vocab * sizeof(logits[0]));
     if (!logits) {
-        ds4_session_free(session);
+        ns4_session_free(session);
         return 1;
     }
-    if (ds4_session_copy_logits(session, logits, vocab) != vocab) {
-        fprintf(stderr, "ds4: failed to copy session logits\n");
+    if (ns4_session_copy_logits(session, logits, vocab) != vocab) {
+        fprintf(stderr, "ns4: failed to copy session logits\n");
         free(logits);
-        ds4_session_free(session);
+        ns4_session_free(session);
         return 1;
     }
 
     FILE *fp = fopen(cfg->gen.dump_logits_path, "wb");
     if (!fp) {
-        fprintf(stderr, "ds4: failed to open --dump-logits file: %s\n", cfg->gen.dump_logits_path);
+        fprintf(stderr, "ns4: failed to open --dump-logits file: %s\n", cfg->gen.dump_logits_path);
         free(logits);
-        ds4_session_free(session);
+        ns4_session_free(session);
         return 1;
     }
 
-    fprintf(fp, "{\n  \"source\":\"ds4\",\n  \"model\":");
+    fprintf(fp, "{\n  \"source\":\"ns4\",\n  \"model\":");
     json_write_string(fp, cfg->engine.model_path, strlen(cfg->engine.model_path));
     fprintf(fp,
             ",\n  \"backend\":\"%s\",\n  \"quant_bits\":%d,\n"
             "  \"prompt_tokens\":%d,\n  \"ctx\":%d,\n  \"vocab\":%d,\n",
-            ds4_backend_name(cfg->engine.backend),
-            ds4_engine_routed_quant_bits(engine),
+            ns4_backend_name(cfg->engine.backend),
+            ns4_engine_routed_quant_bits(engine),
             prompt->len,
             cfg->gen.ctx_size,
             vocab);
-    const int argmax = ds4_session_argmax(session);
+    const int argmax = ns4_session_argmax(session);
     fputs("  \"argmax_token\":", fp);
     json_write_token(fp, engine, argmax);
     fprintf(fp, ",\n  \"argmax_logit\":%.9g,\n  \"logits\":[", logits[argmax]);
@@ -780,25 +780,25 @@ static int run_logits_dump(ds4_engine *engine, const cli_config *cfg, const ds4_
     }
     fputs("\n  ]\n}\n", fp);
     if (fclose(fp) != 0) {
-        fprintf(stderr, "ds4: failed to close --dump-logits file: %s\n", cfg->gen.dump_logits_path);
+        fprintf(stderr, "ns4: failed to close --dump-logits file: %s\n", cfg->gen.dump_logits_path);
         free(logits);
-        ds4_session_free(session);
+        ns4_session_free(session);
         return 1;
     }
 
     free(logits);
-    ds4_session_free(session);
+    ns4_session_free(session);
     return 0;
 }
 
-static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
-    ds4_session *session = NULL;
-    if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
-        fprintf(stderr, "ds4: --dump-logprobs requires a graph session backend\n");
+static int run_logprob_dump(ns4_engine *engine, const cli_config *cfg, const ns4_tokens *prompt) {
+    ns4_session *session = NULL;
+    if (ns4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
+        fprintf(stderr, "ns4: --dump-logprobs requires a graph session backend\n");
         return 1;
     }
     if (cli_wait_distributed_route(cfg, session) != 0) {
-        ds4_session_free(session);
+        ns4_session_free(session);
         return 1;
     }
 
@@ -806,48 +806,48 @@ static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4
     cli_prefill_progress progress = {
         .base_tokens = 0,
         .input_tokens = prompt->len,
-        .use_color = ds4_log_is_tty(stderr),
+        .use_color = ns4_log_is_tty(stderr),
     };
-    ds4_session_set_progress(session, cli_prefill_progress_cb, &progress);
-    ds4_session_set_display_progress(session,
+    ns4_session_set_progress(session, cli_prefill_progress_cb, &progress);
+    ns4_session_set_display_progress(session,
                                      progress.use_color ? cli_prefill_progress_cb : NULL,
                                      progress.use_color ? &progress : NULL);
-    if (ds4_session_sync(session, prompt, err, sizeof(err)) != 0) {
-        ds4_session_set_progress(session, NULL, NULL);
-        ds4_session_set_display_progress(session, NULL, NULL);
-        fprintf(stderr, "ds4: prompt processing failed: %s\n", err);
-        ds4_session_free(session);
+    if (ns4_session_sync(session, prompt, err, sizeof(err)) != 0) {
+        ns4_session_set_progress(session, NULL, NULL);
+        ns4_session_set_display_progress(session, NULL, NULL);
+        fprintf(stderr, "ns4: prompt processing failed: %s\n", err);
+        ns4_session_free(session);
         return 1;
     }
-    ds4_session_set_progress(session, NULL, NULL);
-    ds4_session_set_display_progress(session, NULL, NULL);
+    ns4_session_set_progress(session, NULL, NULL);
+    ns4_session_set_display_progress(session, NULL, NULL);
 
     FILE *fp = fopen(cfg->gen.dump_logprobs_path, "wb");
     if (!fp) {
-        fprintf(stderr, "ds4: failed to open --dump-logprobs file: %s\n", cfg->gen.dump_logprobs_path);
-        ds4_session_free(session);
+        fprintf(stderr, "ns4: failed to open --dump-logprobs file: %s\n", cfg->gen.dump_logprobs_path);
+        ns4_session_free(session);
         return 1;
     }
 
     int k = cfg->gen.dump_logprobs_top_k > 0 ? cfg->gen.dump_logprobs_top_k : 20;
     if (k > 128) k = 128;
-    ds4_token_score *scores = calloc((size_t)k, sizeof(scores[0]));
+    ns4_token_score *scores = calloc((size_t)k, sizeof(scores[0]));
     if (!scores) {
         fclose(fp);
-        ds4_session_free(session);
+        ns4_session_free(session);
         return 1;
     }
 
-    fprintf(fp, "{\n  \"source\":\"ds4\",\n  \"prompt_tokens\":%d,\n  \"ctx\":%d,\n  \"top_k\":%d,\n  \"steps\":[\n",
+    fprintf(fp, "{\n  \"source\":\"ns4\",\n  \"prompt_tokens\":%d,\n  \"ctx\":%d,\n  \"top_k\":%d,\n  \"steps\":[\n",
             prompt->len, cfg->gen.ctx_size, k);
     int generated = 0;
     int max_tokens = cfg->gen.n_predict;
-    int room = ds4_session_ctx(session) - ds4_session_pos(session);
+    int room = ns4_session_ctx(session) - ns4_session_pos(session);
     if (room <= 1) max_tokens = 0;
     else if (max_tokens > room - 1) max_tokens = room - 1;
     for (; generated < max_tokens; generated++) {
-        int n = ds4_session_top_logprobs(session, scores, k);
-        int token = ds4_session_argmax(session);
+        int n = ns4_session_top_logprobs(session, scores, k);
+        int token = ns4_session_argmax(session);
         if (generated) fputs(",\n", fp);
         fprintf(fp, "    {\"step\":%d,\"selected\":", generated);
         json_write_token(fp, engine, token);
@@ -860,35 +860,35 @@ static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4
         }
         fputs("]}", fp);
 
-        if (ds4_token_is_stop(engine, token)) break;
-        if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
-            fprintf(stderr, "ds4: decode failed while dumping logprobs: %s\n", err);
+        if (ns4_token_is_stop(engine, token)) break;
+        if (ns4_session_eval(session, token, err, sizeof(err)) != 0) {
+            fprintf(stderr, "ns4: decode failed while dumping logprobs: %s\n", err);
             free(scores);
             fclose(fp);
-            ds4_session_free(session);
+            ns4_session_free(session);
             return 1;
         }
     }
     fputs("\n  ]\n}\n", fp);
     if (fclose(fp) != 0) {
-        fprintf(stderr, "ds4: failed to close --dump-logprobs file: %s\n", cfg->gen.dump_logprobs_path);
+        fprintf(stderr, "ns4: failed to close --dump-logprobs file: %s\n", cfg->gen.dump_logprobs_path);
         free(scores);
-        ds4_session_free(session);
+        ns4_session_free(session);
         return 1;
     }
     free(scores);
-    ds4_session_free(session);
+    ns4_session_free(session);
     return 0;
 }
 
-static void print_diag_token(FILE *fp, ds4_engine *engine, int token) {
+static void print_diag_token(FILE *fp, ns4_engine *engine, int token) {
     fputs("{\"token\":", fp);
     json_write_token(fp, engine, token);
     fputc('}', fp);
 }
 
-static void print_diag_top(FILE *fp, ds4_engine *engine, const char *label,
-                           const ds4_token_score *scores, int n) {
+static void print_diag_top(FILE *fp, ns4_engine *engine, const char *label,
+                           const ns4_token_score *scores, int n) {
     fprintf(fp, "%s:", label);
     for (int i = 0; i < n && scores[i].id >= 0; i++) {
         fputc(' ', fp);
@@ -898,35 +898,35 @@ static void print_diag_top(FILE *fp, ds4_engine *engine, const char *label,
     fputc('\n', fp);
 }
 
-static int run_decode_consistency(ds4_engine *engine, const cli_config *cfg,
-                                  const ds4_tokens *prompt) {
-    if (cfg->dist && cfg->dist->role != DS4_DISTRIBUTED_NONE) {
-        fprintf(stderr, "ds4: --decode-consistency is local-session only\n");
+static int run_decode_consistency(ns4_engine *engine, const cli_config *cfg,
+                                  const ns4_tokens *prompt) {
+    if (cfg->dist && cfg->dist->role != NS4_DISTRIBUTED_NONE) {
+        fprintf(stderr, "ns4: --decode-consistency is local-session only\n");
         return 1;
     }
     if (cfg->gen.decode_consistency_tokens < 0) {
-        fprintf(stderr, "ds4: --decode-consistency requires a non-negative token count\n");
+        fprintf(stderr, "ns4: --decode-consistency requires a non-negative token count\n");
         return 1;
     }
 
-    const int vocab = ds4_engine_vocab_size(engine);
+    const int vocab = ns4_engine_vocab_size(engine);
     float *live_logits = malloc((size_t)vocab * sizeof(live_logits[0]));
     float *fresh_logits = malloc((size_t)vocab * sizeof(fresh_logits[0]));
     if (!live_logits || !fresh_logits) {
         free(live_logits);
         free(fresh_logits);
-        fprintf(stderr, "ds4: out of memory allocating diagnostic logits\n");
+        fprintf(stderr, "ns4: out of memory allocating diagnostic logits\n");
         return 1;
     }
 
-    ds4_tokens prefix = {0};
-    ds4_tokens_copy(&prefix, prompt);
+    ns4_tokens prefix = {0};
+    ns4_tokens_copy(&prefix, prompt);
 
-    ds4_session *live = NULL;
+    ns4_session *live = NULL;
     char err[160];
-    if (ds4_session_create(&live, engine, cfg->gen.ctx_size) != 0) {
-        fprintf(stderr, "ds4: --decode-consistency requires a graph session backend\n");
-        ds4_tokens_free(&prefix);
+    if (ns4_session_create(&live, engine, cfg->gen.ctx_size) != 0) {
+        fprintf(stderr, "ns4: --decode-consistency requires a graph session backend\n");
+        ns4_tokens_free(&prefix);
         free(live_logits);
         free(fresh_logits);
         return 1;
@@ -935,94 +935,94 @@ static int run_decode_consistency(ds4_engine *engine, const cli_config *cfg,
     cli_prefill_progress progress = {
         .base_tokens = 0,
         .input_tokens = prompt->len,
-        .use_color = ds4_log_is_tty(stderr),
+        .use_color = ns4_log_is_tty(stderr),
     };
-    ds4_session_set_progress(live, cli_prefill_progress_cb, &progress);
-    ds4_session_set_display_progress(live,
+    ns4_session_set_progress(live, cli_prefill_progress_cb, &progress);
+    ns4_session_set_display_progress(live,
                                      progress.use_color ? cli_prefill_progress_cb : NULL,
                                      progress.use_color ? &progress : NULL);
-    if (ds4_session_sync(live, prompt, err, sizeof(err)) != 0) {
-        ds4_session_set_progress(live, NULL, NULL);
-        ds4_session_set_display_progress(live, NULL, NULL);
-        fprintf(stderr, "ds4: prompt processing failed: %s\n", err);
-        ds4_session_free(live);
-        ds4_tokens_free(&prefix);
+    if (ns4_session_sync(live, prompt, err, sizeof(err)) != 0) {
+        ns4_session_set_progress(live, NULL, NULL);
+        ns4_session_set_display_progress(live, NULL, NULL);
+        fprintf(stderr, "ns4: prompt processing failed: %s\n", err);
+        ns4_session_free(live);
+        ns4_tokens_free(&prefix);
         free(live_logits);
         free(fresh_logits);
         return 1;
     }
-    ds4_session_set_progress(live, NULL, NULL);
-    ds4_session_set_display_progress(live, NULL, NULL);
+    ns4_session_set_progress(live, NULL, NULL);
+    ns4_session_set_display_progress(live, NULL, NULL);
 
-    fprintf(stderr, "ds4: decode-consistency prompt_tokens=%d check_after=%d\n",
+    fprintf(stderr, "ns4: decode-consistency prompt_tokens=%d check_after=%d\n",
             prompt->len, cfg->gen.decode_consistency_tokens);
     for (int i = 0; i < cfg->gen.decode_consistency_tokens; i++) {
-        int token = ds4_session_argmax(live);
-        fprintf(stderr, "ds4: decode-consistency selected[%d]=", i);
+        int token = ns4_session_argmax(live);
+        fprintf(stderr, "ns4: decode-consistency selected[%d]=", i);
         print_diag_token(stderr, engine, token);
         fputc('\n', stderr);
-        ds4_tokens_push(&prefix, token);
-        if (ds4_session_eval(live, token, err, sizeof(err)) != 0) {
-            fprintf(stderr, "ds4: decode failed during consistency check: %s\n", err);
-            ds4_session_free(live);
-            ds4_tokens_free(&prefix);
+        ns4_tokens_push(&prefix, token);
+        if (ns4_session_eval(live, token, err, sizeof(err)) != 0) {
+            fprintf(stderr, "ns4: decode failed during consistency check: %s\n", err);
+            ns4_session_free(live);
+            ns4_tokens_free(&prefix);
             free(live_logits);
             free(fresh_logits);
             return 1;
         }
-        if (ds4_token_is_stop(engine, token)) break;
+        if (ns4_token_is_stop(engine, token)) break;
     }
 
-    ds4_token_score live_top[10];
-    int live_top_n = ds4_session_top_logprobs(live, live_top, 10);
-    if (ds4_session_copy_logits(live, live_logits, vocab) != vocab) {
-        fprintf(stderr, "ds4: failed to copy live logits\n");
-        ds4_session_free(live);
-        ds4_tokens_free(&prefix);
+    ns4_token_score live_top[10];
+    int live_top_n = ns4_session_top_logprobs(live, live_top, 10);
+    if (ns4_session_copy_logits(live, live_logits, vocab) != vocab) {
+        fprintf(stderr, "ns4: failed to copy live logits\n");
+        ns4_session_free(live);
+        ns4_tokens_free(&prefix);
         free(live_logits);
         free(fresh_logits);
         return 1;
     }
-    ds4_session_free(live);
+    ns4_session_free(live);
     live = NULL;
 
-    ds4_session *fresh = NULL;
-    if (ds4_session_create(&fresh, engine, cfg->gen.ctx_size) != 0) {
-        fprintf(stderr, "ds4: failed to create fresh diagnostic session\n");
-        ds4_tokens_free(&prefix);
+    ns4_session *fresh = NULL;
+    if (ns4_session_create(&fresh, engine, cfg->gen.ctx_size) != 0) {
+        fprintf(stderr, "ns4: failed to create fresh diagnostic session\n");
+        ns4_tokens_free(&prefix);
         free(live_logits);
         free(fresh_logits);
         return 1;
     }
     progress.input_tokens = prefix.len;
-    ds4_session_set_progress(fresh, cli_prefill_progress_cb, &progress);
-    ds4_session_set_display_progress(fresh,
+    ns4_session_set_progress(fresh, cli_prefill_progress_cb, &progress);
+    ns4_session_set_display_progress(fresh,
                                      progress.use_color ? cli_prefill_progress_cb : NULL,
                                      progress.use_color ? &progress : NULL);
-    if (ds4_session_sync(fresh, &prefix, err, sizeof(err)) != 0) {
-        ds4_session_set_progress(fresh, NULL, NULL);
-        ds4_session_set_display_progress(fresh, NULL, NULL);
-        fprintf(stderr, "ds4: fresh prompt processing failed: %s\n", err);
-        ds4_session_free(fresh);
-        ds4_tokens_free(&prefix);
+    if (ns4_session_sync(fresh, &prefix, err, sizeof(err)) != 0) {
+        ns4_session_set_progress(fresh, NULL, NULL);
+        ns4_session_set_display_progress(fresh, NULL, NULL);
+        fprintf(stderr, "ns4: fresh prompt processing failed: %s\n", err);
+        ns4_session_free(fresh);
+        ns4_tokens_free(&prefix);
         free(live_logits);
         free(fresh_logits);
         return 1;
     }
-    ds4_session_set_progress(fresh, NULL, NULL);
-    ds4_session_set_display_progress(fresh, NULL, NULL);
+    ns4_session_set_progress(fresh, NULL, NULL);
+    ns4_session_set_display_progress(fresh, NULL, NULL);
 
-    ds4_token_score fresh_top[10];
-    int fresh_top_n = ds4_session_top_logprobs(fresh, fresh_top, 10);
-    if (ds4_session_copy_logits(fresh, fresh_logits, vocab) != vocab) {
-        fprintf(stderr, "ds4: failed to copy fresh logits\n");
-        ds4_session_free(fresh);
-        ds4_tokens_free(&prefix);
+    ns4_token_score fresh_top[10];
+    int fresh_top_n = ns4_session_top_logprobs(fresh, fresh_top, 10);
+    if (ns4_session_copy_logits(fresh, fresh_logits, vocab) != vocab) {
+        fprintf(stderr, "ns4: failed to copy fresh logits\n");
+        ns4_session_free(fresh);
+        ns4_tokens_free(&prefix);
         free(live_logits);
         free(fresh_logits);
         return 1;
     }
-    ds4_session_free(fresh);
+    ns4_session_free(fresh);
 
     double ss = 0.0;
     float max_abs = 0.0f;
@@ -1037,32 +1037,32 @@ static int run_decode_consistency(ds4_engine *engine, const cli_config *cfg,
     }
 
     fprintf(stderr,
-            "ds4: decode-consistency compared prefix_tokens=%d vocab=%d "
+            "ns4: decode-consistency compared prefix_tokens=%d vocab=%d "
             "max_abs=%.9g at token=%d live=%.9g fresh=%.9g rms=%.9g\n",
             prefix.len, vocab, max_abs, max_i,
             live_logits[max_i], fresh_logits[max_i],
             sqrt(ss / (double)vocab));
-    print_diag_top(stderr, engine, "ds4: live_top", live_top, live_top_n);
-    print_diag_top(stderr, engine, "ds4: fresh_top", fresh_top, fresh_top_n);
+    print_diag_top(stderr, engine, "ns4: live_top", live_top, live_top_n);
+    print_diag_top(stderr, engine, "ns4: fresh_top", fresh_top, fresh_top_n);
 
-    ds4_tokens_free(&prefix);
+    ns4_tokens_free(&prefix);
     free(live_logits);
     free(fresh_logits);
     return live_top_n > 0 && fresh_top_n > 0 && live_top[0].id == fresh_top[0].id ? 0 : 1;
 }
 
-static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
+static int run_perplexity_file(ns4_engine *engine, const cli_config *cfg) {
     char *text = read_prompt_file(cfg->gen.perplexity_file_path, true);
-    ds4_tokens tokens = {0};
-    ds4_tokenize_text(engine, text, &tokens);
+    ns4_tokens tokens = {0};
+    ns4_tokenize_text(engine, text, &tokens);
     free(text);
 
     /* Seed the graph with enough real context to stay on the normal Metal
      * prefill path; scoring starts immediately after this fixed prefix. */
     const int prefix_len = 32;
     if (tokens.len <= prefix_len) {
-        fprintf(stderr, "ds4: --perplexity-file needs more than %d tokens\n", prefix_len);
-        ds4_tokens_free(&tokens);
+        fprintf(stderr, "ns4: --perplexity-file needs more than %d tokens\n", prefix_len);
+        ns4_tokens_free(&tokens);
         return 1;
     }
 
@@ -1070,56 +1070,56 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
     if (cfg->gen.n_predict > 0 && scored > cfg->gen.n_predict) scored = cfg->gen.n_predict;
     if (scored > cfg->gen.ctx_size - prefix_len) scored = cfg->gen.ctx_size - prefix_len;
     if (scored <= 0) {
-        fprintf(stderr, "ds4: context too small for perplexity scoring\n");
-        ds4_tokens_free(&tokens);
+        fprintf(stderr, "ns4: context too small for perplexity scoring\n");
+        ns4_tokens_free(&tokens);
         return 1;
     }
 
-    ds4_session *session = NULL;
-    if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
-        fprintf(stderr, "ds4: --perplexity-file requires a graph session backend\n");
-        ds4_tokens_free(&tokens);
+    ns4_session *session = NULL;
+    if (ns4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
+        fprintf(stderr, "ns4: --perplexity-file requires a graph session backend\n");
+        ns4_tokens_free(&tokens);
         return 1;
     }
     if (cli_wait_distributed_route(cfg, session) != 0) {
-        ds4_session_free(session);
-        ds4_tokens_free(&tokens);
+        ns4_session_free(session);
+        ns4_tokens_free(&tokens);
         return 1;
     }
 
-    ds4_tokens prefix = {0};
-    for (int i = 0; i < prefix_len; i++) ds4_tokens_push(&prefix, tokens.v[i]);
+    ns4_tokens prefix = {0};
+    for (int i = 0; i < prefix_len; i++) ns4_tokens_push(&prefix, tokens.v[i]);
     char err[160];
-    if (ds4_session_sync(session, &prefix, err, sizeof(err)) != 0) {
-        fprintf(stderr, "ds4: perplexity initial token failed: %s\n", err);
-        ds4_tokens_free(&prefix);
-        ds4_session_free(session);
-        ds4_tokens_free(&tokens);
+    if (ns4_session_sync(session, &prefix, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ns4: perplexity initial token failed: %s\n", err);
+        ns4_tokens_free(&prefix);
+        ns4_session_free(session);
+        ns4_tokens_free(&tokens);
         return 1;
     }
-    ds4_tokens_free(&prefix);
+    ns4_tokens_free(&prefix);
 
     double nll = 0.0;
     for (int j = 0; j < scored; j++) {
         const int i = prefix_len + j;
-        ds4_token_score score;
-        if (!ds4_session_token_logprob(session, tokens.v[i], &score)) {
-            fprintf(stderr, "ds4: failed to score token %d\n", i);
-            ds4_session_free(session);
-            ds4_tokens_free(&tokens);
+        ns4_token_score score;
+        if (!ns4_session_token_logprob(session, tokens.v[i], &score)) {
+            fprintf(stderr, "ns4: failed to score token %d\n", i);
+            ns4_session_free(session);
+            ns4_tokens_free(&tokens);
             return 1;
         }
         nll -= (double)score.logprob;
 
         if (((j + 1) % 256) == 0 || j + 1 == scored) {
-            fprintf(stderr, "ds4: perplexity scored %d/%d\r", j + 1, scored);
+            fprintf(stderr, "ns4: perplexity scored %d/%d\r", j + 1, scored);
             fflush(stderr);
         }
 
-        if (j + 1 < scored && ds4_session_eval(session, tokens.v[i], err, sizeof(err)) != 0) {
-            fprintf(stderr, "\nds4: perplexity decode failed at token %d: %s\n", i, err);
-            ds4_session_free(session);
-            ds4_tokens_free(&tokens);
+        if (j + 1 < scored && ns4_session_eval(session, tokens.v[i], err, sizeof(err)) != 0) {
+            fprintf(stderr, "\nns4: perplexity decode failed at token %d: %s\n", i, err);
+            ns4_session_free(session);
+            ns4_tokens_free(&tokens);
             return 1;
         }
     }
@@ -1129,44 +1129,44 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
     printf("tokens=%d scored=%d nll=%.9f avg_nll=%.9f ppl=%.9f\n",
            tokens.len, scored, nll, avg_nll, exp(avg_nll));
 
-    ds4_session_free(session);
-    ds4_tokens_free(&tokens);
+    ns4_session_free(session);
+    ns4_tokens_free(&tokens);
     return 0;
 }
 
-static int run_generation(ds4_engine *engine, const cli_config *cfg) {
-    ds4_tokens prompt = {0};
+static int run_generation(ns4_engine *engine, const cli_config *cfg) {
+    ns4_tokens prompt = {0};
     build_prompt(engine, &cfg->gen, &prompt);
 
     int rc = 0;
     if (cfg->gen.graph_test) {
-        rc = ds4_engine_graph_test(engine, &prompt);
-        ds4_tokens_free(&prompt);
+        rc = ns4_engine_graph_test(engine, &prompt);
+        ns4_tokens_free(&prompt);
         return rc;
     }
     if (cfg->gen.graph_full_test) {
-        rc = ds4_engine_graph_full_test(engine, &prompt);
-        ds4_tokens_free(&prompt);
+        rc = ns4_engine_graph_full_test(engine, &prompt);
+        ns4_tokens_free(&prompt);
         return rc;
     }
     if (cfg->gen.graph_prompt_test) {
-        rc = ds4_engine_graph_prompt_test(engine, &prompt, cfg->gen.ctx_size);
-        ds4_tokens_free(&prompt);
+        rc = ns4_engine_graph_prompt_test(engine, &prompt, cfg->gen.ctx_size);
+        ns4_tokens_free(&prompt);
         return rc;
     }
     if (cfg->gen.dump_logits_path) {
         rc = run_logits_dump(engine, cfg, &prompt);
-        ds4_tokens_free(&prompt);
+        ns4_tokens_free(&prompt);
         return rc;
     }
     if (cfg->gen.dump_logprobs_path) {
         rc = run_logprob_dump(engine, cfg, &prompt);
-        ds4_tokens_free(&prompt);
+        ns4_tokens_free(&prompt);
         return rc;
     }
     if (cfg->gen.decode_consistency_tokens > 0) {
         rc = run_decode_consistency(engine, cfg, &prompt);
-        ds4_tokens_free(&prompt);
+        ns4_tokens_free(&prompt);
         return rc;
     }
 
@@ -1174,25 +1174,25 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
                             cfg->gen.head_test ||
                             cfg->gen.first_token_test;
     if (cfg->gen.head_test) {
-        rc = ds4_engine_head_test(engine, &prompt);
+        rc = ns4_engine_head_test(engine, &prompt);
     }
     if (rc == 0 && cfg->gen.first_token_test) {
-        rc = ds4_engine_first_token_test(engine, &prompt);
+        rc = ns4_engine_first_token_test(engine, &prompt);
     }
     if (cfg->gen.dump_tokens) {
-        ds4_engine_dump_tokens(engine, &prompt);
+        ns4_engine_dump_tokens(engine, &prompt);
     }
 
     if (diagnostic) {
         if (rc == 0) {
-            fprintf(stderr, "ds4: diagnostic run completed on the native %s path.\n",
-                    ds4_backend_name(cfg->engine.backend));
+            fprintf(stderr, "ns4: diagnostic run completed on the native %s path.\n",
+                    ns4_backend_name(cfg->engine.backend));
         }
     } else {
-        if (cfg->engine.distributed.role == DS4_DISTRIBUTED_COORDINATOR ||
-            getenv("DS4_CLI_FORCE_SESSION") != NULL ||
+        if (cfg->engine.distributed.role == NS4_DISTRIBUTED_COORDINATOR ||
+            getenv("NS4_CLI_FORCE_SESSION") != NULL ||
             cfg->gen.temperature > 0.0f ||
-            ds4_engine_mtp_draft_tokens(engine) > 1) {
+            ns4_engine_mtp_draft_tokens(engine) > 1) {
             /* TP leaders always drive the session path: the sync/eval
              * mirroring that keeps the worker in lockstep lives there.
              * The env override exists so TP-vs-single-node validation
@@ -1202,17 +1202,17 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
             token_printer printer = {
                 .engine = engine,
                 .fp = stdout,
-                .format_thinking = ds4_think_mode_enabled(cli_effective_think_mode(&cfg->gen)),
-                .in_think = ds4_think_mode_enabled(cli_effective_think_mode(&cfg->gen)),
+                .format_thinking = ns4_think_mode_enabled(cli_effective_think_mode(&cfg->gen)),
+                .in_think = ns4_think_mode_enabled(cli_effective_think_mode(&cfg->gen)),
                 .use_color = isatty(fileno(stdout)) != 0,
                 .last_output_newline = true,
             };
             cli_prefill_progress progress = {
                 .base_tokens = 0,
                 .input_tokens = prompt.len,
-                .use_color = ds4_log_is_tty(stderr),
+                .use_color = ns4_log_is_tty(stderr),
             };
-            rc = ds4_engine_generate_argmax(engine, &prompt, cfg->gen.n_predict,
+            rc = ns4_engine_generate_argmax(engine, &prompt, cfg->gen.n_predict,
                                             cfg->gen.ctx_size,
                                             print_generated_token,
                                             generation_done,
@@ -1222,7 +1222,7 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
         }
     }
 
-    ds4_tokens_free(&prompt);
+    ns4_tokens_free(&prompt);
     return rc;
 }
 
@@ -1258,18 +1258,18 @@ static bool parse_power_percent(const char *arg, int *out) {
 static void history_file_path(char *buf, size_t len) {
     const char *home = getenv("HOME");
     if (!home || !home[0]) home = ".";
-    snprintf(buf, len, "%s/.ds4_history", home);
+    snprintf(buf, len, "%s/.ns4_history", home);
 }
 
 typedef struct {
-    ds4_session *session;
-    ds4_tokens transcript;
+    ns4_session *session;
+    ns4_tokens transcript;
     int ctx_size;
     int think_prefix_pos;
     int think_prefix_tokens;
 } repl_chat;
 
-static void tokens_insert(ds4_tokens *dst, int pos, const ds4_tokens *src) {
+static void tokens_insert(ns4_tokens *dst, int pos, const ns4_tokens *src) {
     if (!src || src->len <= 0) return;
     if (pos < 0) pos = 0;
     if (pos > dst->len) pos = dst->len;
@@ -1277,7 +1277,7 @@ static void tokens_insert(ds4_tokens *dst, int pos, const ds4_tokens *src) {
         dst->cap = dst->cap ? dst->cap * 2 : 64;
         int *next = realloc(dst->v, (size_t)dst->cap * sizeof(dst->v[0]));
         if (!next) {
-            perror("ds4: realloc");
+            perror("ns4: realloc");
             exit(1);
         }
         dst->v = next;
@@ -1288,7 +1288,7 @@ static void tokens_insert(ds4_tokens *dst, int pos, const ds4_tokens *src) {
     dst->len += src->len;
 }
 
-static void tokens_remove(ds4_tokens *dst, int pos, int n) {
+static void tokens_remove(ns4_tokens *dst, int pos, int n) {
     if (n <= 0 || pos < 0 || pos >= dst->len) return;
     if (pos + n > dst->len) n = dst->len - pos;
     memmove(dst->v + pos, dst->v + pos + n,
@@ -1296,19 +1296,19 @@ static void tokens_remove(ds4_tokens *dst, int pos, int n) {
     dst->len -= n;
 }
 
-static void repl_chat_build_think_prefix(ds4_engine *engine,
-                                         ds4_think_mode mode,
-                                         ds4_tokens *prefix) {
-    if (mode == DS4_THINK_MAX) ds4_chat_append_max_effort_prefix(engine, prefix);
+static void repl_chat_build_think_prefix(ns4_engine *engine,
+                                         ns4_think_mode mode,
+                                         ns4_tokens *prefix) {
+    if (mode == NS4_THINK_MAX) ns4_chat_append_max_effort_prefix(engine, prefix);
 }
 
 /* Insert/replace the model-family thinking prefix inside the existing
  * transcript.  It lives immediately after the BOS sequence and before any
  * user/system text, matching the GGUF chat templates. */
-static void repl_chat_apply_think_prefix(ds4_engine *engine,
+static void repl_chat_apply_think_prefix(ns4_engine *engine,
                                          repl_chat *chat,
-                                         ds4_think_mode mode) {
-    ds4_tokens prefix = {0};
+                                         ns4_think_mode mode) {
+    ns4_tokens prefix = {0};
     repl_chat_build_think_prefix(engine, mode, &prefix);
 
     bool same = chat->think_prefix_tokens == prefix.len;
@@ -1322,72 +1322,72 @@ static void repl_chat_apply_think_prefix(ds4_engine *engine,
                       chat->think_prefix_tokens);
         tokens_insert(&chat->transcript, chat->think_prefix_pos, &prefix);
         chat->think_prefix_tokens = prefix.len;
-        if (chat->session) ds4_session_invalidate(chat->session);
+        if (chat->session) ns4_session_invalidate(chat->session);
     }
-    ds4_tokens_free(&prefix);
+    ns4_tokens_free(&prefix);
 }
 
-static int repl_chat_create_session(ds4_engine *engine, repl_chat *chat, int ctx_size) {
-    ds4_session *session = NULL;
-    if (ds4_session_create(&session, engine, ctx_size) != 0) {
-        fprintf(stderr, "ds4: interactive chat KV cache requires a session backend\n");
+static int repl_chat_create_session(ns4_engine *engine, repl_chat *chat, int ctx_size) {
+    ns4_session *session = NULL;
+    if (ns4_session_create(&session, engine, ctx_size) != 0) {
+        fprintf(stderr, "ns4: interactive chat KV cache requires a session backend\n");
         return 1;
     }
-    if (chat->session) ds4_session_free(chat->session);
+    if (chat->session) ns4_session_free(chat->session);
     chat->session = session;
     chat->ctx_size = ctx_size;
     return 0;
 }
 
-static int repl_chat_init(ds4_engine *engine, repl_chat *chat, const cli_config *cfg) {
+static int repl_chat_init(ns4_engine *engine, repl_chat *chat, const cli_config *cfg) {
     memset(chat, 0, sizeof(*chat));
-    ds4_chat_begin(engine, &chat->transcript);
+    ns4_chat_begin(engine, &chat->transcript);
     chat->think_prefix_pos = chat->transcript.len;
     repl_chat_apply_think_prefix(engine, chat, cli_effective_think_mode(&cfg->gen));
     if (cfg->gen.system && cfg->gen.system[0]) {
-        ds4_chat_append_message(engine, &chat->transcript, "system", cfg->gen.system);
+        ns4_chat_append_message(engine, &chat->transcript, "system", cfg->gen.system);
     }
     return repl_chat_create_session(engine, chat, cfg->gen.ctx_size);
 }
 
 static void repl_chat_free(repl_chat *chat) {
     if (!chat) return;
-    ds4_session_free(chat->session);
-    ds4_tokens_free(&chat->transcript);
+    ns4_session_free(chat->session);
+    ns4_tokens_free(&chat->transcript);
     memset(chat, 0, sizeof(*chat));
 }
 
-static int repl_chat_set_ctx(ds4_engine *engine, repl_chat *chat, int ctx_size) {
-    ds4_session_free(chat->session);
+static int repl_chat_set_ctx(ns4_engine *engine, repl_chat *chat, int ctx_size) {
+    ns4_session_free(chat->session);
     chat->session = NULL;
     chat->ctx_size = 0;
     return repl_chat_create_session(engine, chat, ctx_size);
 }
 
-static bool repl_chat_assistant_turn_uses_eos(ds4_engine *engine) {
+static bool repl_chat_assistant_turn_uses_eos(ns4_engine *engine) {
     (void)engine;
     return true;
 }
 
 /* Run one interactive turn.  The transcript is tentatively extended with user
- * and assistant markers, then ds4_session_sync() decides whether this is a KV
+ * and assistant markers, then ns4_session_sync() decides whether this is a KV
  * continuation.  If prompt processing fails, the transcript rolls back before
  * returning to the prompt. */
-static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, const char *user_text) {
+static int run_chat_turn(ns4_engine *engine, cli_config *cfg, repl_chat *chat, const char *user_text) {
     if (!chat->session) {
-        fprintf(stderr, "ds4: no active interactive KV cache\n");
+        fprintf(stderr, "ns4: no active interactive KV cache\n");
         return 1;
     }
 
-    ds4_think_mode think_mode = ds4_think_mode_for_context(cfg->gen.think_mode,
+    ns4_think_mode think_mode = ns4_think_mode_for_context(cfg->gen.think_mode,
                                                            chat->ctx_size);
     repl_chat_apply_think_prefix(engine, chat, think_mode);
     const int rollback_len = chat->transcript.len;
-    ds4_chat_append_message(engine, &chat->transcript, "user", user_text);
-    ds4_chat_append_assistant_prefix(engine, &chat->transcript, think_mode);
+    ns4_chat_append_message(engine, &chat->transcript, "user", user_text);
+    ns4_chat_append_assistant_prefix(engine, &chat->transcript, think_mode);
 
-    const int old_pos = ds4_session_pos(chat->session);
-    const int common = ds4_session_common_prefix(chat->session, &chat->transcript);
+    const int old_pos = ns4_session_pos(chat->session);
+    const int common = ns4_session_common_prefix(chat->session, &chat->transcript);
     const int cached = common == old_pos && chat->transcript.len >= old_pos ? common : 0;
     const int suffix = chat->transcript.len - cached;
 
@@ -1395,38 +1395,38 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     cli_prefill_progress progress = {
         .base_tokens = cached,
         .input_tokens = suffix,
-        .use_color = ds4_log_is_tty(stderr),
+        .use_color = ns4_log_is_tty(stderr),
     };
     const double t_prefill0 = cli_now_sec();
-    ds4_session_set_progress(chat->session, cli_prefill_progress_cb, &progress);
-    ds4_session_set_display_progress(chat->session,
+    ns4_session_set_progress(chat->session, cli_prefill_progress_cb, &progress);
+    ns4_session_set_display_progress(chat->session,
                                      progress.use_color ? cli_prefill_progress_cb : NULL,
                                      progress.use_color ? &progress : NULL);
     cli_dist_busy_set(cfg, true);
-    int sync_rc = ds4_session_sync(chat->session, &chat->transcript, err, sizeof(err));
+    int sync_rc = ns4_session_sync(chat->session, &chat->transcript, err, sizeof(err));
     cli_dist_busy_set(cfg, false);
     if (sync_rc != 0) {
-        ds4_session_set_progress(chat->session, NULL, NULL);
-        ds4_session_set_display_progress(chat->session, NULL, NULL);
+        ns4_session_set_progress(chat->session, NULL, NULL);
+        ns4_session_set_display_progress(chat->session, NULL, NULL);
         chat->transcript.len = rollback_len;
-        fprintf(stderr, "ds4: prompt processing failed: %s\n", err);
+        fprintf(stderr, "ns4: prompt processing failed: %s\n", err);
         return 1;
     }
-    ds4_session_set_progress(chat->session, NULL, NULL);
-    ds4_session_set_display_progress(chat->session, NULL, NULL);
+    ns4_session_set_progress(chat->session, NULL, NULL);
+    ns4_session_set_display_progress(chat->session, NULL, NULL);
     const double t_prefill1 = cli_now_sec();
 
     token_printer printer = {
         .engine = engine,
         .fp = stdout,
-        .format_thinking = ds4_think_mode_enabled(think_mode),
-        .in_think = ds4_think_mode_enabled(think_mode),
+        .format_thinking = ns4_think_mode_enabled(think_mode),
+        .in_think = ns4_think_mode_enabled(think_mode),
         .use_color = isatty(fileno(stdout)) != 0,
         .last_output_newline = true,
     };
 
     int max_tokens = cfg->gen.n_predict;
-    int room = ds4_session_ctx(chat->session) - ds4_session_pos(chat->session);
+    int room = ns4_session_ctx(chat->session) - ns4_session_pos(chat->session);
     if (room <= 1) max_tokens = 0;
     else if (max_tokens > room - 1) max_tokens = room - 1;
 
@@ -1434,8 +1434,8 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
     int generated = 0;
     const bool speculative_argmax = cfg->gen.temperature <= 0.0f &&
-        ((ds4_engine_mtp_draft_tokens(engine) > 1 &&
-          getenv("DS4_MTP_SPEC_DISABLE") == NULL) ||
+        ((ns4_engine_mtp_draft_tokens(engine) > 1 &&
+          getenv("NS4_MTP_SPEC_DISABLE") == NULL) ||
          cli_splitkv_spec_requested());
     const bool greedy_argmax = cfg->gen.temperature <= 0.0f &&
         cli_greedy_argmax_requested(speculative_argmax);
@@ -1448,48 +1448,48 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
             token = greedy_next;
             have_greedy_next = false;
         } else {
-            token = ds4_session_sample(chat->session,
+            token = ns4_session_sample(chat->session,
                                        cfg->gen.temperature,
                                        0,
                                        cfg->gen.top_p,
                                        cfg->gen.min_p,
                                        &rng);
         }
-        if (ds4_token_is_stop_for_think_mode(engine, token, think_mode)) break;
+        if (ns4_token_is_stop_for_think_mode(engine, token, think_mode)) break;
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+        if (cfg->gen.temperature <= 0.0f && ns4_engine_mtp_draft_tokens(engine) > 1 &&
+            getenv("NS4_MTP_SPEC_DISABLE") == NULL) {
             cli_dist_busy_set(cfg, true);
-            ntok = ds4_session_eval_speculative_argmax(chat->session,
+            ntok = ns4_session_eval_speculative_argmax(chat->session,
                                                        token,
                                                        max_tokens - generated,
-                                                       ds4_token_eos(engine),
+                                                       ns4_token_eos(engine),
                                                        toks,
                                                        (int)(sizeof(toks) / sizeof(toks[0])),
                                                        err,
                                                        sizeof(err));
             cli_dist_busy_set(cfg, false);
             if (ntok < 0) {
-                fprintf(stderr, "ds4: decode failed: %s\n", err);
+                fprintf(stderr, "ns4: decode failed: %s\n", err);
                 return 1;
             }
         } else {
             size_t piece_len = 0;
-            char *piece = ds4_token_text(engine, token, &piece_len);
-            ds4_tokens_push(&chat->transcript, token);
+            char *piece = ns4_token_text(engine, token, &piece_len);
+            ns4_tokens_push(&chat->transcript, token);
             token_printer_write_text(&printer, piece, piece_len);
             fflush(stdout);
             free(piece);
             generated++;
 
             cli_dist_busy_set(cfg, true);
-            int eval_rc = ds4_session_eval(chat->session, token, err, sizeof(err));
+            int eval_rc = ns4_session_eval(chat->session, token, err, sizeof(err));
             cli_dist_busy_set(cfg, false);
             if (eval_rc != 0) {
-                fprintf(stderr, "ds4: decode failed: %s\n", err);
-                ds4_session_invalidate(chat->session);
+                fprintf(stderr, "ns4: decode failed: %s\n", err);
+                ns4_session_invalidate(chat->session);
                 return 1;
             }
             if (generated >= max_tokens) break;
@@ -1498,13 +1498,13 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
 
         bool stop = false;
         for (int j = 0; j < ntok; j++) {
-            if (ds4_token_is_stop_for_think_mode(engine, toks[j], think_mode)) {
+            if (ns4_token_is_stop_for_think_mode(engine, toks[j], think_mode)) {
                 stop = true;
                 break;
             }
             size_t piece_len = 0;
-            char *piece = ds4_token_text(engine, toks[j], &piece_len);
-            ds4_tokens_push(&chat->transcript, toks[j]);
+            char *piece = ns4_token_text(engine, toks[j], &piece_len);
+            ns4_tokens_push(&chat->transcript, toks[j]);
             token_printer_write_text(&printer, piece, piece_len);
             fflush(stdout);
             free(piece);
@@ -1519,23 +1519,23 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     const bool interrupted = cli_interrupt_requested();
     if (interrupted && generated == 0) {
         chat->transcript.len = rollback_len;
-        ds4_session_invalidate(chat->session);
+        ns4_session_invalidate(chat->session);
     } else if (repl_chat_assistant_turn_uses_eos(engine)) {
-        ds4_tokens_push(&chat->transcript, ds4_token_eos(engine));
+        ns4_tokens_push(&chat->transcript, ns4_token_eos(engine));
     }
 
     const double prefill_s = t_prefill1 - t_prefill0;
     const double decode_s = t_decode1 - t_decode0;
     if (interrupted) cli_interrupt_clear();
-    ds4_log(stderr,
-            DS4_LOG_TIMING,
-            "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
+    ns4_log(stderr,
+            NS4_LOG_TIMING,
+            "ns4: prefill: %.2f t/s, generation: %.2f t/s\n",
             prefill_s > 0.0 ? (double)suffix / prefill_s : 0.0,
             decode_s > 0.0 ? (double)generated / decode_s : 0.0);
     return 0;
 }
 
-static int run_repl(ds4_engine *engine, cli_config *cfg) {
+static int run_repl(ns4_engine *engine, cli_config *cfg) {
     repl_chat chat;
     if (repl_chat_init(engine, &chat, cfg) != 0) return 1;
 
@@ -1557,7 +1557,7 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
     int rc = 0;
     for (;;) {
         errno = 0;
-        char *line = linenoise("ds4> ");
+        char *line = linenoise("ns4> ");
         if (!line) {
             if (errno == EAGAIN || cli_interrupt_requested()) {
                 cli_interrupt_clear();
@@ -1576,31 +1576,31 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
         if (!strcmp(cmd, "/help")) {
             print_repl_help();
         } else if (!strcmp(cmd, "/think")) {
-            cfg->gen.think_mode = DS4_THINK_HIGH;
-            repl_chat_apply_think_prefix(engine, &chat, DS4_THINK_HIGH);
+            cfg->gen.think_mode = NS4_THINK_HIGH;
+            repl_chat_apply_think_prefix(engine, &chat, NS4_THINK_HIGH);
             puts("Thinking mode: high.");
         } else if (!strcmp(cmd, "/think-max")) {
-            cfg->gen.think_mode = DS4_THINK_MAX;
-            bool active = ds4_think_mode_for_context(cfg->gen.think_mode,
-                                                     chat.ctx_size) == DS4_THINK_MAX;
+            cfg->gen.think_mode = NS4_THINK_MAX;
+            bool active = ns4_think_mode_for_context(cfg->gen.think_mode,
+                                                     chat.ctx_size) == NS4_THINK_MAX;
             repl_chat_apply_think_prefix(engine, &chat,
-                                         active ? DS4_THINK_MAX : DS4_THINK_HIGH);
+                                         active ? NS4_THINK_MAX : NS4_THINK_HIGH);
             cli_warn_think_max_downgraded(&cfg->gen, "/think-max");
             printf("Thinking mode: %s.\n", active ? "max" : "high (ctx below 393216)");
         } else if (!strcmp(cmd, "/nothink")) {
-            cfg->gen.think_mode = DS4_THINK_NONE;
-            repl_chat_apply_think_prefix(engine, &chat, DS4_THINK_NONE);
+            cfg->gen.think_mode = NS4_THINK_NONE;
+            repl_chat_apply_think_prefix(engine, &chat, NS4_THINK_NONE);
             puts("Thinking mode: none.");
         } else if (!strncmp(cmd, "/power", 6) && (cmd[6] == '\0' || isspace((unsigned char)cmd[6]))) {
             char *arg = trim_inplace(cmd + 6);
             if (!arg[0]) {
-                printf("Power: %d%%.\n", ds4_session_power(chat.session));
+                printf("Power: %d%%.\n", ns4_session_power(chat.session));
             } else {
                 int power = 0;
                 if (!parse_power_percent(arg, &power)) {
-                    fprintf(stderr, "ds4: /power must be between 1 and 100\n");
-                } else if (ds4_session_set_power(chat.session, power) != 0) {
-                    fprintf(stderr, "ds4: failed to set /power\n");
+                    fprintf(stderr, "ns4: /power must be between 1 and 100\n");
+                } else if (ns4_session_set_power(chat.session, power) != 0) {
+                    fprintf(stderr, "ns4: failed to set /power\n");
                 } else {
                     cfg->engine.power_percent = power;
                     printf("Power: %d%%.\n", power);
@@ -1609,19 +1609,19 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
         } else if (!strncmp(cmd, "/ctx", 4) && (cmd[4] == '\0' || isspace((unsigned char)cmd[4]))) {
             char *arg = trim_inplace(cmd + 4);
             if (!arg[0]) {
-                fprintf(stderr, "ds4: /ctx needs a positive integer\n");
+                fprintf(stderr, "ns4: /ctx needs a positive integer\n");
             } else {
                 cfg->gen.ctx_size = parse_int(arg, "/ctx");
                 log_context_memory(cfg->engine.backend,
                                    cfg->gen.ctx_size,
-                                   ds4_engine_prefill_chunk(engine),
+                                   ns4_engine_prefill_chunk(engine),
                                    cfg->engine.ssd_streaming);
                 rc = repl_chat_set_ctx(engine, &chat, cfg->gen.ctx_size);
                 if (rc != 0) {
                     linenoiseFree(line);
                     break;
                 }
-                ds4_think_mode effective = ds4_think_mode_for_context(cfg->gen.think_mode,
+                ns4_think_mode effective = ns4_think_mode_for_context(cfg->gen.think_mode,
                                                                       chat.ctx_size);
                 repl_chat_apply_think_prefix(engine, &chat, effective);
                 cli_warn_think_max_downgraded(&cfg->gen, "/ctx");
@@ -1632,7 +1632,7 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
         } else if (!strncmp(cmd, "/read", 5) && (cmd[5] == '\0' || isspace((unsigned char)cmd[5]))) {
             char *path = trim_inplace(cmd + 5);
             if (!path[0]) {
-                fprintf(stderr, "ds4: /read needs a file path\n");
+                fprintf(stderr, "ns4: /read needs a file path\n");
             } else {
                 char *prompt = read_prompt_file(path, false);
                 if (prompt) {
@@ -1641,8 +1641,8 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
                 }
             }
         } else if (cmd[0] == '/') {
-            fprintf(stderr, "ds4: unknown command: %s\n", cmd);
-            fprintf(stderr, "ds4: type /help for commands\n");
+            fprintf(stderr, "ns4: unknown command: %s\n", cmd);
+            fprintf(stderr, "ns4: type /help for commands\n");
         } else {
             rc = run_chat_turn(engine, cfg, &chat, cmd);
         }
@@ -1655,7 +1655,7 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
 
 static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
     if (*i + 1 >= argc) {
-        fprintf(stderr, "ds4: missing value for %s\n", opt);
+        fprintf(stderr, "ns4: missing value for %s\n", opt);
         exit(2);
     }
     return argv[++(*i)];
@@ -1664,19 +1664,19 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
 static char *read_prompt_file(const char *path, bool fatal) {
     FILE *fp = fopen(path, "rb");
     if (!fp) {
-        fprintf(stderr, "ds4: failed to open prompt file: %s\n", path);
+        fprintf(stderr, "ns4: failed to open prompt file: %s\n", path);
         if (fatal) exit(2);
         return NULL;
     }
     if (fseek(fp, 0, SEEK_END) != 0) {
-        fprintf(stderr, "ds4: failed to seek prompt file: %s\n", path);
+        fprintf(stderr, "ns4: failed to seek prompt file: %s\n", path);
         fclose(fp);
         if (fatal) exit(2);
         return NULL;
     }
     long len = ftell(fp);
     if (len < 0) {
-        fprintf(stderr, "ds4: failed to size prompt file: %s\n", path);
+        fprintf(stderr, "ns4: failed to size prompt file: %s\n", path);
         fclose(fp);
         if (fatal) exit(2);
         return NULL;
@@ -1685,21 +1685,21 @@ static char *read_prompt_file(const char *path, bool fatal) {
 
     char *buf = malloc((size_t)len + 1);
     if (!buf) {
-        fprintf(stderr, "ds4: out of memory reading prompt file: %s\n", path);
+        fprintf(stderr, "ns4: out of memory reading prompt file: %s\n", path);
         fclose(fp);
         if (fatal) exit(2);
         return NULL;
     }
     size_t nread = fread(buf, 1, (size_t)len, fp);
     if (nread != (size_t)len) {
-        fprintf(stderr, "ds4: failed to read prompt file: %s\n", path);
+        fprintf(stderr, "ns4: failed to read prompt file: %s\n", path);
         free(buf);
         fclose(fp);
         if (fatal) exit(2);
         return NULL;
     }
     if (fclose(fp) != 0) {
-        fprintf(stderr, "ds4: failed to close prompt file: %s\n", path);
+        fprintf(stderr, "ns4: failed to close prompt file: %s\n", path);
         free(buf);
         if (fatal) exit(2);
         return NULL;
@@ -1711,7 +1711,7 @@ static char *read_prompt_file(const char *path, bool fatal) {
 static cli_config parse_options(int argc, char **argv) {
     cli_config c = {
         .engine = {
-            .model_path = "ds4flash.gguf",
+            .model_path = "ns4flash.gguf",
             .backend = default_backend(),
             .mtp_draft_tokens = 1,
             .mtp_margin = 3.0f,
@@ -1721,17 +1721,17 @@ static cli_config parse_options(int argc, char **argv) {
             .system = "You are a helpful assistant",
             .n_predict = 50000,
             .ctx_size = 32768,
-            .temperature = DS4_DEFAULT_TEMPERATURE,
-            .top_p = DS4_DEFAULT_TOP_P,
-            .min_p = DS4_DEFAULT_MIN_P,
+            .temperature = NS4_DEFAULT_TEMPERATURE,
+            .top_p = NS4_DEFAULT_TOP_P,
+            .min_p = NS4_DEFAULT_MIN_P,
             .dump_logprobs_top_k = 20,
-            .think_mode = DS4_THINK_HIGH,
+            .think_mode = NS4_THINK_HIGH,
         },
     };
 
-    c.dist = ds4_dist_options_create();
+    c.dist = ns4_dist_options_create();
     if (!c.dist) {
-        fprintf(stderr, "ds4: out of memory creating distributed options\n");
+        fprintf(stderr, "ns4: out of memory creating distributed options\n");
         exit(1);
     }
 
@@ -1745,28 +1745,28 @@ static cli_config parse_options(int argc, char **argv) {
             exit(0);
         }
         char dist_parse_err[256] = {0};
-        ds4_dist_cli_parse_result dist_parse = ds4_dist_parse_cli_arg(arg,
+        ns4_dist_cli_parse_result dist_parse = ns4_dist_parse_cli_arg(arg,
                                                                       &i,
                                                                       argc,
                                                                       argv,
                                                                       c.dist,
                                                                       dist_parse_err,
                                                                       sizeof(dist_parse_err));
-        if (dist_parse == DS4_DIST_CLI_ERROR) {
-            fprintf(stderr, "ds4: %s\n", dist_parse_err[0] ? dist_parse_err : "invalid distributed option");
+        if (dist_parse == NS4_DIST_CLI_ERROR) {
+            fprintf(stderr, "ns4: %s\n", dist_parse_err[0] ? dist_parse_err : "invalid distributed option");
             exit(2);
         }
-        if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
+        if (dist_parse == NS4_DIST_CLI_MATCHED) continue;
 
         if (!strcmp(arg, "-p") || !strcmp(arg, "--prompt")) {
             if (c.gen.prompt) {
-                fprintf(stderr, "ds4: specify only one prompt source\n");
+                fprintf(stderr, "ns4: specify only one prompt source\n");
                 exit(2);
             }
             c.gen.prompt = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--prompt-file")) {
             if (c.gen.prompt) {
-                fprintf(stderr, "ds4: specify only one prompt source\n");
+                fprintf(stderr, "ns4: specify only one prompt source\n");
                 exit(2);
             }
             c.prompt_owned = read_prompt_file(need_arg(&i, argc, argv, arg), true);
@@ -1817,10 +1817,10 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
             uint32_t experts = 0;
             uint64_t bytes = 0;
-            if (!ds4_parse_streaming_cache_experts_arg(
+            if (!ns4_parse_streaming_cache_experts_arg(
                     need_arg(&i, argc, argv, arg), &experts, &bytes)) {
                 fprintf(stderr,
-                        "ds4: --ssd-streaming-cache-experts must be a positive count or <number>GB\n");
+                        "ns4: --ssd-streaming-cache-experts must be a positive count or <number>GB\n");
                 exit(2);
             }
             c.engine.ssd_streaming_cache_experts = experts;
@@ -1828,28 +1828,28 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--ssd-streaming-preload-experts")) {
             int v = parse_int(need_arg(&i, argc, argv, arg), arg);
             if (v <= 0) {
-                fprintf(stderr, "ds4: --ssd-streaming-preload-experts must be positive\n");
+                fprintf(stderr, "ns4: --ssd-streaming-preload-experts must be positive\n");
                 exit(2);
             }
             c.engine.ssd_streaming_preload_experts = (uint32_t)v;
         } else if (!strcmp(arg, "--simulate-used-memory")) {
-            if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg),
+            if (!ns4_parse_gib_arg(need_arg(&i, argc, argv, arg),
                                    &c.engine.simulate_used_memory_bytes)) {
                 fprintf(stderr,
-                        "ds4: --simulate-used-memory must be a positive GiB value, e.g. 64GB\n");
+                        "ns4: --simulate-used-memory must be a positive GiB value, e.g. 64GB\n");
                 exit(2);
             }
         } else if (!strcmp(arg, "--prefill-chunk")) {
             int v = parse_int(need_arg(&i, argc, argv, arg), arg);
             if (v <= 0) {
-                fprintf(stderr, "ds4: --prefill-chunk must be positive\n");
+                fprintf(stderr, "ns4: --prefill-chunk must be positive\n");
                 exit(2);
             }
             c.engine.prefill_chunk = (uint32_t)v;
         } else if (!strcmp(arg, "--power")) {
             c.engine.power_percent = parse_int(need_arg(&i, argc, argv, arg), arg);
             if (c.engine.power_percent < 1 || c.engine.power_percent > 100) {
-                fprintf(stderr, "ds4: --power must be between 1 and 100\n");
+                fprintf(stderr, "ns4: --power must be between 1 and 100\n");
                 exit(2);
             }
         } else if (!strcmp(arg, "--dir-steering-file")) {
@@ -1867,9 +1867,9 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--backend")) {
             c.engine.backend = parse_backend(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--cpu")) {
-            c.engine.backend = DS4_BACKEND_CPU;
+            c.engine.backend = NS4_BACKEND_CPU;
         } else if (!strcmp(arg, "--cuda")) {
-            c.engine.backend = DS4_BACKEND_CUDA;
+            c.engine.backend = NS4_BACKEND_CUDA;
         } else if (!strcmp(arg, "--gpu-vram")) {
             c.gpu_vram_arg = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--gpu-devices")) {
@@ -1897,11 +1897,11 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--imatrix-max-tokens")) {
             c.gen.imatrix_max_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--think")) {
-            c.gen.think_mode = DS4_THINK_HIGH;
+            c.gen.think_mode = NS4_THINK_HIGH;
         } else if (!strcmp(arg, "--think-max")) {
-            c.gen.think_mode = DS4_THINK_MAX;
+            c.gen.think_mode = NS4_THINK_MAX;
         } else if (!strcmp(arg, "--nothink")) {
-            c.gen.think_mode = DS4_THINK_NONE;
+            c.gen.think_mode = NS4_THINK_NONE;
         } else if (!strcmp(arg, "--head-test")) {
             c.gen.head_test = true;
         } else if (!strcmp(arg, "--first-token-test")) {
@@ -1917,10 +1917,10 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--server")) {
-            fprintf(stderr, "ds4: use ds4-server for the HTTP server\n");
+            fprintf(stderr, "ns4: use ns4-server for the HTTP server\n");
             exit(2);
         } else {
-            fprintf(stderr, "ds4: unknown option: %s\n", arg);
+            fprintf(stderr, "ns4: unknown option: %s\n", arg);
             usage(stderr, NULL);
             exit(2);
         }
@@ -1930,20 +1930,20 @@ static cli_config parse_options(int argc, char **argv) {
         c.engine.directional_steering_ffn = 1.0f;
     }
     if (c.gen.imatrix_output_path && !c.gen.imatrix_dataset_path) {
-        fprintf(stderr, "ds4: --imatrix-out requires --imatrix-dataset\n");
+        fprintf(stderr, "ns4: --imatrix-out requires --imatrix-dataset\n");
         exit(2);
     }
     if (c.gen.imatrix_dataset_path && !c.gen.imatrix_output_path) {
-        fprintf(stderr, "ds4: --imatrix-dataset requires --imatrix-out\n");
+        fprintf(stderr, "ns4: --imatrix-dataset requires --imatrix-out\n");
         exit(2);
     }
     if (c.gen.perplexity_file_path && c.gen.prompt) {
-        fprintf(stderr, "ds4: --perplexity-file does not use -p/--prompt-file\n");
+        fprintf(stderr, "ns4: --perplexity-file does not use -p/--prompt-file\n");
         exit(2);
     }
     char dist_err[256];
-    if (ds4_dist_prepare_engine_options(c.dist, &c.engine, dist_err, sizeof(dist_err)) != 0) {
-        fprintf(stderr, "ds4: %s\n", dist_err);
+    if (ns4_dist_prepare_engine_options(c.dist, &c.engine, dist_err, sizeof(dist_err)) != 0) {
+        fprintf(stderr, "ns4: %s\n", dist_err);
         exit(2);
     }
 
@@ -1954,14 +1954,14 @@ int main(int argc, char **argv) {
     cli_config cfg = parse_options(argc, argv);
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prompt == NULL) {
-            fprintf(stderr, "ds4: --dump-tokens requires -p or --prompt-file\n");
+            fprintf(stderr, "ns4: --dump-tokens requires -p or --prompt-file\n");
             free(cfg.prompt_owned);
             return 2;
         }
-        int rc = ds4_dump_text_tokenization(cfg.engine.model_path,
+        int rc = ns4_dump_text_tokenization(cfg.engine.model_path,
                                             cfg.gen.prompt,
                                             stdout);
-        ds4_dist_options_free(cfg.dist);
+        ns4_dist_options_free(cfg.dist);
         free(cfg.prompt_owned);
         return rc;
     }
@@ -1970,23 +1970,23 @@ int main(int argc, char **argv) {
     cfg.engine.graph_test = cfg.gen.graph_test;
     cfg.engine.context_size = cfg.gen.ctx_size;
     cfg.engine.placement_ctx_hint = cfg.gen.ctx_size;
-    ds4_engine *engine = NULL;
+    ns4_engine *engine = NULL;
     if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
-        ds4_gpu_config gpu_cfg = {0};
+        ns4_gpu_config gpu_cfg = {0};
         bool skip_cuda = false;
         char errbuf[256];
         if (parse_gpu_vram_arg(cfg.gpu_vram_arg, cfg.gpu_devices_arg,
                                &gpu_cfg, &skip_cuda,
                                errbuf, sizeof(errbuf)) != 0) {
-            fprintf(stderr, "ds4: %s\n", errbuf);
-            ds4_dist_options_free(cfg.dist);
+            fprintf(stderr, "ns4: %s\n", errbuf);
+            ns4_dist_options_free(cfg.dist);
             free(cfg.prompt_owned);
             return 2;
         }
-        cfg.engine.backend = skip_cuda ? DS4_BACKEND_CPU : DS4_BACKEND_CUDA;
+        cfg.engine.backend = skip_cuda ? NS4_BACKEND_CPU : NS4_BACKEND_CUDA;
         if (skip_cuda) {
-            if (ds4_engine_open(&engine, &cfg.engine) != 0) {
-                ds4_dist_options_free(cfg.dist);
+            if (ns4_engine_open(&engine, &cfg.engine) != 0) {
+                ns4_dist_options_free(cfg.dist);
                 free(cfg.prompt_owned);
                 return 1;
             }
@@ -2000,20 +2000,20 @@ int main(int argc, char **argv) {
                 fprintf(stdout, "%s\n", layout);
                 fflush(stdout);
             }
-            if (ds4_engine_create_with_gpu_config(&engine, &cfg.engine,
+            if (ns4_engine_create_with_gpu_config(&engine, &cfg.engine,
                                                    &gpu_cfg) != 0) {
-                ds4_dist_options_free(cfg.dist);
+                ns4_dist_options_free(cfg.dist);
                 free(cfg.prompt_owned);
                 return 1;
             }
         }
-    } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
-        ds4_dist_options_free(cfg.dist);
+    } else if (ns4_engine_open(&engine, &cfg.engine) != 0) {
+        ns4_dist_options_free(cfg.dist);
         free(cfg.prompt_owned);
         return 1;
     }
-    if (cfg.dist && cfg.dist->role == DS4_DISTRIBUTED_WORKER) {
-        ds4_dist_generation_options dist_gen = {
+    if (cfg.dist && cfg.dist->role == NS4_DISTRIBUTED_WORKER) {
+        ns4_dist_generation_options dist_gen = {
             .prompt = cfg.gen.prompt,
             .system = cfg.gen.system,
             .dump_logits_path = cfg.gen.dump_logits_path,
@@ -2027,24 +2027,24 @@ int main(int argc, char **argv) {
             .seed = cfg.gen.seed,
             .think_mode = cfg.gen.think_mode,
         };
-        int rc = ds4_dist_run(engine, cfg.dist, &dist_gen);
-        ds4_engine_close(engine);
-        ds4_dist_options_free(cfg.dist);
+        int rc = ns4_dist_run(engine, cfg.dist, &dist_gen);
+        ns4_engine_close(engine);
+        ns4_dist_options_free(cfg.dist);
         free(cfg.prompt_owned);
         return rc;
     }
     if (!cfg.inspect) {
         log_context_memory(cfg.engine.backend,
                            cfg.gen.ctx_size,
-                           ds4_engine_prefill_chunk(engine),
+                           ns4_engine_prefill_chunk(engine),
                            cfg.engine.ssd_streaming);
         cli_warn_think_max_downgraded(&cfg.gen, "--think-max");
     }
     int rc = 0;
     if (cfg.inspect) {
-        ds4_engine_summary(engine);
+        ns4_engine_summary(engine);
     } else if (cfg.gen.imatrix_output_path) {
-        rc = ds4_engine_collect_imatrix(engine,
+        rc = ns4_engine_collect_imatrix(engine,
                                         cfg.gen.imatrix_dataset_path,
                                         cfg.gen.imatrix_output_path,
                                         cfg.gen.ctx_size,
@@ -2057,8 +2057,8 @@ int main(int argc, char **argv) {
     } else {
         rc = run_generation(engine, &cfg);
     }
-    ds4_engine_close(engine);
-    ds4_dist_options_free(cfg.dist);
+    ns4_engine_close(engine);
+    ns4_dist_options_free(cfg.dist);
     free(cfg.prompt_owned);
     return rc;
 }

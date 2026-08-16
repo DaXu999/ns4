@@ -18,7 +18,7 @@ make clean
 make
 ```
 
-The C test runner is `ds4_test`. Running it without arguments is equivalent to
+The C test runner is `ns4_test`. Running it without arguments is equivalent to
 `--all`:
 
 ```sh
@@ -28,11 +28,11 @@ make test
 Useful narrower checks:
 
 ```sh
-./ds4_test --server
-./ds4_test --logprob-vectors
-./ds4_test --long-context
-./ds4_test --tool-call-quality
-./ds4_test --kernels
+./ns4_test --server
+./ns4_test --logprob-vectors
+./ns4_test --long-context
+./ns4_test --tool-call-quality
+./ns4_test --kernels
 ```
 
 What they cover:
@@ -51,12 +51,12 @@ What they cover:
   emission in both fast and exact paths.
 - `--kernels`: isolated GPU kernel numeric checks. Fast and model-free.
 
-The runner defaults to `ds4flash.gguf`. Override paths when needed:
+The runner defaults to `ns4flash.gguf`. Override paths when needed:
 
 ```sh
-DS4_TEST_MODEL=/path/to/model.gguf ./ds4_test --logprob-vectors
-DS4_TEST_VECTOR_FILE=/path/to/official.vec ./ds4_test --logprob-vectors
-DS4_TEST_LONG_PROMPT=/path/to/prompt.txt ./ds4_test --long-context
+NS4_TEST_MODEL=/path/to/model.gguf ./ns4_test --logprob-vectors
+NS4_TEST_VECTOR_FILE=/path/to/official.vec ./ns4_test --logprob-vectors
+NS4_TEST_LONG_PROMPT=/path/to/prompt.txt ./ns4_test --long-context
 ```
 
 For CUDA-specific changes, test on a CUDA machine:
@@ -105,7 +105,7 @@ continuations.
 
 ## Speed Regression Tests
 
-Use `ds4-bench` for throughput regressions. It reports instantaneous prefill and
+Use `ns4-bench` for throughput regressions. It reports instantaneous prefill and
 generation speed at context frontiers, not one whole-run average. Prefill is
 incremental: each row measures only the newly processed suffix since the
 previous frontier.
@@ -113,14 +113,14 @@ previous frontier.
 Default linear sweep:
 
 ```sh
-./ds4-bench \
-  -m ds4flash.gguf \
+./ns4-bench \
+  -m ns4flash.gguf \
   --prompt-file speed-bench/promessi_sposi.txt \
   --ctx-start 2048 \
   --ctx-max 65536 \
   --step-incr 2048 \
   --gen-tokens 128 \
-  --csv /tmp/ds4-speed.csv
+  --csv /tmp/ns4-speed.csv
 ```
 
 Use the same machine, backend, model file, context sweep, power/thermal state,
@@ -131,7 +131,7 @@ greedy and skips EOS so each frontier gets the same number of generated tokens.
 To generate a graph for a CSV:
 
 ```sh
-python3 speed-bench/plot_speed.py /tmp/ds4-speed.csv --title "Machine t/s"
+python3 speed-bench/plot_speed.py /tmp/ns4-speed.csv --title "Machine t/s"
 ```
 
 ## Reporting sessions bugs
@@ -139,5 +139,5 @@ python3 speed-bench/plot_speed.py /tmp/ds4-speed.csv --title "Machine t/s"
 For debugging a failing generation, keep the trace:
 
 ```sh
-./ds4-server --trace /tmp/ds4-trace.txt ...
+./ns4-server --trace /tmp/ns4-trace.txt ...
 ```

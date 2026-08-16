@@ -107,7 +107,7 @@ int main(int argc, char **argv) {
     }
 
     printf("\nbest contiguous read: %.1f GB/s\n", best);
-    printf("ds4 decode achieves ~436 GB/s (8.4 GB/token at 19.2 ms) = %.1f%% of that\n",
+    printf("ns4 decode achieves ~436 GB/s (8.4 GB/token at 19.2 ms) = %.1f%% of that\n",
            100.0 * 436.0 / best);
 
     printf("\nstrided reads at full grid (1504 blocks), same total bytes touched:\n");

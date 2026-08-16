@@ -1,4 +1,4 @@
-#include "ds4.h"
+#include "ns4.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -215,7 +215,7 @@ static void compare_case(const float *logits, float *scratch, uint32_t n,
         uint64_t opt_rng = seed;
         const int ref = reference_sample(logits, n, temperature, top_k,
                                          top_p, min_p, &ref_rng);
-        const int opt = ds4_test_sample_logits(logits, n, temperature, top_k,
+        const int opt = ns4_test_sample_logits(logits, n, temperature, top_k,
                                                top_p, min_p, &opt_rng, scratch);
         CHECK(ref == opt,
               "%s seed=%llu token reference=%d optimized=%d",
@@ -297,7 +297,7 @@ int main(void) {
             tied_logits,
             (uint32_t)(sizeof(tied_logits) / sizeof(tied_logits[0])),
             1.0f, 0, 1.0f, 0.05f, &null_ref_rng);
-    const int null_opt = ds4_test_sample_logits(
+    const int null_opt = ns4_test_sample_logits(
             tied_logits,
             (uint32_t)(sizeof(tied_logits) / sizeof(tied_logits[0])),
             1.0f, 0, 1.0f, 0.05f, &null_opt_rng, NULL);
@@ -335,7 +335,7 @@ int main(void) {
     uint64_t opt_rng = 1234;
     start = now_sec();
     for (int i = 0; i < iterations; i++) {
-        checksum += (uint64_t)ds4_test_sample_logits(logits, perf_n, 1.0f, 0,
+        checksum += (uint64_t)ns4_test_sample_logits(logits, perf_n, 1.0f, 0,
                                                      1.0f, 0.05f,
                                                      &opt_rng, scratch);
     }
@@ -357,7 +357,7 @@ int main(void) {
     opt_rng = 5678;
     start = now_sec();
     for (int i = 0; i < iterations; i++) {
-        checksum += (uint64_t)ds4_test_sample_logits(logits, perf_n, 1.0f, 0,
+        checksum += (uint64_t)ns4_test_sample_logits(logits, perf_n, 1.0f, 0,
                                                      0.9f, 0.05f,
                                                      &opt_rng, scratch);
     }

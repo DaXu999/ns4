@@ -1,16 +1,16 @@
-# DS4 GGUF Tools
+# NS4 GGUF Tools
 
 This directory contains the offline tools used to build and evaluate DeepSeek
-V4 Flash GGUF files for `ds4`.
+V4 Flash GGUF files for `ns4`.
 
 The important pieces are:
 
 - `deepseek4-quantize.c`: C HF-safetensors to GGUF quantizer.
 - `quants.[ch]`: the deliberately small local quantization implementation used
-  by the quantizer.  It implements the DS4 output formats we actually ship:
+  by the quantizer.  It implements the NS4 output formats we actually ship:
   `q8_0`, `q8_K`, `q4_K`, `q2_K`, and `iq2_xxs`.
 - `imatrix/`: dataset and instructions for collecting routed-MoE activation
-  importance with `ds4`.
+  importance with `ns4`.
 - `quality-testing/`: prompts and scripts used to compare local GGUF variants
   against official DeepSeek V4 Flash continuations.
 
@@ -29,25 +29,25 @@ and Q4 recipes live in this directory.
 First regenerate or inspect the calibration dataset:
 
 ```sh
-python3 gguf-tools/imatrix/dataset/build_ds4_imatrix_dataset.py
+python3 gguf-tools/imatrix/dataset/build_ns4_imatrix_dataset.py
 ```
 
-Then collect activation statistics with the DS4 runtime:
+Then collect activation statistics with the NS4 runtime:
 
 ```sh
-./ds4 \
+./ns4 \
   -m gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf \
   --imatrix-dataset gguf-tools/imatrix/dataset/rendered_prompts.txt \
-  --imatrix-out gguf/DeepSeek-V4-Flash-chat-v2-routed-moe-ds4.dat \
+  --imatrix-out gguf/DeepSeek-V4-Flash-chat-v2-routed-moe-ns4.dat \
   --ctx 32768
 ```
 
-The imatrix file is useful immediately with this DS4 quantizer.  Generic GGUF
-tools need DS4-specific tensor-name mapping and per-expert slicing before they
+The imatrix file is useful immediately with this NS4 quantizer.  Generic GGUF
+tools need NS4-specific tensor-name mapping and per-expert slicing before they
 can use it correctly.  The accepted imatrix format is the legacy llama.cpp
-binary `.dat` file emitted by `ds4 --imatrix-out`.
+binary `.dat` file emitted by `ns4 --imatrix-out`.
 
-Generating this `.dat` file locally is possible, but slow: it runs the DS4
+Generating this `.dat` file locally is possible, but slow: it runs the NS4
 prefill graph over the full calibration corpus and reads routed-MoE activation
 statistics back from the GPU.  The latest published imatrix-generated GGUF files
 are available in the antirez Hugging Face repository:
@@ -73,7 +73,7 @@ gguf-tools/deepseek4-quantize \
   --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Flash \
   --template gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf \
   --out gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
-  --imatrix gguf/DeepSeek-V4-Flash-chat-v2-routed-moe-ds4.dat
+  --imatrix gguf/DeepSeek-V4-Flash-chat-v2-routed-moe-ns4.dat
 ```
 
 Q4 routed experts with imatrix:
@@ -83,7 +83,7 @@ gguf-tools/deepseek4-quantize \
   --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Flash \
   --template gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf \
   --out gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf \
-  --imatrix gguf/DeepSeek-V4-Flash-chat-v2-routed-moe-ds4.dat
+  --imatrix gguf/DeepSeek-V4-Flash-chat-v2-routed-moe-ns4.dat
 ```
 
 True Q8_K routed experts:
@@ -136,7 +136,7 @@ The manifest reads only `model.safetensors.index.json`; it does not require the
 large shard files to be present.  The final summary should report three DSpark
 stages and zero unknown DSpark tensors before attempting a full conversion.
 
-To build the support GGUF used by `ds4 --mtp`, run the DSpark support mode.  This
+To build the support GGUF used by `ns4 --mtp`, run the DSpark support mode.  This
 mode writes standalone DSpark metadata plus the packed `mtp.*` tensor payloads;
 it does not require a base-model GGUF template:
 
@@ -177,7 +177,7 @@ from the dequantized weight itself:
 importance[column] = sum(row[column]^2) over all rows
 ```
 
-This is a weight-energy heuristic.  It is not as good as measuring real DS4
+This is a weight-energy heuristic.  It is not as good as measuring real NS4
 activations, but it gives the quantizer a stable column weighting and was good
 enough for the first working 2-bit GGUFs.
 

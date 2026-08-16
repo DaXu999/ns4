@@ -1,6 +1,6 @@
 /* Does a combined (grid, sign) LUT beat the live IQ2_XXS sign reconstruction?
  *
- * ds4-iq2-moe-dequant-is-alu-bound established that
+ * ns4-iq2-moe-dequant-is-alu-bound established that
  * moe_gate_up_mid_decode_lut_qwarp32_kernel runs at 348 GB/s (21% of this
  * box's 1642 GB/s roofline) and that neither the weight access pattern nor
  * shared-memory bank conflicts explain it: the cost is the ALU sequence in
@@ -69,7 +69,7 @@ typedef struct {
     uint16_t qs[CUDA_QK_K / 8];
 } cuda_block_iq2_xxs;
 
-#include "../../ds4_iq2_tables_cuda.inc"
+#include "../../ns4_iq2_tables_cuda.inc"
 
 /* Host mirrors of the two device __constant__ tables, for building the
  * derived tables and for the CPU reference. */
@@ -163,7 +163,7 @@ __device__ static const uint16_t *g_quad_map;
 /* ---------------------------------------------------------------- variants */
 
 enum {
-    V_BASE = 0,       /* verbatim ds4_cuda.cu */
+    V_BASE = 0,       /* verbatim ns4_cuda.cu */
     V_NOPOPC,         /* same, minus the dead parity fix */
     V_COMBINED,       /* 256 KiB combined LUT, global memory */
     V_COMBINED_HALF,  /* 128 KiB, negation symmetry folded out */
@@ -349,7 +349,7 @@ __device__ static float dot_iq2_block(
 }
 
 /* Same arithmetic as dot_iq2_block, sourced from the aligned-SoA artifact
- * layout that ds4_repack_build_iq2_aligned already produces for the MMQ path:
+ * layout that ns4_repack_build_iq2_aligned already produces for the MMQ path:
  * [__half dq[nblk]][pad 64B][uint2 qs[nblk*8]].  Byte-neutral -- 2 + 64 vs the
  * raw block's 66 -- but qs is 8-byte aligned, so each 32-weight group is one
  * ld.global.v2.b32 instead of four unmergeable ld.global.b16. */
@@ -584,7 +584,7 @@ int main(int argc, char **argv) {
     CHECK(cudaMemcpy(d_wt, h_wt, sizeof(h_wt), cudaMemcpyHostToDevice));
 
     /* Aligned-SoA mirror of the same pool: dq[nblk] then qs[nblk*8], the
-     * layout ds4_repack_build_iq2_aligned already emits.  Byte-neutral, so
+     * layout ns4_repack_build_iq2_aligned already emits.  Byte-neutral, so
      * both arms move identical DRAM traffic; only the load width differs. */
     const uint64_t nblk = (uint64_t)pool * expert_mid_dim * xq_blocks;
     uint2 *d_qs_gate = NULL, *d_qs_up = NULL;

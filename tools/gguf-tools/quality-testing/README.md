@@ -19,7 +19,7 @@ calling hosted APIs:
   DeepSeek API with `top_logprobs=20`.
 
 DeepSeek V4 Flash also has tracked official smoke vectors in
-`tests/test-vectors/`.  Those vectors drive `./ds4_test --logprob-vectors` and
+`tests/test-vectors/`.  Those vectors drive `./ns4_test --logprob-vectors` and
 include short prompts plus long-prompt attention cases.
 
 The hosted APIs expose output-token logprobs and top-logprob alternatives, not
@@ -43,7 +43,7 @@ python3 gguf-tools/quality-testing/collect_official.py \
   --reasoning-effort omit
 ```
 
-The scorer links against the DS4 runtime and uses CUDA by default.
+The scorer links against the NS4 runtime and uses CUDA by default.
 
 Build the optional llama.cpp control scorer with:
 
@@ -72,9 +72,9 @@ Use `data/flash/manifest.tsv` for Flash GGUFs and
 which model produced the manifest; the manifest path selects the continuation
 set.
 
-Add `--quality` to disable DS4's speed-oriented numerical shortcuts. For an
+Add `--quality` to disable NS4's speed-oriented numerical shortcuts. For an
 independent llama.cpp comparison of a DeepSeek V4 GGUF, use the same manifest
-and the token-identical DS4 prompt renderer:
+and the token-identical NS4 prompt renderer:
 
 ```sh
 gguf-tools/quality-testing/score_llama \
@@ -82,7 +82,7 @@ gguf-tools/quality-testing/score_llama \
   gguf-tools/quality-testing/data/flash/manifest.tsv \
   /tmp/llama.tsv \
   4096 \
-  deepseek-ds4
+  deepseek-ns4
 ```
 
 For a full-residency vs SSD-streaming comparison, score the same model twice and

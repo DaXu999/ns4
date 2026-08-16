@@ -1,5 +1,5 @@
-/* Standalone microbenchmark for the ds4 CUDA flash decode attention kernel.
- * Baseline kernel text is extracted verbatim from ds4_cuda.cu so the timing
+/* Standalone microbenchmark for the ns4 CUDA flash decode attention kernel.
+ * Baseline kernel text is extracted verbatim from ns4_cuda.cu so the timing
  * and the numerics comparison are honest. */
 #include <cstdio>
 #include <cstdlib>

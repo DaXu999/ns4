@@ -5,17 +5,17 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="$ROOT/$(basename -- "${BASH_SOURCE[0]}")"
 cd -- "$ROOT"
 
-MODEL="${DS4_MODEL:-/home/antirez/models/deepseek-v4-gguf/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf}"
-CTX="${DS4_CTX:-100000}"
-SERVER_HOST="${DS4_SERVER_HOST:-0.0.0.0}"
-SERVER_PORT="${DS4_SERVER_PORT:-8000}"
-KV_DIR="${DS4_KV_DIR:-/data/ds4-kv}"
-KV_SPACE_MB="${DS4_KV_SPACE_MB:-8192}"
-BATCHED_SESSIONS="${DS4_BATCHED_SESSIONS:-16}"
-LOCK_FILE="${DS4_LOCK_FILE:-/tmp/ds4.lock}"
-LOG_FILE="${DS4_SERVER_LOG:-/tmp/ds4-server.log}"
-START_TIMEOUT="${DS4_START_TIMEOUT:-180}"
-STOP_TIMEOUT="${DS4_STOP_TIMEOUT:-120}"
+MODEL="${NS4_MODEL:-/home/antirez/models/deepseek-v4-gguf/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf}"
+CTX="${NS4_CTX:-100000}"
+SERVER_HOST="${NS4_SERVER_HOST:-0.0.0.0}"
+SERVER_PORT="${NS4_SERVER_PORT:-8000}"
+KV_DIR="${NS4_KV_DIR:-/data/ns4-kv}"
+KV_SPACE_MB="${NS4_KV_SPACE_MB:-8192}"
+BATCHED_SESSIONS="${NS4_BATCHED_SESSIONS:-16}"
+LOCK_FILE="${NS4_LOCK_FILE:-/tmp/ns4.lock}"
+LOG_FILE="${NS4_SERVER_LOG:-/tmp/ns4-server.log}"
+START_TIMEOUT="${NS4_START_TIMEOUT:-180}"
+STOP_TIMEOUT="${NS4_STOP_TIMEOUT:-120}"
 
 die() {
     printf 'run-nvidia-tp-server: %s\n' "$*" >&2
@@ -25,9 +25,9 @@ die() {
 usage() {
     cat <<EOF
 Usage:
-  $(basename -- "$0") [ds4-server options...]       Run in the foreground
-  $(basename -- "$0") start [ds4-server options...] Start detached
-  $(basename -- "$0") restart [ds4-server options...] Gracefully restart detached
+  $(basename -- "$0") [ns4-server options...]       Run in the foreground
+  $(basename -- "$0") start [ns4-server options...] Start detached
+  $(basename -- "$0") restart [ns4-server options...] Gracefully restart detached
   $(basename -- "$0") stop                          Gracefully stop
   $(basename -- "$0") status                        Show server status
 
@@ -41,8 +41,8 @@ check_timeout() {
 }
 
 check_prerequisites() {
-    [[ -x ./ds4-server ]] ||
-        die './ds4-server is not built; run `make cuda-generic` first'
+    [[ -x ./ns4-server ]] ||
+        die './ns4-server is not built; run `make cuda-generic` first'
     [[ -f "$MODEL" ]] ||
         die "model not found: $MODEL"
 }
@@ -64,8 +64,8 @@ is_managed_server() {
     [[ "$cwd" == "$ROOT" ]] || return 1
     mapfile -d '' -t argv < "/proc/$pid/cmdline" || return 1
     ((${#argv[@]} > 0)) || return 1
-    [[ "${argv[0]}" == "./ds4-server" ||
-       "${argv[0]}" == "$ROOT/ds4-server" ]] || return 1
+    [[ "${argv[0]}" == "./ns4-server" ||
+       "${argv[0]}" == "$ROOT/ns4-server" ]] || return 1
     for arg in "${argv[@]}"; do
         [[ "$arg" == "--cuda-tensor-parallel" ]] && return 0
     done
@@ -99,7 +99,7 @@ inspect_lock_owner() {
 stop_server() {
     local deadline
 
-    check_timeout DS4_STOP_TIMEOUT "$STOP_TIMEOUT"
+    check_timeout NS4_STOP_TIMEOUT "$STOP_TIMEOUT"
     inspect_lock_owner
     case "$LOCK_OWNER_KIND" in
         none)
@@ -125,7 +125,7 @@ stop_server() {
 
 run_server() {
     check_prerequisites
-    exec ./ds4-server \
+    exec ./ns4-server \
         --cuda \
         --cuda-tensor-parallel \
         --gpu-devices 0,2,4,6,1,3,5,7 \
@@ -143,7 +143,7 @@ run_server() {
 start_server() {
     local pid="" deadline
 
-    check_timeout DS4_START_TIMEOUT "$START_TIMEOUT"
+    check_timeout NS4_START_TIMEOUT "$START_TIMEOUT"
     check_prerequisites
     command -v setsid >/dev/null 2>&1 ||
         die 'setsid is required for detached server startup'
@@ -173,7 +173,7 @@ start_server() {
         fi
         if [[ -n "$pid" ]] &&
            process_is_alive "$pid" &&
-           grep -Fq 'ds4-server: listening on ' "$LOG_FILE"; then
+           grep -Fq 'ns4-server: listening on ' "$LOG_FILE"; then
             printf 'run-nvidia-tp-server: ready on %s:%s (pid %s)\n' \
                 "$SERVER_HOST" "$SERVER_PORT" "$pid"
             return 0
@@ -203,11 +203,11 @@ case "$command" in
         start_server "$@"
         ;;
     stop)
-        (($# == 0)) || die 'stop does not accept ds4-server options'
+        (($# == 0)) || die 'stop does not accept ns4-server options'
         stop_server
         ;;
     status)
-        (($# == 0)) || die 'status does not accept ds4-server options'
+        (($# == 0)) || die 'status does not accept ns4-server options'
         inspect_lock_owner
         case "$LOCK_OWNER_KIND" in
             managed)

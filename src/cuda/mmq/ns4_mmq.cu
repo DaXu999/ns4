@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
-// ds4_mmq.cu - host wrapper around llama.cpp's vendored mul_mat_q kernels.
+// ns4_mmq.cu - host wrapper around llama.cpp's vendored mul_mat_q kernels.
 //
-// The fused target-prefill MoE dispatcher (ds4_mmq_fused_down,
-// ds4_swiglu_weighted_f32, the fused_down branches of
-// ds4_mmq_moe_pair_impl, and the ds4_mmq_iq2_xxs_q2_K_moe_fused_* entry
+// The fused target-prefill MoE dispatcher (ns4_mmq_fused_down,
+// ns4_swiglu_weighted_f32, the fused_down branches of
+// ns4_mmq_moe_pair_impl, and the ns4_mmq_iq2_xxs_q2_K_moe_fused_* entry
 // points) is Portions Copyright (c) 2026 Marco Palaferri (MIT), adapted
-// from xangel82/DS4-GB10-GX10-DSpark-CUDA commit 910501e (v0.5 inc-9).
+// from xangel82/NS4-GB10-GX10-DSpark-CUDA commit 910501e (v0.5 inc-9).
 //
-// Implements the public ds4_mmq_* entry points and explicitly instantiates
+// Implements the public ns4_mmq_* entry points and explicitly instantiates
 // the mul_mat_q_case<T> template for each quant type the caller needs.
 //
 // Status:
@@ -18,13 +18,13 @@
 //   Q2_K MoE _id .......... pending (Phase 4)
 //   IQ2_XXS MoE _id ....... pending (Phase 4)
 
-#include "ds4_mmq.h"
+#include "ns4_mmq.h"
 
 #include "common.cuh"
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
-#include "ds4_mmq_d2r.cuh"
+#include "ns4_mmq_d2r.cuh"
 
 #include <cstdio>
 #include <cstdlib>
@@ -34,33 +34,33 @@
 #if defined(__has_include)
 #if __has_include(<nvtx3/nvToolsExt.h>)
 #include <nvtx3/nvToolsExt.h>
-#define DS4_MMQ_HAS_NVTX 1
+#define NS4_MMQ_HAS_NVTX 1
 #endif
 #endif
-#ifndef DS4_MMQ_HAS_NVTX
-#define DS4_MMQ_HAS_NVTX 0
+#ifndef NS4_MMQ_HAS_NVTX
+#define NS4_MMQ_HAS_NVTX 0
 #endif
 
-static bool ds4_mmq_nvtx_requested() {
+static bool ns4_mmq_nvtx_requested() {
     static int enabled = -1;
     if (enabled < 0) {
-        const char *nvtx = getenv("DS4_CUDA_NVTX");
-        const char *capture = getenv("DS4_CUDA_NSYS_PREFILL_START_POS");
+        const char *nvtx = getenv("NS4_CUDA_NVTX");
+        const char *capture = getenv("NS4_CUDA_NSYS_PREFILL_START_POS");
         enabled = (nvtx != nullptr && std::strcmp(nvtx, "1") == 0) ||
                   (capture != nullptr && capture[0] != '\0');
     }
     return enabled != 0;
 }
 
-static uint64_t ds4_mmq_nvtx_payload(uint32_t first, uint32_t second) {
+static uint64_t ns4_mmq_nvtx_payload(uint32_t first, uint32_t second) {
     return ((uint64_t)first << 32) | second;
 }
 
-class ds4_mmq_nvtx_scope {
+class ns4_mmq_nvtx_scope {
 public:
-    ds4_mmq_nvtx_scope(const char *name, uint64_t payload, bool enabled)
+    ns4_mmq_nvtx_scope(const char *name, uint64_t payload, bool enabled)
         : active_(enabled) {
-#if DS4_MMQ_HAS_NVTX
+#if NS4_MMQ_HAS_NVTX
         if (active_) {
             nvtxEventAttributes_t attr = {};
             attr.version = NVTX_VERSION;
@@ -78,14 +78,14 @@ public:
 #endif
     }
 
-    ~ds4_mmq_nvtx_scope() {
-#if DS4_MMQ_HAS_NVTX
+    ~ns4_mmq_nvtx_scope() {
+#if NS4_MMQ_HAS_NVTX
         if (active_) (void)nvtxRangePop();
 #endif
     }
 
-    ds4_mmq_nvtx_scope(const ds4_mmq_nvtx_scope &) = delete;
-    ds4_mmq_nvtx_scope &operator=(const ds4_mmq_nvtx_scope &) = delete;
+    ns4_mmq_nvtx_scope(const ns4_mmq_nvtx_scope &) = delete;
+    ns4_mmq_nvtx_scope &operator=(const ns4_mmq_nvtx_scope &) = delete;
 
 private:
     bool active_;
@@ -97,7 +97,7 @@ private:
 
 // Step 7 task #29: experimental persistent Q8_1 scratch buffer.
 //
-// Hypothesis: ggml_cuda_pool_alloc inside ds4_mmq_moe_vec_impl records a
+// Hypothesis: ggml_cuda_pool_alloc inside ns4_mmq_moe_vec_impl records a
 // cudaMallocAsync graph node into the captured layer graph.  At replay
 // time the alloc node returns a (potentially different) address, but the
 // matvec kernel's pointer argument was baked in at capture time.  Result:
@@ -106,8 +106,8 @@ private:
 //
 // Mitigation under test: pre-allocate a persistent device buffer at
 // startup via plain cudaMalloc (NOT cudaMallocAsync, NOT inside any
-// capture).  When the env flag DS4_CUDA_MMQ_Q81_PERSISTENT=1 is set,
-// ds4_mmq_moe_vec_impl uses this persistent buffer instead of pool_alloc.
+// capture).  When the env flag NS4_CUDA_MMQ_Q81_PERSISTENT=1 is set,
+// ns4_mmq_moe_vec_impl uses this persistent buffer instead of pool_alloc.
 //
 // Sized for V4 Flash decode shapes: gate Q8_1 ~8 KB, down Q8_1 ~14 KB.
 // 256 KB allocation gives generous headroom for short prefill batches.
@@ -117,50 +117,50 @@ static bool   g_q81_scratch_enabled = false;
 static void  *g_aligned_q81_scratch_ptr = nullptr;
 static size_t g_aligned_q81_scratch_bytes = 0;
 
-extern "C" void ds4_mmq_set_aligned_q81_scratch(void *ptr, size_t bytes) {
+extern "C" void ns4_mmq_set_aligned_q81_scratch(void *ptr, size_t bytes) {
     g_aligned_q81_scratch_ptr = ptr;
     g_aligned_q81_scratch_bytes = ptr ? bytes : 0;
 }
 
-// Read by ds4_mmq_moe_vec_impl; non-zero means use the persistent buffer.
-// Set by ds4_mmq_init once based on env.  (Single-threaded GPU work; no
+// Read by ns4_mmq_moe_vec_impl; non-zero means use the persistent buffer.
+// Set by ns4_mmq_init once based on env.  (Single-threaded GPU work; no
 // atomicity needed.)
-extern "C" int ds4_mmq_q81_persistent_enabled(void) {
+extern "C" int ns4_mmq_q81_persistent_enabled(void) {
     return g_q81_scratch_enabled ? 1 : 0;
 }
 
-extern "C" void *ds4_mmq_q81_scratch_ptr(void) {
+extern "C" void *ns4_mmq_q81_scratch_ptr(void) {
     return g_q81_scratch_ptr;
 }
 
-// M2-Inc2a: registry of producer-emitted q8_1 activations (ds4_cuda.cu).
+// M2-Inc2a: registry of producer-emitted q8_1 activations (ns4_cuda.cu).
 // A hit returns canonical block_q8_1 codes for this exact activation
 // pointer (bit-exact vs quantize_row_q8_1_cuda), letting the caller skip
 // its quantize prelude.  Only valid for single-token unpadded rows
 // (ne10_padded == K); the registry itself guarantees freshness (slots are
 // reset by the producing entry every layer and pops are one-shot).
-extern "C" int ds4_cuda_q8_fold_take_q81(const void *src, uint64_t in_dim,
+extern "C" int ns4_cuda_q8_fold_take_q81(const void *src, uint64_t in_dim,
                                          const void **q81);
-static char *ds4_mmq_folded_q81(const float *X_f32, int64_t K, int n_tokens,
+static char *ns4_mmq_folded_q81(const float *X_f32, int64_t K, int n_tokens,
                                 int64_t ne10_padded) {
     if (n_tokens != 1 || ne10_padded != K) return nullptr;
     const void *p = nullptr;
-    if (!ds4_cuda_q8_fold_take_q81((const void *)X_f32, (uint64_t)K, &p)) return nullptr;
+    if (!ns4_cuda_q8_fold_take_q81((const void *)X_f32, (uint64_t)K, &p)) return nullptr;
     static int logged = 0;
     if (!logged) {
         logged = 1;
-        fprintf(stderr, "ds4: M2-Inc2a q8_1 activation fold active (mmvq decode)\n");
+        fprintf(stderr, "ns4: M2-Inc2a q8_1 activation fold active (mmvq decode)\n");
     }
     return (char *)(uintptr_t)p;
 }
 
 // Default ON (2026-07-09 gated increment: same-boot ABBA 427->493 tok/s @12k,
-// gsm8k 97.5 / mbpp 90). DS4_MMQ_D2R=0 is the kill switch back to the
+// gsm8k 97.5 / mbpp 90). NS4_MMQ_D2R=0 is the kill switch back to the
 // mul_mat_q SoA-tile down path.
 static bool d2r_enabled() {
     static int cached = -1;
     if (cached < 0) {
-        const char *env = getenv("DS4_MMQ_D2R");
+        const char *env = getenv("NS4_MMQ_D2R");
         cached = (env && env[0] == '0') ? 0 : 1;
     }
     return cached != 0;
@@ -169,7 +169,7 @@ static bool d2r_enabled() {
 static bool d2r_iq2_enabled() {
     static int cached = -1;
     if (cached < 0) {
-        const char *env = getenv("DS4_MMQ_D2R_IQ2");
+        const char *env = getenv("NS4_MMQ_D2R_IQ2");
         cached = (env && env[0] == '0') ? 0 : 1;
     }
     return cached != 0;
@@ -179,19 +179,19 @@ static bool d2r_iq2_enabled() {
 // 82b2622 as belt-and-suspenders while root-causing the cont BOS spam; the
 // actual roots were fixed in the same commit (stream-K fixup write_back goes
 // dense + tmp_fixup zeroed + an ncols_max that covers every expert's bucket
-// -- see ds4_mmq_moe_pair_impl for its exact value), after which every
+// -- see ns4_mmq_moe_pair_impl for its exact value), after which every
 // element a consumer reads is stored by the GEMM itself and the zeroing was
 // ~1.0 s/12k-admission of pure memset tax.  Default OFF (2026-07-09 gated
 // increment: L42 deep tensors BIT-IDENTICAL with/without, same-boot ABBA
 // 641.5 -> 678 tok/s @12k, gsm8k 119/120 / mbpp 36/40 / canary=[]).
-// DS4_MMQ_OUT_MEMSET=1 restores the zeroing.
+// NS4_MMQ_OUT_MEMSET=1 restores the zeroing.
 static bool out_memset_enabled() {
     static int cached = -1;
     if (cached < 0) {
-        const char *env = getenv("DS4_MMQ_OUT_MEMSET");
+        const char *env = getenv("NS4_MMQ_OUT_MEMSET");
         cached = (env && env[0] == '1') ? 1 : 0;
         if (cached) {
-            fprintf(stderr, "ds4: DS4_MMQ_OUT_MEMSET=1 - blanket GEMM output zeroing restored\n");
+            fprintf(stderr, "ns4: NS4_MMQ_OUT_MEMSET=1 - blanket GEMM output zeroing restored\n");
         }
     }
     return cached != 0;
@@ -205,7 +205,7 @@ static bool out_memset_enabled() {
  * the mmq write_back masks tail lanes out of the output (the D2R kernels
  * guard their token loops outright).  Modes, same contract as the cublas ws
  * knob:
- *   DS4_MMQ_YBUF_MEMSET unset/0 -> no zero (default; bit-exact IFF no tail
+ *   NS4_MMQ_YBUF_MEMSET unset/0 -> no zero (default; bit-exact IFF no tail
  *     byte can reach an output, proven by the poison gate)
  *   =1      -> S1.1a always-zero (the old behavior)
  *   =poison -> fill 0xFF: the bit-exactness instrument.  Exact twins vs
@@ -214,12 +214,12 @@ static bool out_memset_enabled() {
 static int ybuf_memset_mode() {
     static int cached = -1;
     if (cached < 0) {
-        const char *env = getenv("DS4_MMQ_YBUF_MEMSET");
+        const char *env = getenv("NS4_MMQ_YBUF_MEMSET");
         cached = 0;
         if (env && env[0] == '1') cached = 1;
         else if (env && (env[0] == 'p' || env[0] == 'P')) cached = 2;
         if (cached) {
-            fprintf(stderr, "ds4: DS4_MMQ_YBUF_MEMSET=%s - q8_1 staging %s\n",
+            fprintf(stderr, "ns4: NS4_MMQ_YBUF_MEMSET=%s - q8_1 staging %s\n",
                     cached == 1 ? "1" : "poison",
                     cached == 1 ? "zeroing restored" : "poisoned (0xFF)");
         }
@@ -239,15 +239,15 @@ static void ybuf_memset(void *ptr, size_t bytes, cudaStream_t stream) {
  * assignment slot (n_tokens * top-k rows and bytes).  Bit-identical by
  * construction: the quantize is row-local, so a gathered slot for token t
  * holds exactly the bytes of compact row t; the kernel consumes the same
- * blocks in the same tile order through the indirection.  DS4_MMQ_NO_YIND
- * restores the slot-gathered quantize; DS4_MMQ_YIND_VERIFY byte-compares
+ * blocks in the same tile order through the indirection.  NS4_MMQ_NO_YIND
+ * restores the slot-gathered quantize; NS4_MMQ_YIND_VERIFY byte-compares
  * the two buffers in situ (expect bad=0). */
 static int moe_yind_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
-        cached = getenv("DS4_MMQ_NO_YIND") == NULL ? 1 : 0;
+        cached = getenv("NS4_MMQ_NO_YIND") == NULL ? 1 : 0;
         if (!cached) {
-            fprintf(stderr, "ds4: DS4_MMQ_NO_YIND - moe gate/up y-indirect staging disabled\n");
+            fprintf(stderr, "ns4: NS4_MMQ_NO_YIND - moe gate/up y-indirect staging disabled\n");
         }
     }
     return cached;
@@ -256,7 +256,7 @@ static int moe_yind_enabled(void) {
 static int moe_yind_verify_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
-        cached = getenv("DS4_MMQ_YIND_VERIFY") != NULL ? 1 : 0;
+        cached = getenv("NS4_MMQ_YIND_VERIFY") != NULL ? 1 : 0;
     }
     return cached;
 }
@@ -264,17 +264,17 @@ static int moe_yind_verify_enabled(void) {
 /* Both routed MMQ impls rest on the invariant mm_ids_helper itself rests on:
  * a token names an expert at most once.  When it holds, the helper's compact
  * bucket for an expert is at most n_tokens rows, which is what sizes the
- * column grid (see ds4_mmq_moe_pair_impl).  When it does not, the helper
+ * column grid (see ns4_mmq_moe_pair_impl).  When it does not, the helper
  * emits one row per (token, expert) while expert_bounds keeps counting the
  * raw slot, so the duplicate slot's output column is never written at all --
- * the result is undefined for any ncols_max.  DS4_MMQ_MOE_IDS_VERIFY scans
+ * the result is undefined for any ncols_max.  NS4_MMQ_MOE_IDS_VERIFY scans
  * the ids for a repeat and reports the first one; the bucket widths cannot
  * show this, since a duplicated bucket still holds far fewer than n_tokens
  * rows at any realistic expert count.  Synchronous; off by default. */
 static int moe_ids_verify_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
-        cached = getenv("DS4_MMQ_MOE_IDS_VERIFY") != NULL ? 1 : 0;
+        cached = getenv("NS4_MMQ_MOE_IDS_VERIFY") != NULL ? 1 : 0;
     }
     return cached;
 }
@@ -318,7 +318,7 @@ static int64_t d2r_min_cols() {
     static int64_t cached = -1;
     if (cached < 0) {
         cached = 1024;
-        const char *env = getenv("DS4_MMQ_D2R_MIN_COLS");
+        const char *env = getenv("NS4_MMQ_D2R_MIN_COLS");
         if (env && env[0] != '\0') {
             char *end = nullptr;
             const long v = strtol(env, &end, 10);
@@ -330,24 +330,24 @@ static int64_t d2r_min_cols() {
     return cached;
 }
 
-extern "C" size_t ds4_mmq_q81_scratch_bytes(void) {
+extern "C" size_t ns4_mmq_q81_scratch_bytes(void) {
     return g_q81_scratch_bytes;
 }
 
-extern "C" int ds4_mmq_init(int device) {
+extern "C" int ns4_mmq_init(int device) {
     if (device < 0) {
-        fprintf(stderr, "ds4_mmq_init: invalid device %d\n", device);
+        fprintf(stderr, "ns4_mmq_init: invalid device %d\n", device);
         return -1;
     }
     ggml_cuda_set_device(device);
     // Trigger lazy population of the device-info singleton.
     const auto & info = ggml_cuda_info();
     if (info.device_count == 0) {
-        fprintf(stderr, "ds4_mmq_init: no CUDA devices found\n");
+        fprintf(stderr, "ns4_mmq_init: no CUDA devices found\n");
         return -1;
     }
     if (device >= info.device_count) {
-        fprintf(stderr, "ds4_mmq_init: device %d out of range (have %d)\n",
+        fprintf(stderr, "ns4_mmq_init: device %d out of range (have %d)\n",
                 device, info.device_count);
         return -1;
     }
@@ -356,11 +356,11 @@ extern "C" int ds4_mmq_init(int device) {
     // Must happen here (before any layer-graph capture) so the cudaMalloc
     // is not forbidden by capture-mode restrictions, and so the kernel
     // pointer arg baked into the captured graph stays valid at replay.
-    if (getenv("DS4_CUDA_MMQ_Q81_PERSISTENT") && !g_q81_scratch_ptr) {
+    if (getenv("NS4_CUDA_MMQ_Q81_PERSISTENT") && !g_q81_scratch_ptr) {
         const size_t bytes = 256 * 1024;
         cudaError_t err = cudaMalloc(&g_q81_scratch_ptr, bytes);
         if (err != cudaSuccess) {
-            fprintf(stderr, "ds4_mmq_init: cudaMalloc(q81_scratch %zu B) failed: %s; "
+            fprintf(stderr, "ns4_mmq_init: cudaMalloc(q81_scratch %zu B) failed: %s; "
                             "falling back to pool_alloc\n",
                     bytes, cudaGetErrorString(err));
             g_q81_scratch_ptr = nullptr;
@@ -368,7 +368,7 @@ extern "C" int ds4_mmq_init(int device) {
         } else {
             g_q81_scratch_bytes = bytes;
             g_q81_scratch_enabled = true;
-            fprintf(stderr, "ds4_mmq_init: persistent Q8_1 scratch enabled (%zu B at %p)\n",
+            fprintf(stderr, "ns4_mmq_init: persistent Q8_1 scratch enabled (%zu B at %p)\n",
                     bytes, g_q81_scratch_ptr);
         }
     }
@@ -383,7 +383,7 @@ extern "C" int ds4_mmq_init(int device) {
 // and ggml_backend internals we don't carry over).
 // ----------------------------------------------------------------------------
 
-static bool ds4_should_use_mmq_impl(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
+static bool ns4_should_use_mmq_impl(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
 #ifdef GGML_CUDA_FORCE_CUBLAS
     GGML_UNUSED(type); GGML_UNUSED(cc); GGML_UNUSED(ne11); GGML_UNUSED(n_experts);
     return false;
@@ -459,11 +459,11 @@ static bool ds4_should_use_mmq_impl(enum ggml_type type, int cc, int64_t ne11, i
     return (!GGML_CUDA_CC_IS_CDNA(cc)) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
 }
 
-extern "C" int ds4_mmq_should_use(int type_x, int64_t ne11, int64_t n_experts) {
+extern "C" int ns4_mmq_should_use(int type_x, int64_t ne11, int64_t n_experts) {
     const int dev = ggml_cuda_get_device();
     const int cc  = ggml_cuda_info().devices[dev].cc;
     const enum ggml_type t = (enum ggml_type) type_x;
-    return ds4_should_use_mmq_impl(t, cc, ne11, n_experts) ? 1 : 0;
+    return ns4_should_use_mmq_impl(t, cc, ne11, n_experts) ? 1 : 0;
 }
 
 // ----------------------------------------------------------------------------
@@ -482,16 +482,16 @@ extern "C" int ds4_mmq_should_use(int type_x, int64_t ne11, int64_t n_experts) {
 // device is sufficient for the dense path.
 namespace {
 
-__global__ static void ds4_mmq_sanitize_f32_kernel(float *p, uint64_t n) {
+__global__ static void ns4_mmq_sanitize_f32_kernel(float *p, uint64_t n) {
     const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const float v = p[i];
     if (!isfinite(v)) p[i] = 0.0f;
 }
 
-static void ds4_mmq_sanitize_f32(float *p, uint64_t n, cudaStream_t stream) {
+static void ns4_mmq_sanitize_f32(float *p, uint64_t n, cudaStream_t stream) {
     if (!p || n == 0) return;
-    ds4_mmq_sanitize_f32_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, stream>>>(p, n);
+    ns4_mmq_sanitize_f32_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, stream>>>(p, n);
 }
 
 ggml_backend_cuda_context * get_ctx_for_device(int device) {
@@ -504,7 +504,7 @@ ggml_backend_cuda_context * get_ctx_for_device(int device) {
 }
 
 template <ggml_type type>
-bool ds4_mmq_k_tile_supported(const char *tag, int K, int cc) {
+bool ns4_mmq_k_tile_supported(const char *tag, int K, int cc) {
     if constexpr (type == GGML_TYPE_MXFP4 || type == GGML_TYPE_NVFP4) {
         if (blackwell_mma_available(cc) && K % MMQ_ITER_K_FP4 != 0) {
             fprintf(stderr,
@@ -517,7 +517,7 @@ bool ds4_mmq_k_tile_supported(const char *tag, int K, int cc) {
 }
 
 template <ggml_type type>
-int ds4_mmq_dense_impl(
+int ns4_mmq_dense_impl(
         const char  * tag,
         const void  * W,
         const float * X_f32,
@@ -544,7 +544,7 @@ int ds4_mmq_dense_impl(
 
     const int dev = ggml_cuda_get_device();
     const int cc  = ggml_cuda_info().devices[dev].cc;
-    if (!ds4_mmq_k_tile_supported<type>(tag, K, cc)) return -1;
+    if (!ns4_mmq_k_tile_supported<type>(tag, K, cc)) return -1;
 
     ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
     if (!ctx) {
@@ -559,7 +559,7 @@ int ds4_mmq_dense_impl(
      * while the in-flight quantize/GEMM still reads it -> intermittent illegal
      * access under shape churn (the batched-draft early-step crash).  The vec
      * impls already do this (graph-capture fix); the batched impls were missed. */
-    ds4_pool_set_stream(stream);
+    ns4_pool_set_stream(stream);
 
     // 1. Quantize F32 activations into the format consumed by MMQ. Blackwell
     //    MXFP4 uses native FP4 tensor cores; other paths use MMQ Q8_1.
@@ -658,22 +658,22 @@ int ds4_mmq_dense_impl(
         fprintf(stderr, "%s: mul_mat_q_case launch failed: %s\n", tag, cudaGetErrorString(err));
         return -3;
     }
-    ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)N, stream);
+    ns4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)N, stream);
     return 0;
 }
 
 } // anonymous namespace
 
-extern "C" int ds4_mmq_q8_0_dense(
+extern "C" int ns4_mmq_q8_0_dense(
         const void * W, const float * X, float * out,
         int M, int N, int K, cudaStream_t stream) {
-    return ds4_mmq_dense_impl<GGML_TYPE_Q8_0>("ds4_mmq_q8_0_dense", W, X, out, M, N, K, stream);
+    return ns4_mmq_dense_impl<GGML_TYPE_Q8_0>("ns4_mmq_q8_0_dense", W, X, out, M, N, K, stream);
 }
 
 /* p5a verify instrument: run the REFERENCE quantizer (exact dense_impl
  * parameters) into a caller buffer so producers can be diffed
- * byte-for-byte against it (DS4_CUDA_OUTA_Q8EMIT_VERIFY). */
-extern "C" int ds4_mmq_q8_0_quantize_ref(
+ * byte-for-byte against it (NS4_CUDA_OUTA_Q8EMIT_VERIFY). */
+extern "C" int ns4_mmq_q8_0_quantize_ref(
         const float * X, void * y, size_t y_bytes, int N, int K,
         cudaStream_t stream) {
     if (!X || !y || N <= 0 || K <= 0 || K % 256 != 0) return -1;
@@ -681,7 +681,7 @@ extern "C" int ds4_mmq_q8_0_quantize_ref(
     const int dev = ggml_cuda_get_device();
     ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
     if (!ctx) return -1;
-    ds4_pool_set_stream(stream);
+    ns4_pool_set_stream(stream);
     const size_t need = (size_t)N * ne10_padded * sizeof(block_q8_1) / QK8_1;
     if (y_bytes < need) return -1;
     cudaMemsetAsync(y, 0, y_bytes, stream);
@@ -702,10 +702,10 @@ extern "C" int ds4_mmq_q8_0_quantize_ref(
  * the producer's sticky scratch may hold stale bytes).  Requires the
  * padded row width to equal K so the producer's block addressing
  * (ib = kseg*N + row) matches the quantizer's exactly. */
-extern "C" int ds4_mmq_q8_0_dense_preq(
+extern "C" int ns4_mmq_q8_0_dense_preq(
         const void * W, const void * Y_q8_mmq, size_t y_bytes, float * out,
         int M, int N, int K, cudaStream_t stream) {
-    const char *tag = "ds4_mmq_q8_0_dense_preq";
+    const char *tag = "ns4_mmq_q8_0_dense_preq";
     if (!W || !Y_q8_mmq || !out) {
         fprintf(stderr, "%s: null pointer\n", tag);
         return -1;
@@ -724,7 +724,7 @@ extern "C" int ds4_mmq_q8_0_dense_preq(
         fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
         return -1;
     }
-    ds4_pool_set_stream(stream);
+    ns4_pool_set_stream(stream);
 
     const size_t data_bytes =
         (size_t)N * (size_t)ne10_padded * sizeof(block_q8_1) / QK8_1;
@@ -772,20 +772,20 @@ extern "C" int ds4_mmq_q8_0_dense_preq(
         fprintf(stderr, "%s: mul_mat_q_case launch failed: %s\n", tag, cudaGetErrorString(err));
         return -3;
     }
-    ds4_mmq_sanitize_f32(out, (uint64_t)M * (uint64_t)N, stream);
+    ns4_mmq_sanitize_f32(out, (uint64_t)M * (uint64_t)N, stream);
     return 0;
 }
 
 // Dense Q8_0 D2R entry: same activation quantize + scratch treatment as
-// ds4_mmq_dense_impl (incl. the S1.1a zero for the never-written tail), then
+// ns4_mmq_dense_impl (incl. the S1.1a zero for the never-written tail), then
 // the D2R kernel on the kind-5 aligned artifact instead of mul_mat_q_case.
 // No out-memset / trailing sanitize: the D2R epilogue writes every element
-// through an isfinite guard.  Caller (ds4_cuda.cu) resolves W_aligned and
+// through an isfinite guard.  Caller (ns4_cuda.cu) resolves W_aligned and
 // gates on shape (M%128, K%1024, K<=4096) + n_tok.
-extern "C" int ds4_mmq_q8_0_dense_d2r(
+extern "C" int ns4_mmq_q8_0_dense_d2r(
         const void * W_aligned, const float * X_f32, float * out_f32,
         int M, int N, int K, cudaStream_t stream) {
-    const char *tag = "ds4_mmq_q8_0_dense_d2r";
+    const char *tag = "ns4_mmq_q8_0_dense_d2r";
     if (!W_aligned || !X_f32 || !out_f32) {
         fprintf(stderr, "%s: null pointer\n", tag);
         return -1;
@@ -796,7 +796,7 @@ extern "C" int ds4_mmq_q8_0_dense_d2r(
     }
     const int dev = ggml_cuda_get_device();
     const int cc  = ggml_cuda_info().devices[dev].cc;
-    if (!ds4_mmq_q8_0_dense_d2r_available(cc)) {
+    if (!ns4_mmq_q8_0_dense_d2r_available(cc)) {
         return -1;
     }
     ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
@@ -804,7 +804,7 @@ extern "C" int ds4_mmq_q8_0_dense_d2r(
         fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
         return -1;
     }
-    ds4_pool_set_stream(stream);
+    ns4_pool_set_stream(stream);
 
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     // Slack: the guarded last col tile reads up to 128 blocks past N*K/128.
@@ -826,17 +826,17 @@ extern "C" int ds4_mmq_q8_0_dense_d2r(
         fprintf(stderr, "%s: quantize failed: %s\n", tag, cudaGetErrorString(err));
         return -2;
     }
-    return ds4_mmq_q8_0_dense_d2r_launch(W_aligned, src1_q8_1.get(), out_f32,
+    return ns4_mmq_q8_0_dense_d2r_launch(W_aligned, src1_q8_1.get(), out_f32,
                                          M, N, K, stream);
 }
 
 /* flat-pool p5c: D2R dense entry over a producer-quantized Y (token-major
  * block_q8_1_mmq, ib = kseg*N + row, no row padding).  Same contract as
- * ds4_mmq_q8_0_dense_d2r minus the activation quantize; the caller's
+ * ns4_mmq_q8_0_dense_d2r minus the activation quantize; the caller's
  * buffer must carry the guarded-tail slack (zeroed here each call, S1.1a:
  * the producer rewrites every payload byte, the slack region may hold a
  * previous larger emit's bytes). */
-extern "C" int ds4_mmq_q8_0_dense_d2r_preq(
+extern "C" int ns4_mmq_q8_0_dense_d2r_preq(
         const void * W_aligned, const void * Y_q8_mmq, size_t y_bytes,
         float * out_f32, int M, int N, int K, cudaStream_t stream) {
     if (!W_aligned || !Y_q8_mmq || !out_f32) {
@@ -847,7 +847,7 @@ extern "C" int ds4_mmq_q8_0_dense_d2r_preq(
     }
     const int dev = ggml_cuda_get_device();
     const int cc  = ggml_cuda_info().devices[dev].cc;
-    if (!ds4_mmq_q8_0_dense_d2r_available(cc)) {
+    if (!ns4_mmq_q8_0_dense_d2r_available(cc)) {
         return -1;
     }
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
@@ -860,32 +860,32 @@ extern "C" int ds4_mmq_q8_0_dense_d2r_preq(
         return -1;
     }
     cudaMemsetAsync((char *)Y_q8_mmq + data_bytes, 0, slack_bytes, stream);
-    return ds4_mmq_q8_0_dense_d2r_launch(W_aligned, Y_q8_mmq, out_f32,
+    return ns4_mmq_q8_0_dense_d2r_launch(W_aligned, Y_q8_mmq, out_f32,
                                          M, N, K, stream);
 }
 
-extern "C" int ds4_mmq_q2_K_dense(
+extern "C" int ns4_mmq_q2_K_dense(
         const void * W, const float * X, float * out,
         int M, int N, int K, cudaStream_t stream) {
-    return ds4_mmq_dense_impl<GGML_TYPE_Q2_K>("ds4_mmq_q2_K_dense", W, X, out, M, N, K, stream);
+    return ns4_mmq_dense_impl<GGML_TYPE_Q2_K>("ns4_mmq_q2_K_dense", W, X, out, M, N, K, stream);
 }
 
-extern "C" int ds4_mmq_iq2_xxs_dense(
+extern "C" int ns4_mmq_iq2_xxs_dense(
         const void * W, const float * X, float * out,
         int M, int N, int K, cudaStream_t stream) {
-    return ds4_mmq_dense_impl<GGML_TYPE_IQ2_XXS>("ds4_mmq_iq2_xxs_dense", W, X, out, M, N, K, stream);
+    return ns4_mmq_dense_impl<GGML_TYPE_IQ2_XXS>("ns4_mmq_iq2_xxs_dense", W, X, out, M, N, K, stream);
 }
 
-extern "C" int ds4_mmq_q4_K_dense(
+extern "C" int ns4_mmq_q4_K_dense(
         const void * W, const float * X, float * out,
         int M, int N, int K, cudaStream_t stream) {
-    return ds4_mmq_dense_impl<GGML_TYPE_Q4_K>("ds4_mmq_q4_K_dense", W, X, out, M, N, K, stream);
+    return ns4_mmq_dense_impl<GGML_TYPE_Q4_K>("ns4_mmq_q4_K_dense", W, X, out, M, N, K, stream);
 }
 
-extern "C" int ds4_mmq_mxfp4_dense(
+extern "C" int ns4_mmq_mxfp4_dense(
         const void * W, const float * X, float * out,
         int M, int N, int K, cudaStream_t stream) {
-    return ds4_mmq_dense_impl<GGML_TYPE_MXFP4>("ds4_mmq_mxfp4_dense", W, X, out, M, N, K, stream);
+    return ns4_mmq_dense_impl<GGML_TYPE_MXFP4>("ns4_mmq_mxfp4_dense", W, X, out, M, N, K, stream);
 }
 
 // ----------------------------------------------------------------------------
@@ -907,7 +907,7 @@ extern "C" int ds4_mmq_mxfp4_dense(
 namespace {
 
 template <ggml_type type>
-int ds4_mmq_moe_impl(
+int ns4_mmq_moe_impl(
         const char    * tag,
         const void    * W,
         const float   * X_f32,
@@ -919,11 +919,11 @@ int ds4_mmq_moe_impl(
         int             n_experts,
         int             n_expert_used,
         cudaStream_t    stream,
-        /* ds4 (P4 Inc3): optional aligned-SoA artifact; when non-null the mmq
+        /* ns4 (P4 Inc3): optional aligned-SoA artifact; when non-null the mmq
          * kernel loads tiles from it directly and W is ignored (see mmq_args). */
         const char    * x_soa      = NULL,
         int64_t         soa_blocks = 0,
-        /* ds4 (P3): false skips the whole-buffer nonfinite pass; only valid
+        /* ns4 (P3): false skips the whole-buffer nonfinite pass; only valid
          * when every consumer sanitizes at read (the routed-MoE swiglu/sum
          * kernels do). */
         bool            sanitize_out = true) {
@@ -948,7 +948,7 @@ int ds4_mmq_moe_impl(
 
     const int dev = ggml_cuda_get_device();
     const int cc  = ggml_cuda_info().devices[dev].cc;
-    if (!ds4_mmq_k_tile_supported<type>(tag, K, cc)) return -1;
+    if (!ns4_mmq_k_tile_supported<type>(tag, K, cc)) return -1;
 
     ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
     if (!ctx) {
@@ -956,7 +956,7 @@ int ds4_mmq_moe_impl(
         return -1;
     }
 
-    ds4_pool_set_stream(stream);  /* task #22: pool ops must be stream-ordered with the kernels (see ds4_mmq_dense_impl) */
+    ns4_pool_set_stream(stream);  /* task #22: pool ops must be stream-ordered with the kernels (see ns4_mmq_dense_impl) */
 
     const int64_t ne_get_rows  = (int64_t)n_tokens * n_expert_used;
     const int64_t ne00         = K;
@@ -998,9 +998,9 @@ int ds4_mmq_moe_impl(
     // the cap the launcher dispatches the bit-identical two-pass global
     // variant instead (mmid.cu mm_ids_helper_global) — refusing here used to
     // throw the WHOLE MoE block (including gate/up mmq work) onto the legacy
-    // expert-tile fallback, the W8192 prefill cliff.  DS4_MMID_LARGE=0
+    // expert-tile fallback, the W8192 prefill cliff.  NS4_MMID_LARGE=0
     // restores the refusal.
-    if ((size_t)n_tokens * 4u > ggml_cuda_info().devices[dev].smpbo && !ds4_mmid_large_enabled()) {
+    if ((size_t)n_tokens * 4u > ggml_cuda_info().devices[dev].smpbo && !ns4_mmid_large_enabled()) {
         fprintf(stderr, "%s: n_tokens=%d exceeds mm_ids_helper shared-mem cap; falling back\n",
                 tag, n_tokens);
         return -1;
@@ -1098,14 +1098,14 @@ int ds4_mmq_moe_impl(
         static int d2r_avail = 0;
         if (d2r_avail_cc != cc) {
             d2r_avail_cc = cc;
-            d2r_avail = ds4_mmq_q2_K_moe_d2r_available(cc) ? 1 : 0;
+            d2r_avail = ns4_mmq_q2_K_moe_d2r_available(cc) ? 1 : 0;
         }
         if (d2r_avail) {
             const size_t d2r_work_bytes =
-                ds4_mmq_q2_K_moe_d2r_scratch_bytes(ne_get_rows, n_experts);
+                ns4_mmq_q2_K_moe_d2r_scratch_bytes(ne_get_rows, n_experts);
             if (d2r_work_bytes != 0) {
                 ggml_cuda_pool_alloc<char> d2r_work(ctx->pool(), d2r_work_bytes);
-                const int d2r_rc = ds4_mmq_q2_K_moe_d2r_launch(
+                const int d2r_rc = ns4_mmq_q2_K_moe_d2r_launch(
                     x_soa, soa_blocks, src1_q8_1.get(), ids_dst.get(), expert_bounds.get(),
                     out_f32, M, K, ne_get_rows, n_experts, d2r_work.get(), d2r_work_bytes,
                     stream);
@@ -1141,7 +1141,7 @@ int ds4_mmq_moe_impl(
         /*stride_sample_dst=*/0,
         /*use_stream_k=*/use_stream_k,
         /* Per-expert column bound, not the total gathered row count: see
-         * ds4_mmq_moe_pair_impl.  Every production caller of this entry
+         * ns4_mmq_moe_pair_impl.  Every production caller of this entry
          * reaches it with n_expert_used=1 (the down leg treats each
          * assignment as its own row), where the two agree. */
         /*ncols_max=*/(int64_t)n_tokens,
@@ -1157,12 +1157,12 @@ int ds4_mmq_moe_impl(
         return -4;
     }
     if (sanitize_out) {
-        ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)ne_get_rows, stream);
+        ns4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)ne_get_rows, stream);
     }
     return 0;
 }
 
-struct ds4_mmq_fused_down {
+struct ns4_mmq_fused_down {
     const void  * W;
     const char  * W_soa;
     int64_t       soa_blocks;
@@ -1179,12 +1179,12 @@ struct ds4_mmq_fused_down {
     void        * work_scratch;
     size_t        work_scratch_bytes;
     /* flat-pool p5c: producer-emitted token-compact q8 of X (see the
-     * fused_direct_soa doc in ds4_mmq.h); NULL = quantize internally. */
+     * fused_direct_soa doc in ns4_mmq.h); NULL = quantize internally. */
     const void  * input_q8_ext;
     size_t        input_q8_ext_bytes;
 };
 
-static bool ds4_mmq_take_scratch(
+static bool ns4_mmq_take_scratch(
         void *base, size_t capacity, size_t *offset,
         size_t bytes, size_t alignment, void **result) {
     if (!base || !offset || !result || alignment == 0 ||
@@ -1202,7 +1202,7 @@ static bool ds4_mmq_take_scratch(
     return true;
 }
 
-static bool ds4_mmq_scratch_overlaps(
+static bool ns4_mmq_scratch_overlaps(
         const void *a, size_t a_bytes, const void *b, size_t b_bytes) {
     const uintptr_t a_addr = (uintptr_t)a;
     const uintptr_t b_addr = (uintptr_t)b;
@@ -1215,7 +1215,7 @@ static bool ds4_mmq_scratch_overlaps(
 // proven upstream quantizer below gathers them through the already available
 // ids_dst map, so gate/up and down share one expert-major schedule without a
 // second mm_ids_helper.
-static __global__ void ds4_swiglu_weighted_f32(
+static __global__ void ns4_swiglu_weighted_f32(
         const float * __restrict__ gate,
         const float * __restrict__ up,
         const float * __restrict__ router_weights,
@@ -1236,12 +1236,12 @@ static __global__ void ds4_swiglu_weighted_f32(
 }
 
 // Paired MoE: one helper + one quantize covers both weights.  See the
-// header comment on ds4_mmq_iq2_xxs_moe_pair for motivation.  Internal
-// structure mirrors ds4_mmq_moe_impl above; the only differences are the
+// header comment on ns4_mmq_iq2_xxs_moe_pair for motivation.  Internal
+// structure mirrors ns4_mmq_moe_impl above; the only differences are the
 // two W pointers, the two output pointers, and the second mul_mat_q_case
 // launch with a fresh (x, dst) pair.
 template <ggml_type type, bool profile_fused_prefill = false>
-int ds4_mmq_moe_pair_impl(
+int ns4_mmq_moe_pair_impl(
         const char    * tag,
         const void    * W_a,
         const void    * W_b,
@@ -1255,14 +1255,14 @@ int ds4_mmq_moe_pair_impl(
         int             n_experts,
         int             n_expert_used,
         cudaStream_t    stream,
-        /* ds4 (P4 Inc3): optional aligned-SoA artifacts for W_a / W_b (same
-         * shape, so one block count); see ds4_mmq_moe_impl. */
+        /* ns4 (P4 Inc3): optional aligned-SoA artifacts for W_a / W_b (same
+         * shape, so one block count); see ns4_mmq_moe_impl. */
         const char    * xa_soa     = NULL,
         const char    * xb_soa     = NULL,
         int64_t         soa_blocks = 0,
-        /* ds4 (P3): see ds4_mmq_moe_impl. */
+        /* ns4 (P3): see ns4_mmq_moe_impl. */
         bool            sanitize_out = true,
-        const ds4_mmq_fused_down *fused_down = nullptr) {
+        const ns4_mmq_fused_down *fused_down = nullptr) {
 
     const bool direct_gateup_q8 =
         fused_down != nullptr && fused_down->direct_gateup_q8;
@@ -1302,15 +1302,15 @@ int ds4_mmq_moe_pair_impl(
     const bool nvtx_prefill = profile_fused_prefill &&
                               fused_down != nullptr &&
                               n_tokens >= 1024 &&
-                              ds4_mmq_nvtx_requested();
-    ds4_mmq_nvtx_scope fused_scope(
-            "ds4/prefill/moe/mmq_fused",
-            ds4_mmq_nvtx_payload((uint32_t)n_tokens, (uint32_t)n_expert_used),
+                              ns4_mmq_nvtx_requested();
+    ns4_mmq_nvtx_scope fused_scope(
+            "ns4/prefill/moe/mmq_fused",
+            ns4_mmq_nvtx_payload((uint32_t)n_tokens, (uint32_t)n_expert_used),
             nvtx_prefill);
 
     const int dev = ggml_cuda_get_device();
     const int cc  = ggml_cuda_info().devices[dev].cc;
-    if (!ds4_mmq_k_tile_supported<type>(tag, K, cc)) return -1;
+    if (!ns4_mmq_k_tile_supported<type>(tag, K, cc)) return -1;
 
     ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
     if (!ctx) {
@@ -1318,7 +1318,7 @@ int ds4_mmq_moe_pair_impl(
         return -1;
     }
 
-    ds4_pool_set_stream(stream);  /* task #22: pool ops must be stream-ordered with the kernels (see ds4_mmq_dense_impl) */
+    ns4_pool_set_stream(stream);  /* task #22: pool ops must be stream-ordered with the kernels (see ns4_mmq_dense_impl) */
 
     const int64_t ne_get_rows  = (int64_t)n_tokens * n_expert_used;
     const int64_t ne00         = K;
@@ -1355,17 +1355,17 @@ int ds4_mmq_moe_pair_impl(
                 sizeof(block_q8_1) / QK8_1 +
             (size_t)get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
         const size_t gateup_work_bytes =
-            ds4_mmq_iq2_xxs_moe_d2r_fused_scratch_bytes(
+            ns4_mmq_iq2_xxs_moe_d2r_fused_scratch_bytes(
                 ne_get_rows, n_experts);
         const size_t down_work_bytes =
-            ds4_mmq_q2_K_moe_d2r_scratch_bytes(ne_get_rows, n_experts);
+            ns4_mmq_q2_K_moe_d2r_scratch_bytes(ne_get_rows, n_experts);
         if (fused_down->input_q8_scratch_bytes < nbytes_src1_q8_1) return -91;
         if (fused_down->q8_scratch_bytes < direct_down_q8_bytes) return -92;
         if (gateup_work_bytes == 0 || down_work_bytes == 0) return -93;
         if (!d2r_enabled() || !d2r_iq2_enabled()) return -94;
         if (ne_get_rows < d2r_min_cols()) return -95;
-        if (!ds4_mmq_iq2_xxs_moe_d2r_available(cc) ||
-            !ds4_mmq_q2_K_moe_d2r_available(cc)) {
+        if (!ns4_mmq_iq2_xxs_moe_d2r_available(cc) ||
+            !ns4_mmq_q2_K_moe_d2r_available(cc)) {
             return -96;
         }
 
@@ -1375,19 +1375,19 @@ int ds4_mmq_moe_pair_impl(
         void *expert_bounds_raw = nullptr;
         direct_work_bytes = gateup_work_bytes > down_work_bytes
             ? gateup_work_bytes : down_work_bytes;
-        if (!ds4_mmq_take_scratch(
+        if (!ns4_mmq_take_scratch(
                 fused_down->work_scratch, fused_down->work_scratch_bytes,
                 &offset, (size_t)ne_get_rows * sizeof(int32_t), 256,
                 &ids_src1_raw) ||
-            !ds4_mmq_take_scratch(
+            !ns4_mmq_take_scratch(
                 fused_down->work_scratch, fused_down->work_scratch_bytes,
                 &offset, (size_t)ne_get_rows * sizeof(int32_t), 256,
                 &ids_dst_raw) ||
-            !ds4_mmq_take_scratch(
+            !ns4_mmq_take_scratch(
                 fused_down->work_scratch, fused_down->work_scratch_bytes,
                 &offset, (size_t)(n_experts + 1) * sizeof(int32_t), 256,
                 &expert_bounds_raw) ||
-            !ds4_mmq_take_scratch(
+            !ns4_mmq_take_scratch(
                 fused_down->work_scratch, fused_down->work_scratch_bytes,
                 &offset, direct_work_bytes, 256, &direct_work)) {
             return -97;
@@ -1404,10 +1404,10 @@ int ds4_mmq_moe_pair_impl(
     const int si1  = n_expert_used;
     const int sis1 = 1;
 
-    // Same cap guard as ds4_mmq_moe_impl (see comment there): past the smem
+    // Same cap guard as ns4_mmq_moe_impl (see comment there): past the smem
     // cap the launcher takes the bit-identical global variant (P5); only
-    // refuse with DS4_MMID_LARGE=0.
-    if ((size_t)n_tokens * 4u > ggml_cuda_info().devices[dev].smpbo && !ds4_mmid_large_enabled()) {
+    // refuse with NS4_MMID_LARGE=0.
+    if ((size_t)n_tokens * 4u > ggml_cuda_info().devices[dev].smpbo && !ns4_mmid_large_enabled()) {
         fprintf(stderr, "%s: n_tokens=%d exceeds mm_ids_helper shared-mem cap; falling back\n",
                 tag, n_tokens);
         return -1;
@@ -1415,11 +1415,11 @@ int ds4_mmq_moe_pair_impl(
 
     cudaError_t err = cudaSuccess;
     {
-        ds4_mmq_nvtx_scope stage(
-                "ds4/prefill/moe/expert_map",
-                ds4_mmq_nvtx_payload((uint32_t)n_tokens, (uint32_t)n_experts),
+        ns4_mmq_nvtx_scope stage(
+                "ns4/prefill/moe/expert_map",
+                ns4_mmq_nvtx_payload((uint32_t)n_tokens, (uint32_t)n_experts),
                 nvtx_prefill);
-        // Task #22 root-cause fix (same as ds4_mmq_moe_impl): zero the id maps
+        // Task #22 root-cause fix (same as ns4_mmq_moe_impl): zero the id maps
         // so entries dropped by mm_ids_helper never expose stale pool memory.
         cudaMemsetAsync(ids_src1, 0, ne_get_rows * sizeof(int32_t), stream);
         cudaMemsetAsync(ids_dst,  0, ne_get_rows * sizeof(int32_t), stream);
@@ -1459,7 +1459,7 @@ int ds4_mmq_moe_pair_impl(
      * the helper drops the duplicate row while expert_bounds still counts the
      * raw slot, so the columns the wide bound kept processing are ones the
      * helper never wrote (zeroed ids_dst -> junk accumulated into dst column
-     * 0).  DS4_MMQ_MOE_IDS_VERIFY catches that case. */
+     * 0).  NS4_MMQ_MOE_IDS_VERIFY catches that case. */
     const int64_t routed_ncols_max = (int64_t)n_tokens;
 
     /* The materialized path stream-frees gate/up Q8_1 before allocating the
@@ -1497,15 +1497,15 @@ int ds4_mmq_moe_pair_impl(
         static bool ext_logged = false;
         if (!ext_logged) {
             ext_logged = true;
-            fprintf(stderr, "ds4: moe gateup consuming producer q8 "
+            fprintf(stderr, "ns4: moe gateup consuming producer q8 "
                     "(flat-pool p5c, first n_tokens=%d)\n", n_tokens);
         }
     }
     const int64_t quant_rows = moe_yind ? (int64_t)n_tokens : ne_get_rows;
     if (!input_q8_ext) {
-        ds4_mmq_nvtx_scope stage(
-                "ds4/prefill/moe/input_quant_q8_1",
-                ds4_mmq_nvtx_payload((uint32_t)quant_rows, (uint32_t)K),
+        ns4_mmq_nvtx_scope stage(
+                "ns4/prefill/moe/input_quant_q8_1",
+                ns4_mmq_nvtx_payload((uint32_t)quant_rows, (uint32_t)K),
                 nvtx_prefill);
         ybuf_memset(src1_q8_1, nbytes_src1_q8_1, stream);
         if (use_native_fp4) {
@@ -1535,7 +1535,7 @@ int ds4_mmq_moe_pair_impl(
             static bool yind_logged = false;
             if (!yind_logged) {
                 yind_logged = true;
-                fprintf(stderr, "ds4: moe gateup y-indirect q8 staging engage "
+                fprintf(stderr, "ns4: moe gateup y-indirect q8 staging engage "
                         "(flat-pool p5b, first n_tokens=%d n_assign=%lld)\n",
                         n_tokens, (long long)ne_get_rows);
             }
@@ -1576,7 +1576,7 @@ int ds4_mmq_moe_pair_impl(
                             }
                         }
                     }
-                    fprintf(stderr, "ds4: moe yind VERIFY n_tokens=%d n_assign=%lld ksegs=%d "
+                    fprintf(stderr, "ns4: moe yind VERIFY n_tokens=%d n_assign=%lld ksegs=%d "
                             "bad=%lld/%lld first_slot=%lld first_kseg=%lld\n",
                             n_tokens, (long long)ne_get_rows, nkseg,
                             bad, (long long)nkseg * (long long)ne_get_rows,
@@ -1588,17 +1588,17 @@ int ds4_mmq_moe_pair_impl(
         }
         ybuf_memset(fused_down->q8_scratch, direct_down_q8_bytes, stream);
         const size_t gateup_work_bytes =
-            ds4_mmq_iq2_xxs_moe_d2r_fused_scratch_bytes(
+            ns4_mmq_iq2_xxs_moe_d2r_fused_scratch_bytes(
                 ne_get_rows, n_experts);
         if (gateup_work_bytes == 0) {
             return -9;
         }
         {
-            ds4_mmq_nvtx_scope stage(
-                    "ds4/prefill/moe/iq2_gate_up_swiglu_q8_d2r",
-                    ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)M),
+            ns4_mmq_nvtx_scope stage(
+                    "ns4/prefill/moe/iq2_gate_up_swiglu_q8_d2r",
+                    ns4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)M),
                     nvtx_prefill);
-            const int d2r_rc = ds4_mmq_iq2_xxs_moe_d2r_fused_launch(
+            const int d2r_rc = ns4_mmq_iq2_xxs_moe_d2r_fused_launch(
                     xa_soa, xb_soa, soa_blocks,
                     src1_q8_1,
                     moe_yind ? ids_src1 : nullptr,
@@ -1618,17 +1618,17 @@ int ds4_mmq_moe_pair_impl(
                     stream);
         }
         const size_t down_work_bytes =
-            ds4_mmq_q2_K_moe_d2r_scratch_bytes(ne_get_rows, n_experts);
+            ns4_mmq_q2_K_moe_d2r_scratch_bytes(ne_get_rows, n_experts);
         if (down_work_bytes == 0) {
             return -11;
         }
         {
-            ds4_mmq_nvtx_scope stage(
-                    "ds4/prefill/moe/q2_down_d2r",
-                    ds4_mmq_nvtx_payload((uint32_t)ne_get_rows,
+            ns4_mmq_nvtx_scope stage(
+                    "ns4/prefill/moe/q2_down_d2r",
+                    ns4_mmq_nvtx_payload((uint32_t)ne_get_rows,
                                          (uint32_t)fused_down->out_dim),
                     nvtx_prefill);
-            const int down_rc = ds4_mmq_q2_K_moe_d2r_launch(
+            const int down_rc = ns4_mmq_q2_K_moe_d2r_launch(
                     fused_down->W_soa,
                     fused_down->soa_blocks,
                     fused_down->q8_scratch,
@@ -1661,18 +1661,18 @@ int ds4_mmq_moe_pair_impl(
         static int d2r_iq2_avail = 0;
         if (d2r_iq2_avail_cc != cc) {
             d2r_iq2_avail_cc = cc;
-            d2r_iq2_avail = ds4_mmq_iq2_xxs_moe_d2r_available(cc) ? 1 : 0;
+            d2r_iq2_avail = ns4_mmq_iq2_xxs_moe_d2r_available(cc) ? 1 : 0;
         }
         if (d2r_iq2_avail) {
             const size_t d2r_work_bytes =
-                ds4_mmq_iq2_xxs_moe_d2r_pair_scratch_bytes(ne_get_rows, n_experts);
+                ns4_mmq_iq2_xxs_moe_d2r_pair_scratch_bytes(ne_get_rows, n_experts);
             if (d2r_work_bytes != 0) {
                 ggml_cuda_pool_alloc<char> d2r_work(ctx->pool(), d2r_work_bytes);
-                ds4_mmq_nvtx_scope stage(
-                        "ds4/prefill/moe/iq2_gate_up_d2r",
-                        ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)M),
+                ns4_mmq_nvtx_scope stage(
+                        "ns4/prefill/moe/iq2_gate_up_d2r",
+                        ns4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)M),
                         nvtx_prefill);
-                const int d2r_rc = ds4_mmq_iq2_xxs_moe_d2r_pair_launch(
+                const int d2r_rc = ns4_mmq_iq2_xxs_moe_d2r_pair_launch(
                         xa_soa, xb_soa, soa_blocks, src1_q8_1, ids_dst,
                         expert_bounds, out_a, out_b, M, K, ne_get_rows, n_experts,
                         d2r_work.get(), d2r_work_bytes, stream);
@@ -1714,9 +1714,9 @@ int ds4_mmq_moe_pair_impl(
     };
 
     {
-        ds4_mmq_nvtx_scope stage(
-                "ds4/prefill/moe/iq2_gate",
-                ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)M),
+        ns4_mmq_nvtx_scope stage(
+                "ns4/prefill/moe/iq2_gate",
+                ns4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)M),
                 nvtx_prefill);
         mul_mat_q_case<type>(*ctx, args, stream);
         err = cudaGetLastError();
@@ -1731,9 +1731,9 @@ int ds4_mmq_moe_pair_impl(
     args.dst   = out_b;
     args.x_soa = xb_soa;
     {
-        ds4_mmq_nvtx_scope stage(
-                "ds4/prefill/moe/iq2_up",
-                ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)M),
+        ns4_mmq_nvtx_scope stage(
+                "ns4/prefill/moe/iq2_up",
+                ns4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)M),
                 nvtx_prefill);
         mul_mat_q_case<type>(*ctx, args, stream);
         err = cudaGetLastError();
@@ -1756,12 +1756,12 @@ int ds4_mmq_moe_pair_impl(
 
         const uint64_t mid_values = (uint64_t)ne_get_rows * (uint64_t)M;
         {
-            ds4_mmq_nvtx_scope stage(
-                    "ds4/prefill/moe/swiglu_down_quant",
-                    ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)M),
+            ns4_mmq_nvtx_scope stage(
+                    "ns4/prefill/moe/swiglu_down_quant",
+                    ns4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)M),
                     nvtx_prefill);
             ybuf_memset(down_q8_1.get(), logical_q8_bytes + tail_q8_bytes, stream);
-            ds4_swiglu_weighted_f32<<<
+            ns4_swiglu_weighted_f32<<<
                 (uint32_t)((mid_values + 255u) / 256u), 256, 0, stream>>>(
                     out_a, out_b, fused_down->router_weights,
                     fused_down->mid_f32, mid_values, M, fused_down->clamp);
@@ -1826,17 +1826,17 @@ int ds4_mmq_moe_pair_impl(
         bool down_done = false;
         if (fused_down->W_soa != nullptr && d2r_enabled() &&
             ne_get_rows >= d2r_min_cols() &&
-            ds4_mmq_q2_K_moe_d2r_available(cc)) {
+            ns4_mmq_q2_K_moe_d2r_available(cc)) {
             const size_t work_bytes =
-                ds4_mmq_q2_K_moe_d2r_scratch_bytes(ne_get_rows, n_experts);
+                ns4_mmq_q2_K_moe_d2r_scratch_bytes(ne_get_rows, n_experts);
             if (work_bytes != 0u) {
                 ggml_cuda_pool_alloc<char> work(ctx->pool(), work_bytes);
-                ds4_mmq_nvtx_scope stage(
-                        "ds4/prefill/moe/q2_down_d2r",
-                        ds4_mmq_nvtx_payload((uint32_t)ne_get_rows,
+                ns4_mmq_nvtx_scope stage(
+                        "ns4/prefill/moe/q2_down_d2r",
+                        ns4_mmq_nvtx_payload((uint32_t)ne_get_rows,
                                              (uint32_t)fused_down->out_dim),
                         nvtx_prefill);
-                down_done = ds4_mmq_q2_K_moe_d2r_launch(
+                down_done = ns4_mmq_q2_K_moe_d2r_launch(
                         fused_down->W_soa,
                         fused_down->soa_blocks,
                         down_q8_1.get(),
@@ -1853,9 +1853,9 @@ int ds4_mmq_moe_pair_impl(
             }
         }
         if (!down_done) {
-            ds4_mmq_nvtx_scope stage(
-                    "ds4/prefill/moe/q2_down",
-                    ds4_mmq_nvtx_payload((uint32_t)ne_get_rows,
+            ns4_mmq_nvtx_scope stage(
+                    "ns4/prefill/moe/q2_down",
+                    ns4_mmq_nvtx_payload((uint32_t)ne_get_rows,
                                          (uint32_t)fused_down->out_dim),
                     nvtx_prefill);
             mul_mat_q_case<GGML_TYPE_Q2_K>(*ctx, down_args, stream);
@@ -1868,102 +1868,102 @@ int ds4_mmq_moe_pair_impl(
         }
     }
     if (sanitize_out) {
-        ds4_mmq_sanitize_f32(out_a, (uint64_t)M * (uint64_t)ne_get_rows, stream);
-        ds4_mmq_sanitize_f32(out_b, (uint64_t)M * (uint64_t)ne_get_rows, stream);
+        ns4_mmq_sanitize_f32(out_a, (uint64_t)M * (uint64_t)ne_get_rows, stream);
+        ns4_mmq_sanitize_f32(out_b, (uint64_t)M * (uint64_t)ne_get_rows, stream);
     }
     return 0;
 }
 
 } // anonymous namespace
 
-extern "C" int ds4_mmq_q8_0_moe(
+extern "C" int ns4_mmq_q8_0_moe(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         cudaStream_t stream) {
-    return ds4_mmq_moe_impl<GGML_TYPE_Q8_0>("ds4_mmq_q8_0_moe", W, X, ids, out, M, K,
+    return ns4_mmq_moe_impl<GGML_TYPE_Q8_0>("ns4_mmq_q8_0_moe", W, X, ids, out, M, K,
                                             n_tokens, n_experts, n_expert_used, stream);
 }
 
-extern "C" int ds4_mmq_q2_K_moe(
+extern "C" int ns4_mmq_q2_K_moe(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         cudaStream_t stream) {
-    return ds4_mmq_moe_impl<GGML_TYPE_Q2_K>("ds4_mmq_q2_K_moe", W, X, ids, out, M, K,
+    return ns4_mmq_moe_impl<GGML_TYPE_Q2_K>("ns4_mmq_q2_K_moe", W, X, ids, out, M, K,
                                             n_tokens, n_experts, n_expert_used, stream);
 }
 
-extern "C" int ds4_mmq_iq2_xxs_moe(
+extern "C" int ns4_mmq_iq2_xxs_moe(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         cudaStream_t stream) {
-    return ds4_mmq_moe_impl<GGML_TYPE_IQ2_XXS>("ds4_mmq_iq2_xxs_moe", W, X, ids, out, M, K,
+    return ns4_mmq_moe_impl<GGML_TYPE_IQ2_XXS>("ns4_mmq_iq2_xxs_moe", W, X, ids, out, M, K,
                                                n_tokens, n_experts, n_expert_used, stream);
 }
 
-/* ds4 (P4 Inc3): mmq MoE over the aligned row-pair-SoA Q2_K artifact
+/* ns4 (P4 Inc3): mmq MoE over the aligned row-pair-SoA Q2_K artifact
  * (weight server --repack-q2k-aligned) -- no raw-layout weights and no
  * derepack scratch involved; the mul_mat_q tile loader reads the SoA
  * sections directly (load_tiles_q2_K_soa, bit-identical tiles). */
-extern "C" int ds4_mmq_q2_K_moe_soa(
+extern "C" int ns4_mmq_q2_K_moe_soa(
         const void * W_soa, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         cudaStream_t stream) {
     if (M <= 0 || M % 2 != 0 || K <= 0 || K % 256 != 0 || n_experts <= 0) {
-        fprintf(stderr, "ds4_mmq_q2_K_moe_soa: bad shape M=%d K=%d nexp=%d\n", M, K, n_experts);
+        fprintf(stderr, "ns4_mmq_q2_K_moe_soa: bad shape M=%d K=%d nexp=%d\n", M, K, n_experts);
         return -1;
     }
     const int64_t npair = (int64_t)n_experts * (int64_t)(M/2) * (int64_t)(K/256);
     /* W_soa doubles as the (unused) raw pointer so the impl's null checks
      * hold.  sanitize_out=false: the routed-MoE consumers (swiglu / moe_sum)
      * sanitize at read, saving the whole-buffer pass (P3). */
-    return ds4_mmq_moe_impl<GGML_TYPE_Q2_K>("ds4_mmq_q2_K_moe_soa", W_soa, X, ids, out, M, K,
+    return ns4_mmq_moe_impl<GGML_TYPE_Q2_K>("ns4_mmq_q2_K_moe_soa", W_soa, X, ids, out, M, K,
                                             n_tokens, n_experts, n_expert_used, stream,
                                             (const char *)W_soa, npair,
                                             /*sanitize_out=*/false);
 }
 
-extern "C" int ds4_mmq_q4_K_moe(
+extern "C" int ns4_mmq_q4_K_moe(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         cudaStream_t stream) {
-    return ds4_mmq_moe_impl<GGML_TYPE_Q4_K>("ds4_mmq_q4_K_moe", W, X, ids, out, M, K,
+    return ns4_mmq_moe_impl<GGML_TYPE_Q4_K>("ns4_mmq_q4_K_moe", W, X, ids, out, M, K,
                                             n_tokens, n_experts, n_expert_used, stream);
 }
 
-extern "C" int ds4_mmq_mxfp4_moe(
+extern "C" int ns4_mmq_mxfp4_moe(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         cudaStream_t stream) {
-    return ds4_mmq_moe_impl<GGML_TYPE_MXFP4>("ds4_mmq_mxfp4_moe", W, X, ids, out, M, K,
+    return ns4_mmq_moe_impl<GGML_TYPE_MXFP4>("ns4_mmq_mxfp4_moe", W, X, ids, out, M, K,
                                              n_tokens, n_experts, n_expert_used, stream);
 }
 
-extern "C" int ds4_mmq_iq2_xxs_moe_pair(
+extern "C" int ns4_mmq_iq2_xxs_moe_pair(
         const void * W_a, const void * W_b,
         const float * X, const int32_t * ids, float * out_a, float * out_b,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         cudaStream_t stream) {
-    return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS>(
-        "ds4_mmq_iq2_xxs_moe_pair", W_a, W_b, X, ids, out_a, out_b,
+    return ns4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS>(
+        "ns4_mmq_iq2_xxs_moe_pair", W_a, W_b, X, ids, out_a, out_b,
         M, K, n_tokens, n_experts, n_expert_used, stream);
 }
 
-/* ds4 (P4 Inc3): paired mmq MoE over the aligned-SoA IQ2_XXS gate/up
+/* ns4 (P4 Inc3): paired mmq MoE over the aligned-SoA IQ2_XXS gate/up
  * artifacts (weight server --repack-iq2-aligned); same contract as
- * ds4_mmq_q2_K_moe_soa. */
-extern "C" int ds4_mmq_iq2_xxs_moe_pair_soa(
+ * ns4_mmq_q2_K_moe_soa. */
+extern "C" int ns4_mmq_iq2_xxs_moe_pair_soa(
         const void * Wa_soa, const void * Wb_soa,
         const float * X, const int32_t * ids, float * out_a, float * out_b,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         cudaStream_t stream) {
     if (M <= 0 || K <= 0 || K % 256 != 0 || n_experts <= 0) {
-        fprintf(stderr, "ds4_mmq_iq2_xxs_moe_pair_soa: bad shape M=%d K=%d nexp=%d\n", M, K, n_experts);
+        fprintf(stderr, "ns4_mmq_iq2_xxs_moe_pair_soa: bad shape M=%d K=%d nexp=%d\n", M, K, n_experts);
         return -1;
     }
     const int64_t nblk = (int64_t)n_experts * (int64_t)M * (int64_t)(K/256);
-    /* sanitize_out=false: see ds4_mmq_q2_K_moe_soa. */
-    return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS>(
-        "ds4_mmq_iq2_xxs_moe_pair_soa", Wa_soa, Wb_soa, X, ids, out_a, out_b,
+    /* sanitize_out=false: see ns4_mmq_q2_K_moe_soa. */
+    return ns4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS>(
+        "ns4_mmq_iq2_xxs_moe_pair_soa", Wa_soa, Wb_soa, X, ids, out_a, out_b,
         M, K, n_tokens, n_experts, n_expert_used, stream,
         (const char *)Wa_soa, (const char *)Wb_soa, nblk,
         /*sanitize_out=*/false);
@@ -1975,7 +1975,7 @@ extern "C" int ds4_mmq_iq2_xxs_moe_pair_soa(
  * router weighting run in the pair-major mid buffer, which is gathered and
  * quantized for the Q2_K down MMQ through the same ids_dst/expert_bounds.
  * gate/up/mid/down keep the standard pair-major output layout. */
-extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
+extern "C" int ns4_mmq_iq2_xxs_q2_K_moe_fused_soa(
         const void * W_gate, const void * W_up, const void * W_down,
         const float * X, const int32_t * ids, const float * router_weights,
         float * gate, float * up, float * mid_f32, float * down,
@@ -1992,7 +1992,7 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
         (int64_t)n_experts * expert_mid_dim * (expert_in_dim / 256);
     const int64_t q2_pairs =
         (int64_t)n_experts * (out_dim / 2) * (expert_mid_dim / 256);
-    const ds4_mmq_fused_down fused_down = {
+    const ns4_mmq_fused_down fused_down = {
         W_down,
         (const char *)W_down,
         q2_pairs,
@@ -2011,8 +2011,8 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
         nullptr,
         0,
     };
-    return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS, true>(
-        "ds4_mmq_iq2_xxs_q2_K_moe_fused_soa",
+    return ns4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS, true>(
+        "ns4_mmq_iq2_xxs_q2_K_moe_fused_soa",
         W_gate, W_up, X, ids, gate, up,
         expert_mid_dim, expert_in_dim, n_tokens, n_experts, n_expert_used,
         stream,
@@ -2027,7 +2027,7 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
  * allocations; all three ranges must be distinct and sized to their LOGICAL
  * segments (never an owning arena's capacity - the overlap guard would
  * falsely cover adjacent views). */
-extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
+extern "C" int ns4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
         const void * W_gate, const void * W_up, const void * W_down,
         const float * X, const int32_t * ids, const float * router_weights,
         void * input_q8_scratch, size_t input_q8_scratch_bytes,
@@ -2050,20 +2050,20 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
     const size_t down_bytes =
         (size_t)n_tokens * (size_t)n_expert_used *
         (size_t)out_dim * sizeof(float);
-    if (ds4_mmq_scratch_overlaps(
+    if (ns4_mmq_scratch_overlaps(
             input_q8_scratch, input_q8_scratch_bytes,
             down_q8_scratch, down_q8_scratch_bytes) ||
-        ds4_mmq_scratch_overlaps(
+        ns4_mmq_scratch_overlaps(
             input_q8_scratch, input_q8_scratch_bytes,
             work_scratch, work_scratch_bytes) ||
-        ds4_mmq_scratch_overlaps(
+        ns4_mmq_scratch_overlaps(
             down_q8_scratch, down_q8_scratch_bytes,
             work_scratch, work_scratch_bytes) ||
-        ds4_mmq_scratch_overlaps(
+        ns4_mmq_scratch_overlaps(
             input_q8_scratch, input_q8_scratch_bytes, down, down_bytes) ||
-        ds4_mmq_scratch_overlaps(
+        ns4_mmq_scratch_overlaps(
             down_q8_scratch, down_q8_scratch_bytes, down, down_bytes) ||
-        ds4_mmq_scratch_overlaps(
+        ns4_mmq_scratch_overlaps(
             work_scratch, work_scratch_bytes, down, down_bytes)) {
         return -1;
     }
@@ -2071,7 +2071,7 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
         (int64_t)n_experts * expert_mid_dim * (expert_in_dim / 256);
     const int64_t q2_pairs =
         (int64_t)n_experts * (out_dim / 2) * (expert_mid_dim / 256);
-    const ds4_mmq_fused_down fused_down = {
+    const ns4_mmq_fused_down fused_down = {
         W_down,
         (const char *)W_down,
         q2_pairs,
@@ -2090,8 +2090,8 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
         input_q8_ext,
         input_q8_ext_bytes,
     };
-    return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS, true>(
-        "ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa",
+    return ns4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS, true>(
+        "ns4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa",
         W_gate, W_up, X, ids, nullptr, nullptr,
         expert_mid_dim, expert_in_dim, n_tokens, n_experts, n_expert_used,
         stream,
@@ -2099,23 +2099,23 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
         /*sanitize_out=*/false, &fused_down);
 }
 
-extern "C" int ds4_mmq_q4_K_moe_pair(
+extern "C" int ns4_mmq_q4_K_moe_pair(
         const void * W_a, const void * W_b,
         const float * X, const int32_t * ids, float * out_a, float * out_b,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         cudaStream_t stream) {
-    return ds4_mmq_moe_pair_impl<GGML_TYPE_Q4_K>(
-        "ds4_mmq_q4_K_moe_pair", W_a, W_b, X, ids, out_a, out_b,
+    return ns4_mmq_moe_pair_impl<GGML_TYPE_Q4_K>(
+        "ns4_mmq_q4_K_moe_pair", W_a, W_b, X, ids, out_a, out_b,
         M, K, n_tokens, n_experts, n_expert_used, stream);
 }
 
-extern "C" int ds4_mmq_mxfp4_moe_pair(
+extern "C" int ns4_mmq_mxfp4_moe_pair(
         const void * W_a, const void * W_b,
         const float * X, const int32_t * ids, float * out_a, float * out_b,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         cudaStream_t stream) {
-    return ds4_mmq_moe_pair_impl<GGML_TYPE_MXFP4>(
-        "ds4_mmq_mxfp4_moe_pair", W_a, W_b, X, ids, out_a, out_b,
+    return ns4_mmq_moe_pair_impl<GGML_TYPE_MXFP4>(
+        "ns4_mmq_mxfp4_moe_pair", W_a, W_b, X, ids, out_a, out_b,
         M, K, n_tokens, n_experts, n_expert_used, stream);
 }
 
@@ -2146,7 +2146,7 @@ extern "C" int ds4_mmq_mxfp4_moe_pair(
 namespace {
 
 template <ggml_type type>
-int ds4_mmq_moe_vec_impl(
+int ns4_mmq_moe_vec_impl(
         const char    * tag,
         const void    * W,
         const float   * X_f32,
@@ -2194,7 +2194,7 @@ int ds4_mmq_moe_vec_impl(
     // stream the caller uses for kernel launches.  Required for Step 8
     // (CUDA Graph capture): pool allocations on a different stream than
     // the capture stream would invalidate the capture.
-    ds4_pool_set_stream(stream);
+    ns4_pool_set_stream(stream);
 
     // 1. Quantize X into CANONICAL Q8_1 (NOT the MMQ-interleaved variant).
     //    Layout: [ne13=1, ne12=n_tokens, ne11=1, ne10_padded blocks].
@@ -2205,7 +2205,7 @@ int ds4_mmq_moe_vec_impl(
     // pool_alloc (cudaMallocAsync) graph nodes whose pointer baked at
     // capture time may not match the address resolved at replay.  When
     // disabled (default) or when the persistent buffer is too small,
-    // fall back to the pool path.  See ds4_mmq_init for setup.
+    // fall back to the pool path.  See ns4_mmq_init for setup.
     ggml_cuda_pool_alloc<char> src1_q8_1_pool;
     char *src1_q8_1_ptr = nullptr;
     if (g_q81_scratch_enabled && g_q81_scratch_ptr &&
@@ -2318,14 +2318,14 @@ int ds4_mmq_moe_vec_impl(
         }
     }
 
-    ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)n_tokens * (uint64_t)n_expert_used, stream);
+    ns4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)n_tokens * (uint64_t)n_expert_used, stream);
     return 0;
 }
 
 // ---------------------------------------------------------------------------
 // Aligned-SoA IQ2_XXS decode matvec (megakernel program M1-Inc1).
 //
-// Layout contract (see ds4_mmq.h): W_aligned = [__half dq[nblk]][pad to 64B]
+// Layout contract (see ns4_mmq.h): W_aligned = [__half dq[nblk]][pad to 64B]
 // [uint2 qs[nblk*8]], nblk = n_experts * M * (K/256), block linear order equal
 // to the raw tensor byte order.  Per-pair integer math is bit-identical to
 // vec_dot_iq2_xxs_q8_1 (vecdotq.cuh); only the float accumulation order
@@ -2459,7 +2459,7 @@ __global__ void iq2_xxs_aligned_moe_pair_vec_kernel(
 // M1-Inc2 variant F: gate and up accumulated in the same warp (interleaved so
 // each q8 activation block is loaded once), clamp/SwiGLU/router-weight
 // epilogue folded in (semantics copied from
-// ds4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel) -> mid directly.  Replaces
+// ns4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel) -> mid directly.  Replaces
 // quantize+gate+up+sanitize+swiglu with quantize+one launch.
 __global__ void iq2_xxs_aligned_moe_gate_up_mid_kernel(
         float             *mid,        // [n_tokens*n_expert_used, M]
@@ -2699,7 +2699,7 @@ __global__ void iq2_xxs_aligned_moe_gate_up_mid_dedup_kernel(
 }
 
 template <ggml_type type>
-int ds4_mmq_moe_pair_raw_vec_impl(
+int ns4_mmq_moe_pair_raw_vec_impl(
         const char    * tag,
         const void    * W_a,
         const void    * W_b,
@@ -2739,7 +2739,7 @@ int ds4_mmq_moe_pair_raw_vec_impl(
         return -1;
     }
 
-    ds4_pool_set_stream(stream);
+    ns4_pool_set_stream(stream);
 
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     const size_t  nbytes_q8_1 = (size_t)n_tokens * ne10_padded *
@@ -2840,13 +2840,13 @@ int ds4_mmq_moe_pair_raw_vec_impl(
     }
 
     const uint64_t out_count = (uint64_t)M * (uint64_t)n_tokens * (uint64_t)n_expert_used;
-    ds4_mmq_sanitize_f32(out_a, out_count, stream);
-    ds4_mmq_sanitize_f32(out_b, out_count, stream);
+    ns4_mmq_sanitize_f32(out_a, out_count, stream);
+    ns4_mmq_sanitize_f32(out_b, out_count, stream);
     return 0;
 }
 
 template <ggml_type type>
-int ds4_mmq_moe_pair_vec_impl(
+int ns4_mmq_moe_pair_vec_impl(
         const char    * tag,
         const void    * W_a,
         const void    * W_b,
@@ -2885,8 +2885,8 @@ int ds4_mmq_moe_pair_vec_impl(
     }
 
     // Route the pool's cudaMallocAsync through the caller-supplied stream
-    // for Step 8 / CUDA Graph compatibility.  See ds4_mmq_moe_vec_impl.
-    ds4_pool_set_stream(stream);
+    // for Step 8 / CUDA Graph compatibility.  See ns4_mmq_moe_vec_impl.
+    ns4_pool_set_stream(stream);
 
     const int n_tokens = 1;  // fusion only supported at ncols_dst=1.
 
@@ -2953,12 +2953,12 @@ int ds4_mmq_moe_pair_vec_impl(
                 tag, cudaGetErrorString(err));
         return -3;
     }
-    ds4_mmq_sanitize_f32(out_silu, (uint64_t)M * (uint64_t)n_expert_used, stream);
+    ns4_mmq_sanitize_f32(out_silu, (uint64_t)M * (uint64_t)n_expert_used, stream);
     return 0;
 }
 
 template <ggml_type type>
-int ds4_mmq_dense_vec_impl(
+int ns4_mmq_dense_vec_impl(
         const char  * tag,
         const void  * W,
         const float * X_f32,
@@ -2994,8 +2994,8 @@ int ds4_mmq_dense_vec_impl(
     }
 
     // Route the pool's cudaMallocAsync through the caller-supplied stream
-    // for Step 8 / CUDA Graph compatibility.  See ds4_mmq_moe_vec_impl.
-    ds4_pool_set_stream(stream);
+    // for Step 8 / CUDA Graph compatibility.  See ns4_mmq_moe_vec_impl.
+    ns4_pool_set_stream(stream);
 
     // Dense: no MoE, ids=null. Layout [K, N, 1, 1] for src1.
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
@@ -3059,18 +3059,18 @@ int ds4_mmq_dense_vec_impl(
                 tag, cudaGetErrorString(err));
         return -3;
     }
-    ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)N, stream);
+    ns4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)N, stream);
     return 0;
 }
 
-template <ggml_type type> struct ds4_mmq_vdr_mmvq_value;
-template <> struct ds4_mmq_vdr_mmvq_value<GGML_TYPE_IQ2_XXS> { static constexpr int value = VDR_IQ2_XXS_Q8_1_MMVQ; };
-template <> struct ds4_mmq_vdr_mmvq_value<GGML_TYPE_Q2_K>    { static constexpr int value = VDR_Q2_K_Q8_1_MMVQ; };
-template <> struct ds4_mmq_vdr_mmvq_value<GGML_TYPE_Q4_K>    { static constexpr int value = VDR_Q4_K_Q8_1_MMVQ; };
-template <> struct ds4_mmq_vdr_mmvq_value<GGML_TYPE_MXFP4>   { static constexpr int value = VDR_MXFP4_Q8_1_MMVQ; };
+template <ggml_type type> struct ns4_mmq_vdr_mmvq_value;
+template <> struct ns4_mmq_vdr_mmvq_value<GGML_TYPE_IQ2_XXS> { static constexpr int value = VDR_IQ2_XXS_Q8_1_MMVQ; };
+template <> struct ns4_mmq_vdr_mmvq_value<GGML_TYPE_Q2_K>    { static constexpr int value = VDR_Q2_K_Q8_1_MMVQ; };
+template <> struct ns4_mmq_vdr_mmvq_value<GGML_TYPE_Q4_K>    { static constexpr int value = VDR_Q4_K_Q8_1_MMVQ; };
+template <> struct ns4_mmq_vdr_mmvq_value<GGML_TYPE_MXFP4>   { static constexpr int value = VDR_MXFP4_Q8_1_MMVQ; };
 
 template <ggml_type type>
-static __device__ __forceinline__ float ds4_mmq_vec_dot_q8_1(
+static __device__ __forceinline__ float ns4_mmq_vec_dot_q8_1(
         const void * __restrict__ W,
         const block_q8_1 * __restrict__ X_q8,
         const int & kbx,
@@ -3087,7 +3087,7 @@ static __device__ __forceinline__ float ds4_mmq_vec_dot_q8_1(
     }
 }
 
-static __device__ __forceinline__ float ds4_mmq_half_warp_sum_f32(float v) {
+static __device__ __forceinline__ float ns4_mmq_half_warp_sum_f32(float v) {
     const uint32_t mask = 0xffffu << (threadIdx.x & 16u);
     for (int offset = 8; offset > 0; offset >>= 1) {
         v += __shfl_down_sync(mask, v, offset, 16);
@@ -3096,7 +3096,7 @@ static __device__ __forceinline__ float ds4_mmq_half_warp_sum_f32(float v) {
 }
 
 template <ggml_type type>
-static __global__ void ds4_mmq_moe_down_sum6_q8_1_qwarp32_kernel(
+static __global__ void ns4_mmq_moe_down_sum6_q8_1_qwarp32_kernel(
         const void       * __restrict__ W,
         const block_q8_1 * __restrict__ X_q8,
         const int32_t    * __restrict__ ids,
@@ -3113,7 +3113,7 @@ static __global__ void ds4_mmq_moe_down_sum6_q8_1_qwarp32_kernel(
     constexpr int qk = ggml_cuda_type_traits<type>::qk;
     constexpr int q8_per_k = qk / QK8_1;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr = ds4_mmq_vdr_mmvq_value<type>::value;
+    constexpr int vdr = ns4_mmq_vdr_mmvq_value<type>::value;
     constexpr int lanes_per_k = qi / vdr;
     constexpr int blocks_per_iter = vdr * 16 / qi;
     const uint32_t lane = threadIdx.x & 15u;
@@ -3140,10 +3140,10 @@ static __global__ void ds4_mmq_moe_down_sum6_q8_1_qwarp32_kernel(
             const int kbx_base = (int)(expert * stride_channel_x + row * stride_row_x);
             float acc = 0.0f;
             for (uint32_t b = kbx0; !invalid_id && b < blocks_per_row_x; b += blocks_per_iter) {
-                acc += ds4_mmq_vec_dot_q8_1<type>(
+                acc += ns4_mmq_vec_dot_q8_1<type>(
                     W, xq + (uint64_t)b * q8_per_k, kbx_base + (int)b, kqs);
             }
-            acc = ds4_mmq_half_warp_sum_f32(acc);
+            acc = ns4_mmq_half_warp_sum_f32(acc);
             if (lane == 0) {
                 if (!isfinite(acc)) acc = 0.0f;
                 total += acc;
@@ -3156,7 +3156,7 @@ static __global__ void ds4_mmq_moe_down_sum6_q8_1_qwarp32_kernel(
 }
 
 template <ggml_type type>
-static __global__ void ds4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel(
+static __global__ void ns4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel(
         const void       * __restrict__ W_gate,
         const void       * __restrict__ W_up,
         const block_q8_1 * __restrict__ X_q8,
@@ -3176,7 +3176,7 @@ static __global__ void ds4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel(
     constexpr int qk = ggml_cuda_type_traits<type>::qk;
     constexpr int q8_per_k = qk / QK8_1;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr = ds4_mmq_vdr_mmvq_value<type>::value;
+    constexpr int vdr = ns4_mmq_vdr_mmvq_value<type>::value;
     constexpr int lanes_per_k = qi / vdr;
     constexpr int blocks_per_iter = vdr * 16 / qi;
     const uint32_t lane = threadIdx.x & 15u;
@@ -3204,11 +3204,11 @@ static __global__ void ds4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel(
         for (uint32_t b = kbx0; !invalid_id && b < blocks_per_row_x; b += blocks_per_iter) {
             const block_q8_1 * xb = xq + (uint64_t)b * q8_per_k;
             const int kbx = kbx_base + (int)b;
-            gate += ds4_mmq_vec_dot_q8_1<type>(W_gate, xb, kbx, kqs);
-            up   += ds4_mmq_vec_dot_q8_1<type>(W_up,   xb, kbx, kqs);
+            gate += ns4_mmq_vec_dot_q8_1<type>(W_gate, xb, kbx, kqs);
+            up   += ns4_mmq_vec_dot_q8_1<type>(W_up,   xb, kbx, kqs);
         }
-        gate = ds4_mmq_half_warp_sum_f32(gate);
-        up   = ds4_mmq_half_warp_sum_f32(up);
+        gate = ns4_mmq_half_warp_sum_f32(gate);
+        up   = ns4_mmq_half_warp_sum_f32(up);
         if (lane == 0) {
             if (!isfinite(gate)) gate = 0.0f;
             if (!isfinite(up)) up = 0.0f;
@@ -3224,7 +3224,7 @@ static __global__ void ds4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel(
 }
 
 template <ggml_type type, int c_rows_per_block>
-static __global__ void ds4_mmq_moe_down_sum6_vec_kernel(
+static __global__ void ns4_mmq_moe_down_sum6_vec_kernel(
         const void       * __restrict__ W,
         const block_q8_1 * __restrict__ X_q8,
         const int32_t    * __restrict__ ids,
@@ -3240,7 +3240,7 @@ static __global__ void ds4_mmq_moe_down_sum6_vec_kernel(
     constexpr int top_k = 6;
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr = ds4_mmq_vdr_mmvq_value<type>::value;
+    constexpr int vdr = ns4_mmq_vdr_mmvq_value<type>::value;
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     const uint32_t slot  = threadIdx.y;
@@ -3270,7 +3270,7 @@ static __global__ void ds4_mmq_moe_down_sum6_vec_kernel(
 
 #pragma unroll
         for (int i = 0; i < c_rows_per_block; ++i) {
-            tmp[i] += ds4_mmq_vec_dot_q8_1<type>(
+            tmp[i] += ns4_mmq_vec_dot_q8_1<type>(
                 W, &y[kby], kbx_offset + i * stride_row_x + kbx, kqs);
         }
     }
@@ -3301,7 +3301,7 @@ static __global__ void ds4_mmq_moe_down_sum6_vec_kernel(
 }
 
 template <ggml_type type>
-int ds4_mmq_moe_down_sum6_vec_impl(
+int ns4_mmq_moe_down_sum6_vec_impl(
         const char    * tag,
         const void    * W,
         const float   * X_f32,
@@ -3335,7 +3335,7 @@ int ds4_mmq_moe_down_sum6_vec_impl(
         return -1;
     }
 
-    ds4_pool_set_stream(stream);
+    ns4_pool_set_stream(stream);
 
     const int n_assignments = n_tokens * n_expert_used;
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
@@ -3373,7 +3373,7 @@ int ds4_mmq_moe_down_sum6_vec_impl(
     const dim3 block_nums((M + 63) / 64, n_tokens);
     const dim3 block_dims(256);
 
-    ds4_mmq_moe_down_sum6_q8_1_qwarp32_kernel<type><<<block_nums, block_dims, 0, stream>>>(
+    ns4_mmq_moe_down_sum6_q8_1_qwarp32_kernel<type><<<block_nums, block_dims, 0, stream>>>(
         W, (const block_q8_1 *)src1_q8_1_ptr, ids, out_f32,
         (uint32_t)K, (uint32_t)M, (uint32_t)n_tokens, (uint32_t)n_experts,
         stride_row_x, stride_col_y, stride_channel_x);
@@ -3389,7 +3389,7 @@ int ds4_mmq_moe_down_sum6_vec_impl(
 }
 
 template <ggml_type type, int c_rows_per_block>
-static __global__ void ds4_mmq_moe_gate_up_mid_vec_kernel(
+static __global__ void ns4_mmq_moe_gate_up_mid_vec_kernel(
         const void       * __restrict__ W_gate,
         const void       * __restrict__ W_up,
         const block_q8_1 * __restrict__ X_q8,
@@ -3408,7 +3408,7 @@ static __global__ void ds4_mmq_moe_gate_up_mid_vec_kernel(
     constexpr int top_k = 6;
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr = ds4_mmq_vdr_mmvq_value<type>::value;
+    constexpr int vdr = ns4_mmq_vdr_mmvq_value<type>::value;
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     const uint32_t slot  = threadIdx.y;
@@ -3436,8 +3436,8 @@ static __global__ void ds4_mmq_moe_gate_up_mid_vec_kernel(
 #pragma unroll
         for (int i = 0; i < c_rows_per_block; ++i) {
             const int row_kbx = kbx_offset + i * stride_row_x + kbx;
-            gate[i] += ds4_mmq_vec_dot_q8_1<type>(W_gate, &y[kby], row_kbx, kqs);
-            up[i]   += ds4_mmq_vec_dot_q8_1<type>(W_up,   &y[kby], row_kbx, kqs);
+            gate[i] += ns4_mmq_vec_dot_q8_1<type>(W_gate, &y[kby], row_kbx, kqs);
+            up[i]   += ns4_mmq_vec_dot_q8_1<type>(W_up,   &y[kby], row_kbx, kqs);
         }
     }
 
@@ -3466,7 +3466,7 @@ static __global__ void ds4_mmq_moe_gate_up_mid_vec_kernel(
 }
 
 template <ggml_type type, int c_rows_per_block>
-static __global__ void ds4_mmq_moe_gate_up_mid_vec_by_slot_kernel(
+static __global__ void ns4_mmq_moe_gate_up_mid_vec_by_slot_kernel(
         const void       * __restrict__ W_gate,
         const void       * __restrict__ W_up,
         const block_q8_1 * __restrict__ X_q8,
@@ -3485,7 +3485,7 @@ static __global__ void ds4_mmq_moe_gate_up_mid_vec_by_slot_kernel(
     constexpr int top_k = 6;
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr = ds4_mmq_vdr_mmvq_value<type>::value;
+    constexpr int vdr = ns4_mmq_vdr_mmvq_value<type>::value;
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     const uint32_t slot  = blockIdx.y;
@@ -3513,8 +3513,8 @@ static __global__ void ds4_mmq_moe_gate_up_mid_vec_by_slot_kernel(
 #pragma unroll
         for (int i = 0; i < c_rows_per_block; ++i) {
             const int row_kbx = kbx_offset + i * stride_row_x + kbx;
-            gate[i] += ds4_mmq_vec_dot_q8_1<type>(W_gate, &y[kby], row_kbx, kqs);
-            up[i]   += ds4_mmq_vec_dot_q8_1<type>(W_up,   &y[kby], row_kbx, kqs);
+            gate[i] += ns4_mmq_vec_dot_q8_1<type>(W_gate, &y[kby], row_kbx, kqs);
+            up[i]   += ns4_mmq_vec_dot_q8_1<type>(W_up,   &y[kby], row_kbx, kqs);
         }
     }
 
@@ -3543,7 +3543,7 @@ static __global__ void ds4_mmq_moe_gate_up_mid_vec_by_slot_kernel(
 }
 
 template <ggml_type type>
-int ds4_mmq_moe_gate_up_mid_vec_impl(
+int ns4_mmq_moe_gate_up_mid_vec_impl(
         const char    * tag,
         const void    * W_gate,
         const void    * W_up,
@@ -3580,7 +3580,7 @@ int ds4_mmq_moe_gate_up_mid_vec_impl(
         return -1;
     }
 
-    ds4_pool_set_stream(stream);
+    ns4_pool_set_stream(stream);
 
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     const size_t nbytes_q8_1 = (size_t)n_tokens * ne10_padded *
@@ -3589,7 +3589,7 @@ int ds4_mmq_moe_gate_up_mid_vec_impl(
     ggml_cuda_pool_alloc<char> src1_q8_1_pool;
     // M2-Inc2a: the fused HC stage may have emitted this activation's q8_1
     // codes already (ffn_norm) -- take them and skip the quantize prelude.
-    char *src1_q8_1_ptr = ds4_mmq_folded_q81(X_f32, K, n_tokens, ne10_padded);
+    char *src1_q8_1_ptr = ns4_mmq_folded_q81(X_f32, K, n_tokens, ne10_padded);
     cudaError_t err;
     if (!src1_q8_1_ptr) {
     if (g_q81_scratch_enabled && g_q81_scratch_ptr && g_q81_scratch_bytes >= nbytes_q8_1) {
@@ -3621,7 +3621,7 @@ int ds4_mmq_moe_gate_up_mid_vec_impl(
 
     const dim3 block_nums((M + 63) / 64, n_tokens * n_expert_used);
     const dim3 block_dims(256);
-    ds4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel<type><<<block_nums, block_dims, 0, stream>>>(
+    ns4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel<type><<<block_nums, block_dims, 0, stream>>>(
         W_gate, W_up, (const block_q8_1 *)src1_q8_1_ptr, ids, weights, mid_f32,
         (uint32_t)K, (uint32_t)M, (uint32_t)n_tokens, (uint32_t)n_experts,
         stride_row_x, stride_col_y, stride_channel_x, clamp);
@@ -3638,53 +3638,53 @@ int ds4_mmq_moe_gate_up_mid_vec_impl(
 
 } // anonymous namespace
 
-extern "C" int ds4_mmq_q8_0_moe_vec(
+extern "C" int ns4_mmq_q8_0_moe_vec(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         cudaStream_t stream) {
-    return ds4_mmq_moe_vec_impl<GGML_TYPE_Q8_0>(
-        "ds4_mmq_q8_0_moe_vec", W, X, ids, out, M, K,
+    return ns4_mmq_moe_vec_impl<GGML_TYPE_Q8_0>(
+        "ns4_mmq_q8_0_moe_vec", W, X, ids, out, M, K,
         n_tokens, n_experts, n_expert_used, stream);
 }
 
-extern "C" int ds4_mmq_q2_K_moe_vec(
+extern "C" int ns4_mmq_q2_K_moe_vec(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         cudaStream_t stream) {
-    return ds4_mmq_moe_vec_impl<GGML_TYPE_Q2_K>(
-        "ds4_mmq_q2_K_moe_vec", W, X, ids, out, M, K,
+    return ns4_mmq_moe_vec_impl<GGML_TYPE_Q2_K>(
+        "ns4_mmq_q2_K_moe_vec", W, X, ids, out, M, K,
         n_tokens, n_experts, n_expert_used, stream);
 }
 
-extern "C" int ds4_mmq_iq2_xxs_moe_vec(
+extern "C" int ns4_mmq_iq2_xxs_moe_vec(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         cudaStream_t stream) {
-    return ds4_mmq_moe_vec_impl<GGML_TYPE_IQ2_XXS>(
-        "ds4_mmq_iq2_xxs_moe_vec", W, X, ids, out, M, K,
+    return ns4_mmq_moe_vec_impl<GGML_TYPE_IQ2_XXS>(
+        "ns4_mmq_iq2_xxs_moe_vec", W, X, ids, out, M, K,
         n_tokens, n_experts, n_expert_used, stream);
 }
 
-extern "C" int ds4_mmq_q4_K_moe_vec(
+extern "C" int ns4_mmq_q4_K_moe_vec(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         cudaStream_t stream) {
-    return ds4_mmq_moe_vec_impl<GGML_TYPE_Q4_K>(
-        "ds4_mmq_q4_K_moe_vec", W, X, ids, out, M, K,
+    return ns4_mmq_moe_vec_impl<GGML_TYPE_Q4_K>(
+        "ns4_mmq_q4_K_moe_vec", W, X, ids, out, M, K,
         n_tokens, n_experts, n_expert_used, stream);
 }
 
-extern "C" int ds4_mmq_mxfp4_moe_vec(
+extern "C" int ns4_mmq_mxfp4_moe_vec(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         cudaStream_t stream) {
-    return ds4_mmq_moe_vec_impl<GGML_TYPE_MXFP4>(
-        "ds4_mmq_mxfp4_moe_vec", W, X, ids, out, M, K,
+    return ns4_mmq_moe_vec_impl<GGML_TYPE_MXFP4>(
+        "ns4_mmq_mxfp4_moe_vec", W, X, ids, out, M, K,
         n_tokens, n_experts, n_expert_used, stream);
 }
 
 // M1-Inc2b: exact inverse of the weight-server repack
-// (repack_iq2_xxs_aligned_kernel, tools/ds4_weight_server.cu): aligned-SoA
+// (repack_iq2_xxs_aligned_kernel, tools/ns4_weight_server.cu): aligned-SoA
 // artifact -> raw block_iq2_xxs byte stream (66B = [half d][8 x uint2
 // codes]).  Device->device fill of a raw-layout scratch so the batched/mmq
 // consumers keep their layout while the raw spans stay excluded from the
@@ -3709,10 +3709,10 @@ __global__ void iq2_xxs_aligned_derepack_kernel(
     memcpy(dst + 2u + (uint64_t)p * 8u, &v, 8u);
 }
 
-extern "C" int ds4_mmq_iq2_xxs_aligned_derepack(
+extern "C" int ns4_mmq_iq2_xxs_aligned_derepack(
         const void * W_aligned, void * raw_out,
         int M, int K, int n_experts, cudaStream_t stream) {
-    const char *tag = "ds4_mmq_iq2_xxs_aligned_derepack";
+    const char *tag = "ns4_mmq_iq2_xxs_aligned_derepack";
     if (!W_aligned || !raw_out) {
         fprintf(stderr, "%s: null pointer\n", tag);
         return -1;
@@ -3837,17 +3837,17 @@ __global__ void q8_0_aligned_dense_vec_nc_kernel(
     }
 }
 
-extern "C" uint64_t ds4_mmq_q8_0_aligned_bytes(int M, int K) {
+extern "C" uint64_t ns4_mmq_q8_0_aligned_bytes(int M, int K) {
     if (M <= 0 || K <= 0 || K % 1024 != 0) return 0;
     const uint64_t nblk = (uint64_t)M * (uint64_t)(K / 32);
     const uint64_t dq_bytes = (nblk * 2u + 63u) & ~63ull;
     return dq_bytes + nblk * 32u;
 }
 
-extern "C" int ds4_mmq_q8_0_aligned_dense_vec(
+extern "C" int ns4_mmq_q8_0_aligned_dense_vec(
         const void * W_aligned, const float * X_f32, float * out_f32,
         int M, int N, int K, cudaStream_t stream) {
-    const char *tag = "ds4_mmq_q8_0_aligned_dense_vec";
+    const char *tag = "ns4_mmq_q8_0_aligned_dense_vec";
     if (!W_aligned || !X_f32 || !out_f32) {
         fprintf(stderr, "%s: null pointer\n", tag);
         return -1;
@@ -3863,14 +3863,14 @@ extern "C" int ds4_mmq_q8_0_aligned_dense_vec(
         fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
         return -1;
     }
-    ds4_pool_set_stream(stream);
+    ns4_pool_set_stream(stream);
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     const size_t  nbytes_q8_1 = (size_t)N * ne10_padded * sizeof(block_q8_1) / QK8_1;
     ggml_cuda_pool_alloc<char> q8_pool;
     // M2-Inc2a: producer-emitted q8_1 codes (qr_norm from the qkv-rms
     // kernel) -- take them and skip the quantize prelude.  Single-column
     // producers only; verify widths always quantize.
-    char *x8 = N == 1 ? ds4_mmq_folded_q81(X_f32, K, 1, ne10_padded) : NULL;
+    char *x8 = N == 1 ? ns4_mmq_folded_q81(X_f32, K, 1, ne10_padded) : NULL;
     cudaError_t err;
     if (!x8) {
     if (g_q81_scratch_enabled && g_q81_scratch_ptr && g_q81_scratch_bytes >= nbytes_q8_1) {
@@ -3928,7 +3928,7 @@ extern "C" int ds4_mmq_q8_0_aligned_dense_vec(
 // (2p, 2p+1) of an expert, each lane-iteration needs exactly one 8B qs load
 // (both rows' int), one 16B scales-window load (both rows' 8B half), one 8B
 // dm load.  Layout contract (shared with the weight server
-// --repack-q2k-aligned, DERIVED_Q2_K_ALIGNED_MOE, and ds4_mmq.h):
+// --repack-q2k-aligned, DERIVED_Q2_K_ALIGNED_MOE, and ns4_mmq.h):
 //
 //   npair = n_experts * (M/2) * (K/256)      pair-blocks, expert-major then
 //                                            row-pair then block (raw order)
@@ -4048,7 +4048,7 @@ __global__ static void q2_k_aligned_moe_vec_kernel(
 }
 
 // Exact inverse of the weight-server repack (repack_q2_k_aligned_kernel,
-// tools/ds4_weight_server.cu): pair-SoA -> raw block_q2_K byte stream.  One
+// tools/ns4_weight_server.cu): pair-SoA -> raw block_q2_K byte stream.  One
 // thread per (raw block, qs int); p < 4 additionally restores a scales word,
 // p == 0 the dm word.
 __global__ static void q2_k_aligned_derepack_kernel(
@@ -4085,7 +4085,7 @@ __global__ static void q2_k_aligned_derepack_kernel(
     }
 }
 
-extern "C" uint64_t ds4_mmq_q2_k_aligned_bytes(int M, int K, int n_experts) {
+extern "C" uint64_t ns4_mmq_q2_k_aligned_bytes(int M, int K, int n_experts) {
     if (M <= 0 || K <= 0 || n_experts <= 0 || K % 256 != 0 || M % 2 != 0) return 0;
     const uint64_t npair = (uint64_t)n_experts * (uint64_t)(M/2) * (uint64_t)(K / 256);
     const uint64_t dm_bytes = (npair * 8u + 63u) & ~63ull;
@@ -4093,11 +4093,11 @@ extern "C" uint64_t ds4_mmq_q2_k_aligned_bytes(int M, int K, int n_experts) {
     return dm_bytes + sc_bytes + npair * 128u;
 }
 
-extern "C" int ds4_mmq_q2_K_aligned_moe_vec(
+extern "C" int ns4_mmq_q2_K_aligned_moe_vec(
         const void * W_aligned, const float * X_f32, const int32_t * ids,
         float * out_f32, int M, int K, int n_tokens, int n_experts,
         int n_expert_used, cudaStream_t stream) {
-    const char *tag = "ds4_mmq_q2_K_aligned_moe_vec";
+    const char *tag = "ns4_mmq_q2_K_aligned_moe_vec";
     if (!W_aligned || !X_f32 || !ids || !out_f32) {
         fprintf(stderr, "%s: null pointer\n", tag);
         return -1;
@@ -4115,9 +4115,9 @@ extern "C" int ds4_mmq_q2_K_aligned_moe_vec(
         fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
         return -1;
     }
-    ds4_pool_set_stream(stream);
+    ns4_pool_set_stream(stream);
 
-    /* Quantize verbatim from ds4_mmq_moe_vec_impl<GGML_TYPE_Q2_K> so the q8_1
+    /* Quantize verbatim from ns4_mmq_moe_vec_impl<GGML_TYPE_Q2_K> so the q8_1
      * codes feeding the twin are bit-identical to the raw path's. */
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     const size_t  nbytes_q8_1 = (size_t)n_tokens * ne10_padded * sizeof(block_q8_1) / QK8_1;
@@ -4178,14 +4178,14 @@ extern "C" int ds4_mmq_q2_K_aligned_moe_vec(
         }
     }
 
-    ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)n_tokens, stream);
+    ns4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)n_tokens, stream);
     return 0;
 }
 
-extern "C" int ds4_mmq_q2_K_aligned_derepack(
+extern "C" int ns4_mmq_q2_K_aligned_derepack(
         const void * W_aligned, void * raw_out,
         int M, int K, int n_experts, cudaStream_t stream) {
-    const char *tag = "ds4_mmq_q2_K_aligned_derepack";
+    const char *tag = "ns4_mmq_q2_K_aligned_derepack";
     if (!W_aligned || !raw_out) {
         fprintf(stderr, "%s: null pointer\n", tag);
         return -1;
@@ -4210,7 +4210,7 @@ extern "C" int ds4_mmq_q2_K_aligned_derepack(
     return 0;
 }
 
-extern "C" uint64_t ds4_mmq_iq2_xxs_aligned_bytes(int M, int K, int n_experts) {
+extern "C" uint64_t ns4_mmq_iq2_xxs_aligned_bytes(int M, int K, int n_experts) {
     if (M <= 0 || K <= 0 || n_experts <= 0 || K % 256 != 0) return 0;
     const uint64_t nblk = (uint64_t)n_experts * (uint64_t)M * (uint64_t)(K / 256);
     const uint64_t dq_bytes = (nblk * 2u + 63u) & ~63ull;
@@ -4229,21 +4229,21 @@ static char *iq2_aligned_quantize_xn(
         fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
         return nullptr;
     }
-    ds4_pool_set_stream(stream);
+    ns4_pool_set_stream(stream);
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     const size_t  nbytes_q8_1 = (size_t)n_tokens * ne10_padded * sizeof(block_q8_1) / QK8_1;
     // M2-Inc2a: producer-emitted q8_1 codes (ffn_norm from the fused HC
     // stage) -- take them and skip the quantize prelude.
-    char *folded = ds4_mmq_folded_q81(X_f32, K, n_tokens, ne10_padded);
+    char *folded = ns4_mmq_folded_q81(X_f32, K, n_tokens, ne10_padded);
     if (folded) {
-        // C3-Inc4 fold twin selftest (DS4_Q8_FOLD_SELFTEST=<call budget>,
+        // C3-Inc4 fold twin selftest (NS4_Q8_FOLD_SELFTEST=<call budget>,
         // eager legs only -- syncs the stream): the taken sidecar must be
         // byte-identical to the fresh quantize this prelude would have run.
-        // Do NOT combine with DS4_HC_STAGE_BATCH_PARITY (the probe rewrites
+        // Do NOT combine with NS4_HC_STAGE_BATCH_PARITY (the probe rewrites
         // norm_out after the sidecar was emitted).
         static int fold_st = -1;
         if (fold_st < 0) {
-            const char *st = getenv("DS4_Q8_FOLD_SELFTEST");
+            const char *st = getenv("NS4_Q8_FOLD_SELFTEST");
             fold_st = st && *st ? atoi(st) : 0;
             if (st && *st && fold_st <= 1) fold_st = 512;
         }
@@ -4265,10 +4265,10 @@ static char *iq2_aligned_quantize_xn(
                 cudaStreamSynchronize(stream) == cudaSuccess &&
                 cudaMemcpy(h[0], folded, nbytes_q8_1, cudaMemcpyDeviceToHost) == cudaSuccess &&
                 cudaMemcpy(h[1], fresh, nbytes_q8_1, cudaMemcpyDeviceToHost) == cudaSuccess) {
-                fprintf(stderr, "ds4: Q8F-SELFTEST(q81 moe) K=%d %s\n", K,
+                fprintf(stderr, "ns4: Q8F-SELFTEST(q81 moe) K=%d %s\n", K,
                         memcmp(h[0], h[1], nbytes_q8_1) == 0 ? "PASS" : "FAIL");
             } else {
-                fprintf(stderr, "ds4: Q8F-SELFTEST(q81 moe) SKIP (setup failed)\n");
+                fprintf(stderr, "ns4: Q8F-SELFTEST(q81 moe) SKIP (setup failed)\n");
             }
         }
         return folded;
@@ -4298,13 +4298,13 @@ static char *iq2_aligned_quantize_xn(
     return ptr;
 }
 
-extern "C" int ds4_mmq_iq2_xxs_aligned_moe_pair_vec(
+extern "C" int ns4_mmq_iq2_xxs_aligned_moe_pair_vec(
         const void * W_gate_aligned, const void * W_up_aligned,
         const float * X_f32, const int32_t * ids,
         float * gate_out, float * up_out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         cudaStream_t stream) {
-    const char *tag = "ds4_mmq_iq2_xxs_aligned_moe_pair_vec";
+    const char *tag = "ns4_mmq_iq2_xxs_aligned_moe_pair_vec";
     if (!W_gate_aligned || !W_up_aligned || !X_f32 || !ids || !gate_out || !up_out) {
         fprintf(stderr, "%s: null pointer\n", tag);
         return -1;
@@ -4335,13 +4335,13 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_pair_vec(
     return 0;
 }
 
-extern "C" int ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
+extern "C" int ns4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
         const void * W_gate_aligned, const void * W_up_aligned,
         const float * X_f32, const int32_t * ids, const float * weights,
         float * mid_f32,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         float clamp, cudaStream_t stream) {
-    const char *tag = "ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec";
+    const char *tag = "ns4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec";
     if (!W_gate_aligned || !W_up_aligned || !X_f32 || !ids || !weights || !mid_f32) {
         fprintf(stderr, "%s: null pointer\n", tag);
         return -1;
@@ -4364,27 +4364,27 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
     /* v0.4 V6: verify widths dedup expert overlap (see the dedup kernel's
      * header comment).  n_tokens==1 has no cross-token overlap and keeps
      * the per-slot kernel; widths beyond the verify envelope likewise.
-     * DS4_CUDA_NO_MOE_DEDUP restores the per-slot kernel (diagnostic). */
+     * NS4_CUDA_NO_MOE_DEDUP restores the per-slot kernel (diagnostic). */
     static int moe_dedup_en = -1;
-    if (moe_dedup_en < 0) moe_dedup_en = getenv("DS4_CUDA_NO_MOE_DEDUP") == NULL;
+    if (moe_dedup_en < 0) moe_dedup_en = getenv("NS4_CUDA_NO_MOE_DEDUP") == NULL;
     if (moe_dedup_en && n_tokens >= 2 && n_tokens <= 8) {
         const int n_slots = n_tokens * n_expert_used;
         switch (n_tokens) {
-#define DS4_GATEUP_DEDUP_CASE(NT) \
+#define NS4_GATEUP_DEDUP_CASE(NT) \
         case NT: \
             iq2_xxs_aligned_moe_gate_up_mid_dedup_kernel<NT><<<grid, 32, 0, stream>>>( \
                 mid_f32, qs_g, dq_g, qs_u, dq_u, \
                 (const block_q8_1 *)x8, ids, weights, M, K / 256, K / 32, \
                 n_expert_used, n_slots, clamp); \
             break;
-        DS4_GATEUP_DEDUP_CASE(2)
-        DS4_GATEUP_DEDUP_CASE(3)
-        DS4_GATEUP_DEDUP_CASE(4)
-        DS4_GATEUP_DEDUP_CASE(5)
-        DS4_GATEUP_DEDUP_CASE(6)
-        DS4_GATEUP_DEDUP_CASE(7)
-        DS4_GATEUP_DEDUP_CASE(8)
-#undef DS4_GATEUP_DEDUP_CASE
+        NS4_GATEUP_DEDUP_CASE(2)
+        NS4_GATEUP_DEDUP_CASE(3)
+        NS4_GATEUP_DEDUP_CASE(4)
+        NS4_GATEUP_DEDUP_CASE(5)
+        NS4_GATEUP_DEDUP_CASE(6)
+        NS4_GATEUP_DEDUP_CASE(7)
+        NS4_GATEUP_DEDUP_CASE(8)
+#undef NS4_GATEUP_DEDUP_CASE
         }
     } else {
         iq2_xxs_aligned_moe_gate_up_mid_kernel<<<grid, 32, 0, stream>>>(
@@ -4399,11 +4399,11 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
     return 0;
 }
 
-extern "C" int ds4_mmq_iq2_xxs_aligned_moe_vec(
+extern "C" int ns4_mmq_iq2_xxs_aligned_moe_vec(
         const void * W_aligned, const float * X_f32, const int32_t * ids, float * out_f32,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         cudaStream_t stream) {
-    const char *tag = "ds4_mmq_iq2_xxs_aligned_moe_vec";
+    const char *tag = "ns4_mmq_iq2_xxs_aligned_moe_vec";
     if (!W_aligned || !X_f32 || !ids || !out_f32) {
         fprintf(stderr, "%s: null pointer\n", tag);
         return -1;
@@ -4422,9 +4422,9 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_vec(
         fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
         return -1;
     }
-    ds4_pool_set_stream(stream);
+    ns4_pool_set_stream(stream);
 
-    // Quantize X into canonical Q8_1, exactly as ds4_mmq_moe_vec_impl does, so
+    // Quantize X into canonical Q8_1, exactly as ns4_mmq_moe_vec_impl does, so
     // the aligned path shares its activation numerics (and its persistent
     // scratch when enabled).
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
@@ -4464,112 +4464,112 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_vec(
         return -3;
     }
 
-    ds4_mmq_sanitize_f32(out_f32, (uint64_t)n_tokens * (uint64_t)M * (uint64_t)n_expert_used, stream);
+    ns4_mmq_sanitize_f32(out_f32, (uint64_t)n_tokens * (uint64_t)M * (uint64_t)n_expert_used, stream);
     return 0;
 }
 
-extern "C" int ds4_mmq_q2_K_moe_down_sum6_vec(
+extern "C" int ns4_mmq_q2_K_moe_down_sum6_vec(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         cudaStream_t stream) {
-    return ds4_mmq_moe_down_sum6_vec_impl<GGML_TYPE_Q2_K>(
-        "ds4_mmq_q2_K_moe_down_sum6_vec", W, X, ids, out, M, K,
+    return ns4_mmq_moe_down_sum6_vec_impl<GGML_TYPE_Q2_K>(
+        "ns4_mmq_q2_K_moe_down_sum6_vec", W, X, ids, out, M, K,
         n_tokens, n_experts, n_expert_used, stream);
 }
 
-extern "C" int ds4_mmq_q4_K_moe_down_sum6_vec(
+extern "C" int ns4_mmq_q4_K_moe_down_sum6_vec(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         cudaStream_t stream) {
-    return ds4_mmq_moe_down_sum6_vec_impl<GGML_TYPE_Q4_K>(
-        "ds4_mmq_q4_K_moe_down_sum6_vec", W, X, ids, out, M, K,
+    return ns4_mmq_moe_down_sum6_vec_impl<GGML_TYPE_Q4_K>(
+        "ns4_mmq_q4_K_moe_down_sum6_vec", W, X, ids, out, M, K,
         n_tokens, n_experts, n_expert_used, stream);
 }
 
-extern "C" int ds4_mmq_mxfp4_moe_down_sum6_vec(
+extern "C" int ns4_mmq_mxfp4_moe_down_sum6_vec(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         cudaStream_t stream) {
-    return ds4_mmq_moe_down_sum6_vec_impl<GGML_TYPE_MXFP4>(
-        "ds4_mmq_mxfp4_moe_down_sum6_vec", W, X, ids, out, M, K,
+    return ns4_mmq_moe_down_sum6_vec_impl<GGML_TYPE_MXFP4>(
+        "ns4_mmq_mxfp4_moe_down_sum6_vec", W, X, ids, out, M, K,
         n_tokens, n_experts, n_expert_used, stream);
 }
 
-extern "C" int ds4_mmq_iq2_xxs_moe_gate_up_mid_vec(
+extern "C" int ns4_mmq_iq2_xxs_moe_gate_up_mid_vec(
         const void * W_gate, const void * W_up,
         const float * X, const int32_t * ids, const float * weights, float * mid,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         float clamp, cudaStream_t stream) {
-    return ds4_mmq_moe_gate_up_mid_vec_impl<GGML_TYPE_IQ2_XXS>(
-        "ds4_mmq_iq2_xxs_moe_gate_up_mid_vec", W_gate, W_up, X, ids, weights, mid,
+    return ns4_mmq_moe_gate_up_mid_vec_impl<GGML_TYPE_IQ2_XXS>(
+        "ns4_mmq_iq2_xxs_moe_gate_up_mid_vec", W_gate, W_up, X, ids, weights, mid,
         M, K, n_tokens, n_experts, n_expert_used, clamp, stream);
 }
 
-extern "C" int ds4_mmq_q4_K_moe_gate_up_mid_vec(
+extern "C" int ns4_mmq_q4_K_moe_gate_up_mid_vec(
         const void * W_gate, const void * W_up,
         const float * X, const int32_t * ids, const float * weights, float * mid,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         float clamp, cudaStream_t stream) {
-    return ds4_mmq_moe_gate_up_mid_vec_impl<GGML_TYPE_Q4_K>(
-        "ds4_mmq_q4_K_moe_gate_up_mid_vec", W_gate, W_up, X, ids, weights, mid,
+    return ns4_mmq_moe_gate_up_mid_vec_impl<GGML_TYPE_Q4_K>(
+        "ns4_mmq_q4_K_moe_gate_up_mid_vec", W_gate, W_up, X, ids, weights, mid,
         M, K, n_tokens, n_experts, n_expert_used, clamp, stream);
 }
 
-extern "C" int ds4_mmq_mxfp4_moe_gate_up_mid_vec(
+extern "C" int ns4_mmq_mxfp4_moe_gate_up_mid_vec(
         const void * W_gate, const void * W_up,
         const float * X, const int32_t * ids, const float * weights, float * mid,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         float clamp, cudaStream_t stream) {
-    return ds4_mmq_moe_gate_up_mid_vec_impl<GGML_TYPE_MXFP4>(
-        "ds4_mmq_mxfp4_moe_gate_up_mid_vec", W_gate, W_up, X, ids, weights, mid,
+    return ns4_mmq_moe_gate_up_mid_vec_impl<GGML_TYPE_MXFP4>(
+        "ns4_mmq_mxfp4_moe_gate_up_mid_vec", W_gate, W_up, X, ids, weights, mid,
         M, K, n_tokens, n_experts, n_expert_used, clamp, stream);
 }
 
-extern "C" int ds4_mmq_iq2_xxs_moe_pair_vec(
+extern "C" int ns4_mmq_iq2_xxs_moe_pair_vec(
         const void * W_a, const void * W_b,
         const float * X, const int32_t * ids, float * out_silu,
         int M, int K, int n_experts, int n_expert_used,
         cudaStream_t stream) {
-    return ds4_mmq_moe_pair_vec_impl<GGML_TYPE_IQ2_XXS>(
-        "ds4_mmq_iq2_xxs_moe_pair_vec", W_a, W_b, X, ids, out_silu,
+    return ns4_mmq_moe_pair_vec_impl<GGML_TYPE_IQ2_XXS>(
+        "ns4_mmq_iq2_xxs_moe_pair_vec", W_a, W_b, X, ids, out_silu,
         M, K, n_experts, n_expert_used, stream);
 }
 
-extern "C" int ds4_mmq_q4_K_moe_pair_vec(
+extern "C" int ns4_mmq_q4_K_moe_pair_vec(
         const void * W_a, const void * W_b,
         const float * X, const int32_t * ids, float * out_silu,
         int M, int K, int n_experts, int n_expert_used,
         cudaStream_t stream) {
-    return ds4_mmq_moe_pair_vec_impl<GGML_TYPE_Q4_K>(
-        "ds4_mmq_q4_K_moe_pair_vec", W_a, W_b, X, ids, out_silu,
+    return ns4_mmq_moe_pair_vec_impl<GGML_TYPE_Q4_K>(
+        "ns4_mmq_q4_K_moe_pair_vec", W_a, W_b, X, ids, out_silu,
         M, K, n_experts, n_expert_used, stream);
 }
 
-extern "C" int ds4_mmq_iq2_xxs_moe_pair_raw_vec(
+extern "C" int ns4_mmq_iq2_xxs_moe_pair_raw_vec(
         const void * W_a, const void * W_b,
         const float * X, const int32_t * ids, float * out_a, float * out_b,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         cudaStream_t stream) {
-    return ds4_mmq_moe_pair_raw_vec_impl<GGML_TYPE_IQ2_XXS>(
-        "ds4_mmq_iq2_xxs_moe_pair_raw_vec", W_a, W_b, X, ids, out_a, out_b,
+    return ns4_mmq_moe_pair_raw_vec_impl<GGML_TYPE_IQ2_XXS>(
+        "ns4_mmq_iq2_xxs_moe_pair_raw_vec", W_a, W_b, X, ids, out_a, out_b,
         M, K, n_tokens, n_experts, n_expert_used, stream);
 }
 
-extern "C" int ds4_mmq_q4_K_moe_pair_raw_vec(
+extern "C" int ns4_mmq_q4_K_moe_pair_raw_vec(
         const void * W_a, const void * W_b,
         const float * X, const int32_t * ids, float * out_a, float * out_b,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         cudaStream_t stream) {
-    return ds4_mmq_moe_pair_raw_vec_impl<GGML_TYPE_Q4_K>(
-        "ds4_mmq_q4_K_moe_pair_raw_vec", W_a, W_b, X, ids, out_a, out_b,
+    return ns4_mmq_moe_pair_raw_vec_impl<GGML_TYPE_Q4_K>(
+        "ns4_mmq_q4_K_moe_pair_raw_vec", W_a, W_b, X, ids, out_a, out_b,
         M, K, n_tokens, n_experts, n_expert_used, stream);
 }
 
-extern "C" int ds4_mmq_q8_0_dense_vec(
+extern "C" int ns4_mmq_q8_0_dense_vec(
         const void * W, const float * X, float * out,
         int M, int N, int K, cudaStream_t stream) {
-    return ds4_mmq_dense_vec_impl<GGML_TYPE_Q8_0>(
-        "ds4_mmq_q8_0_dense_vec", W, X, out, M, N, K, stream);
+    return ns4_mmq_dense_vec_impl<GGML_TYPE_Q8_0>(
+        "ns4_mmq_q8_0_dense_vec", W, X, out, M, N, K, stream);
 }
 
 // Explicit instantiations. One per quant type the public API exposes.

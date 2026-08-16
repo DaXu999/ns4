@@ -1,19 +1,19 @@
-#ifndef DS4_LAYER_PACK_H
-#define DS4_LAYER_PACK_H
+#ifndef NS4_LAYER_PACK_H
+#define NS4_LAYER_PACK_H
 
 #include <stddef.h>
 #include <stdio.h>
 
-#define DS4_LAYER_PACK_MAX_GPUS 16
-#define DS4_LAYER_PACK_CPU      (-1)
+#define NS4_LAYER_PACK_MAX_GPUS 16
+#define NS4_LAYER_PACK_CPU      (-1)
 
 typedef struct {
     /* Per-device budget in BYTES (already net of per-device overhead such as
      * cuBLAS workspace, global scratch, logits buffer, MTP, steering, and the
      * configured safety margin). The packer treats these as raw capacity. */
-    size_t gpu_budget_bytes[DS4_LAYER_PACK_MAX_GPUS];
+    size_t gpu_budget_bytes[NS4_LAYER_PACK_MAX_GPUS];
     int    n_gpus;
-} ds4_layer_pack_config;
+} ns4_layer_pack_config;
 
 #ifdef __cplusplus
 extern "C" {
@@ -31,7 +31,7 @@ extern "C" {
  *
  * Output:
  *   device_for_entry[] — filled with target device for each entry; CPU is
- *                        DS4_LAYER_PACK_CPU. Caller-owned, must be
+ *                        NS4_LAYER_PACK_CPU. Caller-owned, must be
  *                        large enough for n_entries int slots.
  *
  * Returns:
@@ -42,9 +42,9 @@ extern "C" {
  * Per the design doc, an entry that exceeds every GPU budget spills to CPU;
  * by the monotonicity rule every entry after it also goes to CPU. There is
  * no error path for "entry too large" — the CPU tier is always available. */
-int ds4_compute_layer_placement(const size_t *entry_bytes,
+int ns4_compute_layer_placement(const size_t *entry_bytes,
                                 int n_entries,
-                                const ds4_layer_pack_config *cfg,
+                                const ns4_layer_pack_config *cfg,
                                 int *device_for_entry);
 
 /* Print a human-readable layout summary matching the design doc's format:
@@ -61,7 +61,7 @@ int ds4_compute_layer_placement(const size_t *entry_bytes,
  *
  * gpu_used_bytes[] and gpu_budget_bytes[] may be NULL — in that case the
  * "(used / budget)" line is omitted for the GPU lines. */
-void ds4_layer_pack_print(FILE *out,
+void ns4_layer_pack_print(FILE *out,
                           const int *device_for_entry,
                           int n_entries,
                           int n_layers,
@@ -74,4 +74,4 @@ void ds4_layer_pack_print(FILE *out,
 }
 #endif
 
-#endif /* DS4_LAYER_PACK_H */
+#endif /* NS4_LAYER_PACK_H */

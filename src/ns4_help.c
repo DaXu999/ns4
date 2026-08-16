@@ -1,4 +1,4 @@
-#include "ds4_help.h"
+#include "ns4_help.h"
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -100,64 +100,64 @@ static bool topic_is(const char *topic, const char *name) {
     return topic && strcmp(topic, name) == 0;
 }
 
-static const char *tool_name(ds4_help_tool tool) {
+static const char *tool_name(ns4_help_tool tool) {
     switch (tool) {
-    case DS4_HELP_DS4: return "ds4";
-    case DS4_HELP_SERVER: return "ds4-server";
-    case DS4_HELP_AGENT: return "ds4-agent";
-    case DS4_HELP_BENCH: return "ds4-bench";
-    case DS4_HELP_EVAL: return "ds4-eval";
+    case NS4_HELP_NS4: return "ns4";
+    case NS4_HELP_SERVER: return "ns4-server";
+    case NS4_HELP_AGENT: return "ns4-agent";
+    case NS4_HELP_BENCH: return "ns4-bench";
+    case NS4_HELP_EVAL: return "ns4-eval";
     }
-    return "ds4";
+    return "ns4";
 }
 
-static const char *tool_usage(ds4_help_tool tool) {
+static const char *tool_usage(ns4_help_tool tool) {
     switch (tool) {
-    case DS4_HELP_DS4:
-        return "Usage: ds4 [(-p PROMPT | --prompt-file FILE)] [options]";
-    case DS4_HELP_SERVER:
-        return "Usage: ds4-server [options]";
-    case DS4_HELP_AGENT:
-        return "Usage: ds4-agent [options]";
-    case DS4_HELP_BENCH:
-        return "Usage: ds4-bench (--prompt-file FILE | --chat-prompt-file FILE) [options]";
-    case DS4_HELP_EVAL:
-        return "Usage: ds4-eval [options]";
+    case NS4_HELP_NS4:
+        return "Usage: ns4 [(-p PROMPT | --prompt-file FILE)] [options]";
+    case NS4_HELP_SERVER:
+        return "Usage: ns4-server [options]";
+    case NS4_HELP_AGENT:
+        return "Usage: ns4-agent [options]";
+    case NS4_HELP_BENCH:
+        return "Usage: ns4-bench (--prompt-file FILE | --chat-prompt-file FILE) [options]";
+    case NS4_HELP_EVAL:
+        return "Usage: ns4-eval [options]";
     }
-    return "Usage: ds4 [options]";
+    return "Usage: ns4 [options]";
 }
 
-static const char *tool_summary(ds4_help_tool tool) {
+static const char *tool_summary(ns4_help_tool tool) {
     switch (tool) {
-    case DS4_HELP_DS4:
+    case NS4_HELP_NS4:
         return "Chat with a local DwarfStar model, run one-shot prompts, inspect models, or coordinate distributed inference.";
-    case DS4_HELP_SERVER:
+    case NS4_HELP_SERVER:
         return "Serve one loaded DwarfStar model through OpenAI, Responses, Anthropic, and completion-compatible HTTP APIs.";
-    case DS4_HELP_AGENT:
+    case NS4_HELP_AGENT:
         return "Run the native terminal coding agent with live tools, session save/restore, and a responsive prompt while the model works.";
-    case DS4_HELP_BENCH:
+    case NS4_HELP_BENCH:
         return "Measure prefill, decode, context growth, and KV-cache size across repeatable context frontiers.";
-    case DS4_HELP_EVAL:
+    case NS4_HELP_EVAL:
         return "Run the built-in reasoning, math, science, and security evaluation harness with a live terminal UI.";
     }
     return "";
 }
 
 static void print_model_runtime(FILE *fp, const help_colors *c,
-                                ds4_help_tool tool, bool full) {
+                                ns4_help_tool tool, bool full) {
     title(fp, c, "Model And Runtime");
-    opt(fp, c, "-m, --model FILE", "GGUF model path. Default: ds4flash.gguf");
+    opt(fp, c, "-m, --model FILE", "GGUF model path. Default: ns4flash.gguf");
     opt(fp, c, "--cuda | --cpu", "Select the backend explicitly.");
     opt(fp, c, "--backend NAME", "Backend name: cuda or cpu.");
     opt(fp, c, "--gpu-vram N[,N,...]|auto", "CUDA VRAM budgets per device, in GiB, or auto-detect free VRAM.");
     opt(fp, c, "--gpu-devices N[,N,...]", "CUDA device indices used by multi-GPU placement.");
-    if (tool != DS4_HELP_EVAL) {
+    if (tool != NS4_HELP_EVAL) {
         opt(fp, c, "--cuda-tensor-parallel", "Enable the paired DeepSeek tensor/expert path on an even multi-GPU CUDA placement.");
     }
-    if (tool != DS4_HELP_BENCH) {
+    if (tool != NS4_HELP_BENCH) {
         opt(fp, c, "-c, --ctx N", "Allocated context tokens.");
     }
-    if (tool == DS4_HELP_SERVER) {
+    if (tool == NS4_HELP_SERVER) {
         opt(fp, c, "-n, --tokens N", "Default max output tokens when clients omit a limit.");
     }
     opt(fp, c, "-t, --threads N", "CPU helper threads for host-side/reference work.");
@@ -169,10 +169,10 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");
     opt(fp, c, "--prefill-chunk N", "Graph prefill chunk size. Default: CUDA TP 2048; PRO long prompts 8192; others 4096.");
     if (full) {
-        if (tool != DS4_HELP_BENCH) {
+        if (tool != NS4_HELP_BENCH) {
             opt(fp, c, "--mtp FILE", "Optional MTP support GGUF used for draft-token probes.");
         }
-        if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
+        if (tool == NS4_HELP_NS4 || tool == NS4_HELP_AGENT || tool == NS4_HELP_SERVER) {
             opt(fp, c, "--mtp-draft N", "Maximum autoregressive MTP draft tokens. Default: 1");
             opt(fp, c, "--mtp-margin F", "Verifier confidence margin for fast MTP acceptance. Default: 3");
             opt(fp, c, "--dspark", "Enable DSpark using the support GGUF passed with --mtp.");
@@ -181,7 +181,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
         }
         opt(fp, c, "--quality", "Prefer exact kernels where faster approximate paths exist.");
         opt(fp, c, "--warm-weights", "Touch mapped tensor pages at startup to reduce first-use stalls.");
-        if (tool == DS4_HELP_DS4 || tool == DS4_HELP_BENCH) {
+        if (tool == NS4_HELP_NS4 || tool == NS4_HELP_BENCH) {
             opt(fp, c, "--expert-profile FILE", "Write routed expert locality/cache simulation JSON.");
         }
     }
@@ -236,9 +236,9 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c);
 
 static void print_cli_specific(FILE *fp, const help_colors *c, bool full) {
     title(fp, c, "CLI Modes");
-    opt(fp, c, "ds4", "Start the interactive prompt.");
-    opt(fp, c, "ds4 -p TEXT", "Run one prompt and exit.");
-    opt(fp, c, "ds4 --prompt-file FILE", "Run a long prompt from a file and exit.");
+    opt(fp, c, "ns4", "Start the interactive prompt.");
+    opt(fp, c, "ns4 -p TEXT", "Run one prompt and exit.");
+    opt(fp, c, "ns4 --prompt-file FILE", "Run a long prompt from a file and exit.");
     fputc('\n', fp);
     if (full) {
         print_cli_diagnostics(fp, c);
@@ -275,7 +275,7 @@ static void print_cli_commands(FILE *fp, const help_colors *c) {
     opt(fp, c, "/power N", "Set GPU duty cycle percentage, 1..100.");
     opt(fp, c, "/read FILE", "Read FILE and submit it as the next user message.");
     opt(fp, c, "/quit, /exit", "Leave the prompt.");
-    opt(fp, c, "Ctrl+C", "Stop current generation and return to ds4>.");
+    opt(fp, c, "Ctrl+C", "Stop current generation and return to ns4>.");
     fputc('\n', fp);
 }
 
@@ -292,7 +292,7 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
 
 static void print_agent_sessions(FILE *fp, const help_colors *c) {
     title(fp, c, "Agent Runtime Commands");
-    opt(fp, c, "/save", "Save the current session in ~/.ds4/kvcache.");
+    opt(fp, c, "/save", "Save the current session in ~/.ns4/kvcache.");
     opt(fp, c, "/compact", "Compact the current session context now.");
     opt(fp, c, "/list", "List saved sessions, sorted by recent update time.");
     opt(fp, c, "/switch ID", "Load a saved session and show recent history.");
@@ -377,24 +377,24 @@ static void print_eval_specific(FILE *fp, const help_colors *c) {
     fputc('\n', fp);
 }
 
-static bool tool_has_topic(ds4_help_tool tool, const char *topic) {
+static bool tool_has_topic(ns4_help_tool tool, const char *topic) {
     if (!topic) return true;
     if (streq(topic, "all")) return true;
     if (streq(topic, "runtime") || streq(topic, "distributed")) return true;
     if (streq(topic, "sampling"))
-        return tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_EVAL;
+        return tool == NS4_HELP_NS4 || tool == NS4_HELP_AGENT || tool == NS4_HELP_EVAL;
     if (streq(topic, "steering"))
-        return tool == DS4_HELP_DS4 || tool == DS4_HELP_SERVER || tool == DS4_HELP_AGENT;
+        return tool == NS4_HELP_NS4 || tool == NS4_HELP_SERVER || tool == NS4_HELP_AGENT;
     switch (tool) {
-    case DS4_HELP_DS4:
+    case NS4_HELP_NS4:
         return streq(topic, "diagnostics") || streq(topic, "commands");
-    case DS4_HELP_SERVER:
+    case NS4_HELP_SERVER:
         return streq(topic, "api") || streq(topic, "kv-cache") || streq(topic, "thinking");
-    case DS4_HELP_AGENT:
+    case NS4_HELP_AGENT:
         return streq(topic, "sessions") || streq(topic, "commands") || streq(topic, "tools");
-    case DS4_HELP_BENCH:
+    case NS4_HELP_BENCH:
         return streq(topic, "benchmark");
-    case DS4_HELP_EVAL:
+    case NS4_HELP_EVAL:
         return streq(topic, "evaluation");
     }
     return false;
@@ -412,7 +412,7 @@ static void more_line(FILE *fp, const help_colors *c, const char *label, const c
     fprintf(fp, "    %s%-26s%s --help %s\n", on, label, off, topic);
 }
 
-static void print_more_info(FILE *fp, const help_colors *c, ds4_help_tool tool) {
+static void print_more_info(FILE *fp, const help_colors *c, ns4_help_tool tool) {
     title(fp, c, "More Info");
     more_line(fp, c, "Runtime full info:", "runtime");
     if (tool_has_topic(tool, "sampling"))
@@ -420,87 +420,87 @@ static void print_more_info(FILE *fp, const help_colors *c, ds4_help_tool tool) 
     more_line(fp, c, "Distributed inference:", "distributed");
     if (tool_has_topic(tool, "steering"))
         more_line(fp, c, "Steering full info:", "steering");
-    if (tool == DS4_HELP_DS4) {
+    if (tool == NS4_HELP_NS4) {
         more_line(fp, c, "Interactive commands:", "commands");
         more_line(fp, c, "Diagnostics:", "diagnostics");
-    } else if (tool == DS4_HELP_SERVER) {
+    } else if (tool == NS4_HELP_SERVER) {
         more_line(fp, c, "HTTP API:", "api");
         more_line(fp, c, "Disk KV cache:", "kv-cache");
         more_line(fp, c, "Thinking behavior:", "thinking");
-    } else if (tool == DS4_HELP_AGENT) {
+    } else if (tool == NS4_HELP_AGENT) {
         more_line(fp, c, "Agent sessions:", "sessions");
         more_line(fp, c, "Agent commands:", "commands");
         more_line(fp, c, "Agent tool system:", "tools");
-    } else if (tool == DS4_HELP_BENCH) {
+    } else if (tool == NS4_HELP_BENCH) {
         more_line(fp, c, "Benchmark sweep:", "benchmark");
-    } else if (tool == DS4_HELP_EVAL) {
+    } else if (tool == NS4_HELP_EVAL) {
         more_line(fp, c, "Evaluation options:", "evaluation");
     }
     fputc('\n', fp);
 }
 
-static void print_examples(FILE *fp, const help_colors *c, ds4_help_tool tool, const char *topic) {
+static void print_examples(FILE *fp, const help_colors *c, ns4_help_tool tool, const char *topic) {
     title(fp, c, "Examples");
     if (topic_is(topic, "distributed")) {
-        opt(fp, c, "worker", "./ds4 --role worker --layers 21:output --coordinator 192.168.0.181 9000 -m ds4flash.gguf");
-        opt(fp, c, "coordinator", "./ds4 --role coordinator --layers 0:20 --listen 0.0.0.0 9000 -p \"Hello\" -m ds4flash.gguf");
+        opt(fp, c, "worker", "./ns4 --role worker --layers 21:output --coordinator 192.168.0.181 9000 -m ns4flash.gguf");
+        opt(fp, c, "coordinator", "./ns4 --role coordinator --layers 0:20 --listen 0.0.0.0 9000 -p \"Hello\" -m ns4flash.gguf");
     } else if (topic_is(topic, "runtime")) {
-        if (tool == DS4_HELP_SERVER) {
-            opt(fp, c, "quiet API", "./ds4-server --power 60 --host 127.0.0.1 --port 8000");
-        } else if (tool == DS4_HELP_AGENT) {
-            opt(fp, c, "agent", "./ds4-agent -m ds4flash.gguf --ctx 100000");
-            opt(fp, c, "quiet agent", "./ds4-agent --power 50");
-        } else if (tool == DS4_HELP_BENCH) {
-            opt(fp, c, "bench", "./ds4-bench --prompt-file long.txt --ctx-max 32768");
-            opt(fp, c, "quiet bench", "./ds4-bench --prompt-file long.txt --power 70");
-        } else if (tool == DS4_HELP_EVAL) {
-            opt(fp, c, "eval", "./ds4-eval --questions 10 --ctx 100000");
-            opt(fp, c, "CPU debug", "./ds4-eval --cpu --questions 1 --tokens 32");
+        if (tool == NS4_HELP_SERVER) {
+            opt(fp, c, "quiet API", "./ns4-server --power 60 --host 127.0.0.1 --port 8000");
+        } else if (tool == NS4_HELP_AGENT) {
+            opt(fp, c, "agent", "./ns4-agent -m ns4flash.gguf --ctx 100000");
+            opt(fp, c, "quiet agent", "./ns4-agent --power 50");
+        } else if (tool == NS4_HELP_BENCH) {
+            opt(fp, c, "bench", "./ns4-bench --prompt-file long.txt --ctx-max 32768");
+            opt(fp, c, "quiet bench", "./ns4-bench --prompt-file long.txt --power 70");
+        } else if (tool == NS4_HELP_EVAL) {
+            opt(fp, c, "eval", "./ns4-eval --questions 10 --ctx 100000");
+            opt(fp, c, "CPU debug", "./ns4-eval --cpu --questions 1 --tokens 32");
         } else {
-            opt(fp, c, "CUDA", "./ds4 -m ds4flash.gguf --cuda -c 100000");
-            opt(fp, c, "quiet thermals", "./ds4 -p \"Summarize README\" --power 50");
+            opt(fp, c, "CUDA", "./ns4 -m ns4flash.gguf --cuda -c 100000");
+            opt(fp, c, "quiet thermals", "./ns4 -p \"Summarize README\" --power 50");
         }
     } else if (topic_is(topic, "steering")) {
-        opt(fp, c, "steer FFN", "./ds4 -p \"Write tersely\" --dir-steering-file dir.bin --dir-steering-ffn 0.8");
-    } else if (tool == DS4_HELP_SERVER || topic_is(topic, "api") || topic_is(topic, "kv-cache")) {
-        opt(fp, c, "local API", "./ds4-server --ctx 100000 --kv-disk-dir ~/.ds4/server-kv --kv-disk-space-mb 8192");
+        opt(fp, c, "steer FFN", "./ns4 -p \"Write tersely\" --dir-steering-file dir.bin --dir-steering-ffn 0.8");
+    } else if (tool == NS4_HELP_SERVER || topic_is(topic, "api") || topic_is(topic, "kv-cache")) {
+        opt(fp, c, "local API", "./ns4-server --ctx 100000 --kv-disk-dir ~/.ns4/server-kv --kv-disk-space-mb 8192");
         opt(fp, c, "curl", "curl http://127.0.0.1:8000/v1/models");
-    } else if (tool == DS4_HELP_AGENT || topic_is(topic, "sessions") || topic_is(topic, "tools")) {
-        opt(fp, c, "interactive", "./ds4-agent");
-        opt(fp, c, "one shot", "./ds4-agent --non-interactive -p \"Create /tmp/hello.c\"");
-    } else if (tool == DS4_HELP_BENCH || topic_is(topic, "benchmark")) {
-        opt(fp, c, "csv", "./ds4-bench --prompt-file long.txt --ctx-max 32768 --csv speed.csv");
-        opt(fp, c, "prefill only", "./ds4-bench --prompt-file long.txt --gen-tokens 0");
-    } else if (tool == DS4_HELP_EVAL || topic_is(topic, "evaluation")) {
-        opt(fp, c, "first 10", "./ds4-eval --questions 10 --trace eval.trace");
-        opt(fp, c, "plain", "./ds4-eval --plain --nothink --tokens 512");
+    } else if (tool == NS4_HELP_AGENT || topic_is(topic, "sessions") || topic_is(topic, "tools")) {
+        opt(fp, c, "interactive", "./ns4-agent");
+        opt(fp, c, "one shot", "./ns4-agent --non-interactive -p \"Create /tmp/hello.c\"");
+    } else if (tool == NS4_HELP_BENCH || topic_is(topic, "benchmark")) {
+        opt(fp, c, "csv", "./ns4-bench --prompt-file long.txt --ctx-max 32768 --csv speed.csv");
+        opt(fp, c, "prefill only", "./ns4-bench --prompt-file long.txt --gen-tokens 0");
+    } else if (tool == NS4_HELP_EVAL || topic_is(topic, "evaluation")) {
+        opt(fp, c, "first 10", "./ns4-eval --questions 10 --trace eval.trace");
+        opt(fp, c, "plain", "./ns4-eval --plain --nothink --tokens 512");
     } else {
-        opt(fp, c, "chat", "./ds4");
-        opt(fp, c, "one shot", "./ds4 -p \"Explain mmap in C\"");
-        opt(fp, c, "long prompt", "./ds4 --think-max --prompt-file prompt.txt --ctx 393216");
+        opt(fp, c, "chat", "./ns4");
+        opt(fp, c, "one shot", "./ns4 -p \"Explain mmap in C\"");
+        opt(fp, c, "long prompt", "./ns4 --think-max --prompt-file prompt.txt --ctx 393216");
     }
     fputc('\n', fp);
 }
 
-static void print_topic(FILE *fp, const help_colors *c, ds4_help_tool tool, const char *topic) {
+static void print_topic(FILE *fp, const help_colors *c, ns4_help_tool tool, const char *topic) {
     if (streq(topic, "all")) {
         print_model_runtime(fp, c, tool, true);
         if (tool_has_topic(tool, "sampling")) print_sampling(fp, c, true);
         if (tool_has_topic(tool, "steering")) print_steering(fp, c);
         print_distributed(fp, c);
-        if (tool == DS4_HELP_DS4) {
+        if (tool == NS4_HELP_NS4) {
             print_cli_specific(fp, c, true);
             print_cli_commands(fp, c);
-        } else if (tool == DS4_HELP_SERVER) {
+        } else if (tool == NS4_HELP_SERVER) {
             print_server_api(fp, c);
             print_server_thinking(fp, c);
             print_kv_cache(fp, c);
-        } else if (tool == DS4_HELP_AGENT) {
+        } else if (tool == NS4_HELP_AGENT) {
             print_agent_specific(fp, c);
             print_agent_sessions(fp, c);
-        } else if (tool == DS4_HELP_BENCH) {
+        } else if (tool == NS4_HELP_BENCH) {
             print_bench_specific(fp, c);
-        } else if (tool == DS4_HELP_EVAL) {
+        } else if (tool == NS4_HELP_EVAL) {
             print_eval_specific(fp, c);
         }
         return;
@@ -510,43 +510,43 @@ static void print_topic(FILE *fp, const help_colors *c, ds4_help_tool tool, cons
     else if (streq(topic, "sampling")) print_sampling(fp, c, true);
     else if (streq(topic, "steering")) print_steering(fp, c);
     else if (streq(topic, "distributed")) print_distributed(fp, c);
-    else if (tool == DS4_HELP_DS4 && streq(topic, "diagnostics")) print_cli_diagnostics(fp, c);
-    else if (tool == DS4_HELP_DS4 && streq(topic, "commands")) print_cli_commands(fp, c);
-    else if (tool == DS4_HELP_SERVER && streq(topic, "api")) print_server_api(fp, c);
-    else if (tool == DS4_HELP_SERVER && streq(topic, "kv-cache")) print_kv_cache(fp, c);
-    else if (tool == DS4_HELP_SERVER && streq(topic, "thinking")) print_server_thinking(fp, c);
-    else if (tool == DS4_HELP_AGENT && streq(topic, "sessions")) print_agent_sessions(fp, c);
-    else if (tool == DS4_HELP_AGENT && streq(topic, "commands")) print_agent_sessions(fp, c);
-    else if (tool == DS4_HELP_AGENT && streq(topic, "tools")) {
+    else if (tool == NS4_HELP_NS4 && streq(topic, "diagnostics")) print_cli_diagnostics(fp, c);
+    else if (tool == NS4_HELP_NS4 && streq(topic, "commands")) print_cli_commands(fp, c);
+    else if (tool == NS4_HELP_SERVER && streq(topic, "api")) print_server_api(fp, c);
+    else if (tool == NS4_HELP_SERVER && streq(topic, "kv-cache")) print_kv_cache(fp, c);
+    else if (tool == NS4_HELP_SERVER && streq(topic, "thinking")) print_server_thinking(fp, c);
+    else if (tool == NS4_HELP_AGENT && streq(topic, "sessions")) print_agent_sessions(fp, c);
+    else if (tool == NS4_HELP_AGENT && streq(topic, "commands")) print_agent_sessions(fp, c);
+    else if (tool == NS4_HELP_AGENT && streq(topic, "tools")) {
         title(fp, c, "Agent Tool System");
         para(fp, c, "The agent can read, search, write, edit, run bash, and browse through Chrome-backed web tools.");
         para(fp, c, "The model emits DSML tool calls, rendered live in the terminal.");
         para(fp, c, "Edit uses exact old/new replacement; [upto] can bridge a unique head and tail for large anchored edits.");
         fputc('\n', fp);
-    } else if (tool == DS4_HELP_BENCH && streq(topic, "benchmark")) print_bench_specific(fp, c);
-    else if (tool == DS4_HELP_EVAL && streq(topic, "evaluation")) print_eval_specific(fp, c);
+    } else if (tool == NS4_HELP_BENCH && streq(topic, "benchmark")) print_bench_specific(fp, c);
+    else if (tool == NS4_HELP_EVAL && streq(topic, "evaluation")) print_eval_specific(fp, c);
 }
 
-static void print_default(FILE *fp, const help_colors *c, ds4_help_tool tool) {
+static void print_default(FILE *fp, const help_colors *c, ns4_help_tool tool) {
     print_model_runtime(fp, c, tool, false);
 
-    if (tool == DS4_HELP_DS4) {
+    if (tool == NS4_HELP_NS4) {
         print_cli_specific(fp, c, true);
         print_sampling(fp, c, false);
-    } else if (tool == DS4_HELP_SERVER) {
+    } else if (tool == NS4_HELP_SERVER) {
         print_server_api(fp, c);
         print_kv_cache(fp, c);
-    } else if (tool == DS4_HELP_AGENT) {
+    } else if (tool == NS4_HELP_AGENT) {
         print_agent_specific(fp, c);
         print_agent_sessions(fp, c);
-    } else if (tool == DS4_HELP_BENCH) {
+    } else if (tool == NS4_HELP_BENCH) {
         print_bench_specific(fp, c);
-    } else if (tool == DS4_HELP_EVAL) {
+    } else if (tool == NS4_HELP_EVAL) {
         print_eval_specific(fp, c);
     }
 }
 
-void ds4_help_print(FILE *fp, ds4_help_tool tool, const char *topic) {
+void ns4_help_print(FILE *fp, ns4_help_tool tool, const char *topic) {
     help_colors c = help_make_colors(fp);
     if (topic && !tool_has_topic(tool, topic)) {
         fprintf(fp, "%s: unknown help topic '%s'\n\n", tool_name(tool), topic);

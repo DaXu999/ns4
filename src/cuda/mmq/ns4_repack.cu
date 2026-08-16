@@ -1,10 +1,10 @@
-/* ds4_repack: shared aligned-artifact layout library.  See ds4_repack.h for
- * the API surface and tools/ds4_weight_server.cu for the original home of
+/* ns4_repack: shared aligned-artifact layout library.  See ns4_repack.h for
+ * the API surface and tools/ns4_weight_server.cu for the original home of
  * this code (extracted 2026-07 so self-load boots build the same artifacts
  * in-process).  Every byte-movement and kernel here must stay bit-identical
  * between the weight-server and in-process producers — the FNV repack-hash
  * lines are the gate. */
-#include "ds4_repack.h"
+#include "ns4_repack.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -49,7 +49,7 @@ static void *repack_align_ptr(void *ptr, uint64_t align) {
 
 /* ---- file mapping + GGUF catalog ---------------------------------------- */
 
-bool ds4_repack_map_file(const char *log_prefix, const char *path, ds4_repack_file &m) {
+bool ns4_repack_map_file(const char *log_prefix, const char *path, ns4_repack_file &m) {
     m.fd = open(path, O_RDONLY);
     if (m.fd < 0) {
         fprintf(stderr, "%s: open failed %s: %s\n", log_prefix, path, strerror(errno));
@@ -65,7 +65,7 @@ bool ds4_repack_map_file(const char *log_prefix, const char *path, ds4_repack_fi
     m.size = (uint64_t)st.st_size;
     if (st.st_blksize > 1) m.direct_align = (uint64_t)st.st_blksize;
 #if defined(__linux__) && defined(O_DIRECT)
-    if (getenv("DS4_CUDA_NO_DIRECT_IO") == nullptr) {
+    if (getenv("NS4_CUDA_NO_DIRECT_IO") == nullptr) {
         char proc_path[64];
         snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", m.fd);
         int direct_fd = open(proc_path, O_RDONLY | O_DIRECT);
@@ -90,34 +90,34 @@ bool ds4_repack_map_file(const char *log_prefix, const char *path, ds4_repack_fi
     return true;
 }
 
-void ds4_repack_unmap_file(ds4_repack_file &m) {
+void ns4_repack_unmap_file(ns4_repack_file &m) {
     if (m.data) munmap((void *)m.data, (size_t)m.size);
     if (m.direct_fd >= 0) close(m.direct_fd);
     if (m.fd >= 0) close(m.fd);
     m = {};
 }
 
-static bool read_u32(const ds4_repack_file &m, uint64_t &pos, uint32_t &out) {
+static bool read_u32(const ns4_repack_file &m, uint64_t &pos, uint32_t &out) {
     if (pos > m.size || m.size - pos < 4) return false;
     memcpy(&out, m.data + pos, 4);
     pos += 4;
     return true;
 }
 
-static bool read_u64(const ds4_repack_file &m, uint64_t &pos, uint64_t &out) {
+static bool read_u64(const ns4_repack_file &m, uint64_t &pos, uint64_t &out) {
     if (pos > m.size || m.size - pos < 8) return false;
     memcpy(&out, m.data + pos, 8);
     pos += 8;
     return true;
 }
 
-static bool skip_bytes(const ds4_repack_file &m, uint64_t &pos, uint64_t n) {
+static bool skip_bytes(const ns4_repack_file &m, uint64_t &pos, uint64_t n) {
     if (pos > m.size || n > m.size - pos) return false;
     pos += n;
     return true;
 }
 
-static bool read_string(const ds4_repack_file &m, uint64_t &pos, std::string &out) {
+static bool read_string(const ns4_repack_file &m, uint64_t &pos, std::string &out) {
     uint64_t len = 0;
     if (!read_u64(m, pos, len) || len > m.size || pos > m.size || len > m.size - pos) return false;
     out.assign((const char *)m.data + pos, (size_t)len);
@@ -142,9 +142,9 @@ static uint64_t gguf_scalar_size(uint32_t type) {
     }
 }
 
-static bool skip_metadata_value(const ds4_repack_file &m, uint64_t &pos, uint32_t type);
+static bool skip_metadata_value(const ns4_repack_file &m, uint64_t &pos, uint32_t type);
 
-static bool skip_array(const ds4_repack_file &m, uint64_t &pos) {
+static bool skip_array(const ns4_repack_file &m, uint64_t &pos) {
     uint32_t elem_type = 0;
     uint64_t len = 0;
     if (!read_u32(m, pos, elem_type) || !read_u64(m, pos, len)) return false;
@@ -160,7 +160,7 @@ static bool skip_array(const ds4_repack_file &m, uint64_t &pos) {
     return skip_bytes(m, pos, len * elem_size);
 }
 
-static bool skip_metadata_value(const ds4_repack_file &m, uint64_t &pos, uint32_t type) {
+static bool skip_metadata_value(const ns4_repack_file &m, uint64_t &pos, uint32_t type) {
     if (type == 8) {
         std::string tmp;
         return read_string(m, pos, tmp);
@@ -205,10 +205,10 @@ static bool tensor_type_info(uint32_t type, uint64_t &block_elems, uint64_t &blo
     }
 }
 
-bool ds4_repack_collect_catalog(const char *log_prefix,
-                                const ds4_repack_file &m,
-                                std::vector<ds4_repack_span> *spans,
-                                std::vector<ds4_repack_tensor> *records) {
+bool ns4_repack_collect_catalog(const char *log_prefix,
+                                const ns4_repack_file &m,
+                                std::vector<ns4_repack_span> *spans,
+                                std::vector<ns4_repack_tensor> *records) {
     uint64_t pos = 0;
     uint32_t magic = 0, version = 0;
     uint64_t n_tensors = 0, n_kv = 0;
@@ -235,10 +235,10 @@ bool ds4_repack_collect_catalog(const char *log_prefix,
         }
     }
 
-    std::vector<ds4_repack_tensor> tensors;
+    std::vector<ns4_repack_tensor> tensors;
     tensors.reserve((size_t)n_tensors);
     for (uint64_t i = 0; i < n_tensors; i++) {
-        ds4_repack_tensor t;
+        ns4_repack_tensor t;
         uint32_t ndim = 0;
         if (!read_string(m, pos, t.name) || !read_u32(m, pos, ndim) || ndim > 8) return false;
         t.ndim = ndim;
@@ -275,7 +275,7 @@ bool ds4_repack_collect_catalog(const char *log_prefix,
     }
     if (records) records->clear();
     if (records) records->reserve(tensors.size());
-    for (ds4_repack_tensor &t : tensors) {
+    for (ns4_repack_tensor &t : tensors) {
         if (t.off > UINT64_MAX - tensor_data_pos) return false;
         const uint64_t off = tensor_data_pos + t.off;
         if (off > m.size || t.bytes > m.size - off) return false;
@@ -288,7 +288,7 @@ bool ds4_repack_collect_catalog(const char *log_prefix,
 
 /* ---- staged file reads --------------------------------------------------- */
 
-bool ds4_repack_pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset) {
+bool ns4_repack_pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset) {
     uint64_t done = 0;
     while (done < bytes) {
         const size_t req = bytes - done > (uint64_t)SSIZE_MAX ? (size_t)SSIZE_MAX : (size_t)(bytes - done);
@@ -303,7 +303,7 @@ bool ds4_repack_pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset) {
     return true;
 }
 
-bool ds4_repack_read_stage(const ds4_repack_file &m, void *stage, uint64_t stage_bytes,
+bool ns4_repack_read_stage(const ns4_repack_file &m, void *stage, uint64_t stage_bytes,
                            uint64_t file_off, uint64_t bytes, const char **payload) {
     *payload = (const char *)stage;
 #if defined(__linux__) && defined(O_DIRECT)
@@ -314,7 +314,7 @@ bool ds4_repack_read_stage(const ds4_repack_file &m, void *stage, uint64_t stage
         if (aligned_off <= m.size && read_size <= stage_bytes && read_size <= m.size - aligned_off) {
             const int saved_errno = errno;
             errno = 0;
-            if (ds4_repack_pread_full(m.direct_fd, stage, read_size, aligned_off)) {
+            if (ns4_repack_pread_full(m.direct_fd, stage, read_size, aligned_off)) {
                 *payload = (const char *)stage + delta;
                 errno = saved_errno;
                 return true;
@@ -326,7 +326,7 @@ bool ds4_repack_read_stage(const ds4_repack_file &m, void *stage, uint64_t stage
 #else
     (void)stage_bytes;
 #endif
-    return ds4_repack_pread_full(m.fd, stage, bytes, file_off);
+    return ns4_repack_pread_full(m.fd, stage, bytes, file_off);
 }
 
 /* ---- aligned repack kernels ---------------------------------------------- */
@@ -421,7 +421,7 @@ __global__ static void repack_q8_0_aligned_kernel(
 }
 
 /* One thread per dequantized element of the staged chunk.  Math is the
- * engine's lazy dequant_q8_0_to_f16_kernel (ds4_cuda.cu) verbatim -- the
+ * engine's lazy dequant_q8_0_to_f16_kernel (ns4_cuda.cu) verbatim -- the
  * first-touch cache and this prebuild must stay bit-identical.  The full
  * tensor's f16 element order is exactly (raw block index)*32 + code index,
  * so chunking at 34-byte block granularity preserves every element's
@@ -444,7 +444,7 @@ __global__ static void dequant_q8_0_f16_colmajor_kernel(
 
 /* --repack-iq2-aligned candidates: routed-expert gate/up stacks in IQ2_XXS.
  * dims[0] % 1024: the aligned decode kernel covers 4 blocks per warp pass. */
-bool ds4_repack_iq2_candidate(const ds4_repack_tensor &t) {
+bool ns4_repack_iq2_candidate(const ns4_repack_tensor &t) {
     if (t.type != 16u || t.ndim != 3u) return false; /* GGML_TYPE_IQ2_XXS */
     if (t.dims[0] == 0 || t.dims[1] == 0 || t.dims[2] == 0 || t.dims[2] > UINT32_MAX) return false;
     if (t.dims[0] % 1024u != 0) return false;
@@ -462,7 +462,7 @@ bool ds4_repack_iq2_candidate(const ds4_repack_tensor &t) {
 /* --repack-q2k-aligned candidates: routed-expert down stacks in Q2_K.
  * dims[0] % 256 (whole superblocks per row) and dims[1] % 2 (the layout pairs
  * adjacent rows). */
-bool ds4_repack_q2k_candidate(const ds4_repack_tensor &t) {
+bool ns4_repack_q2k_candidate(const ns4_repack_tensor &t) {
     if (t.type != 10u || t.ndim != 3u) return false; /* GGML_TYPE_Q2_K */
     if (t.dims[0] == 0 || t.dims[1] == 0 || t.dims[2] == 0 || t.dims[2] > UINT32_MAX) return false;
     if (t.dims[0] % 256u != 0 || t.dims[1] % 2u != 0) return false;
@@ -478,7 +478,7 @@ bool ds4_repack_q2k_candidate(const ds4_repack_tensor &t) {
  * K % 1024 constraint.  token_embd is excluded: it is consumed by row-gather,
  * never by the dense GEMV.  Unlike the IQ2 expert repack these artifacts are
  * ADDITIVE (raw stays served). */
-bool ds4_repack_q8_candidate(const ds4_repack_tensor &t) {
+bool ns4_repack_q8_candidate(const ns4_repack_tensor &t) {
     if (t.type != 8u || t.ndim != 2u) return false; /* GGML_TYPE_Q8_0 */
     if (t.dims[0] == 0 || t.dims[1] == 0) return false;
     if (t.dims[0] % 1024u != 0) return false;
@@ -493,7 +493,7 @@ bool ds4_repack_q8_candidate(const ds4_repack_tensor &t) {
  * cuda_q8_f16_ptr cache): the packed-out_a prefill weights.  The runtime
  * admission gate admits more labels, but attn_output_a is the set the ship
  * config actually first-touch-builds on the fast paths. */
-bool ds4_repack_q8_f16_candidate(const ds4_repack_tensor &t) {
+bool ns4_repack_q8_f16_candidate(const ns4_repack_tensor &t) {
     if (t.type != 8u || t.ndim != 2u) return false; /* GGML_TYPE_Q8_0 */
     if (t.dims[0] == 0 || t.dims[1] == 0) return false;
     if (t.dims[0] % 32u != 0) return false;
@@ -510,24 +510,24 @@ bool ds4_repack_q8_f16_candidate(const ds4_repack_tensor &t) {
  * the NVMe at queue depth = nthreads while uploads/kernels overlap other
  * workers' reads.  Allocation (VMM reservation order) and artifact push stay
  * on the caller thread so range layout is thread-count-invariant; only the
- * byte movement fans out.  --repack-threads N / DS4_WS_REPACK_THREADS
+ * byte movement fans out.  --repack-threads N / NS4_WS_REPACK_THREADS
  * overrides (1 = the old serial order through the new plumbing);
- * --repack-hash / DS4_WS_REPACK_HASH=1 prints a per-artifact FNV-1a for the
+ * --repack-hash / NS4_WS_REPACK_HASH=1 prints a per-artifact FNV-1a for the
  * bit-identity gate. */
 static int g_repack_threads = 0;   /* 0 = auto (min(6, hw)) */
 static int g_repack_hash = -1;     /* -1 = read env on first use */
 
-void ds4_repack_set_threads(int n) {
+void ns4_repack_set_threads(int n) {
     g_repack_threads = n;
 }
 
-void ds4_repack_set_hash(bool on) {
+void ns4_repack_set_hash(bool on) {
     g_repack_hash = on ? 1 : 0;
 }
 
 static bool repack_hash_enabled(void) {
     if (g_repack_hash < 0) {
-        const char *rh = getenv("DS4_WS_REPACK_HASH");
+        const char *rh = getenv("NS4_WS_REPACK_HASH");
         g_repack_hash = (rh && rh[0] == '1' && rh[1] == '\0') ? 1 : 0;
     }
     return g_repack_hash == 1;
@@ -536,7 +536,7 @@ static bool repack_hash_enabled(void) {
 static int repack_thread_count(size_t njobs) {
     int n = g_repack_threads;
     if (n <= 0) {
-        const char *e = getenv("DS4_WS_REPACK_THREADS");
+        const char *e = getenv("NS4_WS_REPACK_THREADS");
         n = e && e[0] ? atoi(e) : 0;
     }
     if (n <= 0) {
@@ -549,11 +549,11 @@ static int repack_thread_count(size_t njobs) {
 }
 
 struct repack_job {
-    ds4_repack_artifact art;
+    ns4_repack_artifact art;
     uint64_t chunk;        /* kind-specific rounded chunk bytes */
 };
 
-uint64_t ds4_repack_fnv1a(const unsigned char *p, uint64_t n, uint64_t h) {
+uint64_t ns4_repack_fnv1a(const unsigned char *p, uint64_t n, uint64_t h) {
     for (uint64_t i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ull; }
     return h;
 }
@@ -563,7 +563,7 @@ uint64_t ds4_repack_fnv1a(const unsigned char *p, uint64_t n, uint64_t h) {
  * for O_DIRECT), scratch is device (>= max chunk).  Returns false if any job
  * failed; caller releases the job artifacts. */
 template <typename FN>
-static bool run_repack_jobs(const char *log_prefix, const char *what, const ds4_repack_file &m,
+static bool run_repack_jobs(const char *log_prefix, const char *what, const ns4_repack_file &m,
                             int device, std::vector<repack_job> &jobs, FN fn) {
     if (jobs.empty()) return true;
     uint64_t max_chunk = 0;
@@ -593,7 +593,7 @@ static bool run_repack_jobs(const char *log_prefix, const char *what, const ds4_
                 if (i >= jobs.size()) break;
                 if (!fn(jobs[i], stream, stage, stage_bytes, scratch)) { fail = true; break; }
                 if (hash) {
-                    const ds4_repack_artifact &r = jobs[i].art;
+                    const ns4_repack_artifact &r = jobs[i].art;
                     uint64_t h = 14695981039346656037ull;
                     for (uint64_t off = 0; off < r.bytes && !fail; off += max_chunk) {
                         const uint64_t nb = r.bytes - off < max_chunk ? r.bytes - off : max_chunk;
@@ -606,7 +606,7 @@ static bool run_repack_jobs(const char *log_prefix, const char *what, const ds4_
                             fail = true;
                             break;
                         }
-                        h = ds4_repack_fnv1a(stage, nb, h);
+                        h = ns4_repack_fnv1a(stage, nb, h);
                     }
                     if (!fail)
                         fprintf(stderr, "%s: repack-hash %s %s bytes=%llu fnv=%016llx\n",
@@ -628,12 +628,12 @@ static bool run_repack_jobs(const char *log_prefix, const char *what, const ds4_
 
 /* One chunk of one tensor: O_DIRECT read into stage, async H2D into scratch on
  * the worker stream; the caller launches its kind's kernel then stream-syncs. */
-static bool repack_read_upload(const char *log_prefix, const ds4_repack_file &m, const char *what,
-                               const ds4_repack_tensor &t,
+static bool repack_read_upload(const char *log_prefix, const ns4_repack_file &m, const char *what,
+                               const ns4_repack_tensor &t,
                                unsigned char *stage, uint64_t stage_bytes, unsigned char *scratch,
                                uint64_t done, uint64_t nb, cudaStream_t stream) {
     const char *payload = nullptr;
-    if (!ds4_repack_read_stage(m, stage, stage_bytes, t.off + done, nb, &payload)) {
+    if (!ns4_repack_read_stage(m, stage, stage_bytes, t.off + done, nb, &payload)) {
         fprintf(stderr, "%s: %s repack read failed for %s at off=%llu: %s\n",
                 log_prefix, what, t.name.c_str(), (unsigned long long)(t.off + done), strerror(errno));
         return false;
@@ -647,8 +647,8 @@ static bool repack_read_upload(const char *log_prefix, const ds4_repack_file &m,
     return true;
 }
 
-static bool repack_alloc_artifact(const ds4_repack_build_args &a, const char *what,
-                                  ds4_repack_artifact *art) {
+static bool repack_alloc_artifact(const ns4_repack_build_args &a, const char *what,
+                                  ns4_repack_artifact *art) {
     if (a.alloc_fn) return a.alloc_fn(a.alloc_ctx, art);
     void *dev = nullptr;
     cudaError_t err = cudaMalloc(&dev, (size_t)art->bytes);
@@ -662,7 +662,7 @@ static bool repack_alloc_artifact(const ds4_repack_build_args &a, const char *wh
     return true;
 }
 
-static void repack_free_artifact(const ds4_repack_build_args &a, ds4_repack_artifact *art) {
+static void repack_free_artifact(const ns4_repack_build_args &a, ns4_repack_artifact *art) {
     if (!art->dev) return;
     if (a.free_fn) a.free_fn(a.alloc_ctx, art);
     else (void)cudaFree(art->dev);
@@ -674,23 +674,23 @@ static void repack_free_artifact(const ds4_repack_build_args &a, ds4_repack_arti
 /* Aligned-SoA Q8_0 dense artifacts: [__half dq[nblk]][pad to 64B]
  * [int8 qs[nblk*32]], nblk = out_dim * (in_dim/32), block order identical to
  * the raw tensor byte order.  Layout contract shared with
- * ds4_mmq_q8_0_aligned_dense_vec (cuda/mmq/ds4_mmq.h).  ADDITIVE: the raw
+ * ns4_mmq_q8_0_aligned_dense_vec (cuda/mmq/ns4_mmq.h).  ADDITIVE: the raw
  * spans stay served, so only the n_tokens==1 decode GEMV dispatches on the
  * artifact; every other consumer reads raw as before. */
-bool ds4_repack_build_q8_aligned(const ds4_repack_build_args &a,
-                                 std::vector<ds4_repack_artifact> &out,
+bool ns4_repack_build_q8_aligned(const ns4_repack_build_args &a,
+                                 std::vector<ns4_repack_artifact> &out,
                                  uint64_t *repacked_bytes_out) {
     if (repacked_bytes_out) *repacked_bytes_out = 0;
-    ds4_repack_file m;
-    if (!ds4_repack_map_file(a.log_prefix, a.path, m)) return false;
+    ns4_repack_file m;
+    if (!ns4_repack_map_file(a.log_prefix, a.path, m)) return false;
     uint64_t chunk = a.copy_chunk_bytes / 34u * 34u;
     if (chunk < 34u * 32768u) chunk = 34u * 32768u;
 
     const double t0 = repack_now_sec();
     std::vector<repack_job> jobs;
     bool ok = true;
-    for (const ds4_repack_tensor &t : *a.records) {
-        if (!ds4_repack_q8_candidate(t)) continue;
+    for (const ns4_repack_tensor &t : *a.records) {
+        if (!ns4_repack_q8_candidate(t)) continue;
         const uint64_t nblk = t.bytes / 34u;
         const uint64_t expect_blk = (t.dims[0] / 32u) * t.dims[1];
         if (nblk != expect_blk || t.off > m.size || t.bytes > m.size - t.off) {
@@ -709,7 +709,7 @@ bool ds4_repack_build_q8_aligned(const ds4_repack_build_args &a,
         repack_job j;
         j.chunk = chunk;
         j.art.t = &t;
-        j.art.kind = DS4_REPACK_Q8_0_ALIGNED_DENSE;
+        j.art.kind = NS4_REPACK_Q8_0_ALIGNED_DENSE;
         j.art.bytes = art_bytes;
         j.art.in_dim = t.dims[0];
         j.art.out_dim = t.dims[1];
@@ -726,7 +726,7 @@ bool ds4_repack_build_q8_aligned(const ds4_repack_build_args &a,
         ok = run_repack_jobs(a.log_prefix, "q8", m, a.device, jobs,
             [&m, &a](const repack_job &j, cudaStream_t stream, unsigned char *stage,
                      uint64_t stage_bytes, unsigned char *scratch) -> bool {
-        const ds4_repack_tensor &t = *j.art.t;
+        const ns4_repack_tensor &t = *j.art.t;
         const uint64_t nblk = t.bytes / 34u;
         const uint64_t dq_bytes = repack_align_up(nblk * 2u, 64u);
         __half *dq = (__half *)j.art.dev;
@@ -752,7 +752,7 @@ bool ds4_repack_build_q8_aligned(const ds4_repack_build_args &a,
 
     if (!ok) {
         for (repack_job &j : jobs) repack_free_artifact(a, &j.art);
-        ds4_repack_unmap_file(m);
+        ns4_repack_unmap_file(m);
         return false;
     }
 
@@ -764,7 +764,7 @@ bool ds4_repack_build_q8_aligned(const ds4_repack_build_args &a,
         count++;
     }
 
-    ds4_repack_unmap_file(m);
+    ns4_repack_unmap_file(m);
     if (count == 0) {
         fprintf(stderr, "%s: --repack-q8-aligned found no candidate tensors in %s\n",
                 a.log_prefix, a.model_id);
@@ -785,20 +785,20 @@ bool ds4_repack_build_q8_aligned(const ds4_repack_build_args &a,
  * order (raw block index)*32 + code index.  Kind and layout shared with the
  * weight server's --derive-q8-f16 (DERIVED_Q8_0_F16_COLMAJOR) and the
  * engine's lazy cuda_q8_f16_ptr cache.  ADDITIVE: raw stays served. */
-bool ds4_repack_build_q8_f16(const ds4_repack_build_args &a,
-                             std::vector<ds4_repack_artifact> &out,
+bool ns4_repack_build_q8_f16(const ns4_repack_build_args &a,
+                             std::vector<ns4_repack_artifact> &out,
                              uint64_t *repacked_bytes_out) {
     if (repacked_bytes_out) *repacked_bytes_out = 0;
-    ds4_repack_file m;
-    if (!ds4_repack_map_file(a.log_prefix, a.path, m)) return false;
+    ns4_repack_file m;
+    if (!ns4_repack_map_file(a.log_prefix, a.path, m)) return false;
     uint64_t chunk = a.copy_chunk_bytes / 34u * 34u;
     if (chunk < 34u * 32768u) chunk = 34u * 32768u;
 
     const double t0 = repack_now_sec();
     std::vector<repack_job> jobs;
     bool ok = true;
-    for (const ds4_repack_tensor &t : *a.records) {
-        if (!ds4_repack_q8_f16_candidate(t)) continue;
+    for (const ns4_repack_tensor &t : *a.records) {
+        if (!ns4_repack_q8_f16_candidate(t)) continue;
         const uint64_t nblk = t.bytes / 34u;
         const uint64_t expect_blk = (t.dims[0] / 32u) * t.dims[1];
         if (nblk != expect_blk || t.off > m.size || t.bytes > m.size - t.off) {
@@ -815,7 +815,7 @@ bool ds4_repack_build_q8_f16(const ds4_repack_build_args &a,
         repack_job j;
         j.chunk = chunk;
         j.art.t = &t;
-        j.art.kind = DS4_REPACK_Q8_0_F16_COLMAJOR;
+        j.art.kind = NS4_REPACK_Q8_0_F16_COLMAJOR;
         j.art.bytes = nblk * 64u; /* nblk*32 __half elements */
         j.art.in_dim = t.dims[0];
         j.art.out_dim = t.dims[1];
@@ -832,7 +832,7 @@ bool ds4_repack_build_q8_f16(const ds4_repack_build_args &a,
         ok = run_repack_jobs(a.log_prefix, "q8_f16", m, a.device, jobs,
             [&m, &a](const repack_job &j, cudaStream_t stream, unsigned char *stage,
                      uint64_t stage_bytes, unsigned char *scratch) -> bool {
-        const ds4_repack_tensor &t = *j.art.t;
+        const ns4_repack_tensor &t = *j.art.t;
         __half *dst = (__half *)j.art.dev;
         for (uint64_t done = 0; done < t.bytes; done += j.chunk) {
             const uint64_t nb = t.bytes - done < j.chunk ? t.bytes - done : j.chunk;
@@ -855,7 +855,7 @@ bool ds4_repack_build_q8_f16(const ds4_repack_build_args &a,
 
     if (!ok) {
         for (repack_job &j : jobs) repack_free_artifact(a, &j.art);
-        ds4_repack_unmap_file(m);
+        ns4_repack_unmap_file(m);
         return false;
     }
 
@@ -867,7 +867,7 @@ bool ds4_repack_build_q8_f16(const ds4_repack_build_args &a,
         count++;
     }
 
-    ds4_repack_unmap_file(m);
+    ns4_repack_unmap_file(m);
     if (count == 0) {
         fprintf(stderr, "%s: q8 f16 prebuild found no candidate tensors in %s\n",
                 a.log_prefix, a.model_id);
@@ -887,23 +887,23 @@ bool ds4_repack_build_q8_f16(const ds4_repack_build_args &a,
 /* Aligned-SoA IQ2_XXS routed-expert artifacts.  Byte-neutral: [__half
  * dq[nblk]][pad to 64B][uint2 qs[nblk*8]], block order identical to the raw
  * tensor byte order.  Layout contract shared with
- * ds4_mmq_iq2_xxs_aligned_moe_vec (cuda/mmq/ds4_mmq.h).  These REPLACE the
+ * ns4_mmq_iq2_xxs_aligned_moe_vec (cuda/mmq/ns4_mmq.h).  These REPLACE the
  * raw residency of their source tensors (the producer stops serving/pinning
  * the raw spans); raw-layout consumers fall back to the host mmap. */
-bool ds4_repack_build_iq2_aligned(const ds4_repack_build_args &a,
-                                  std::vector<ds4_repack_artifact> &out,
+bool ns4_repack_build_iq2_aligned(const ns4_repack_build_args &a,
+                                  std::vector<ns4_repack_artifact> &out,
                                   uint64_t *repacked_bytes_out) {
     if (repacked_bytes_out) *repacked_bytes_out = 0;
-    ds4_repack_file m;
-    if (!ds4_repack_map_file(a.log_prefix, a.path, m)) return false;
+    ns4_repack_file m;
+    if (!ns4_repack_map_file(a.log_prefix, a.path, m)) return false;
     uint64_t chunk = a.copy_chunk_bytes / 66u * 66u;
     if (chunk < 66u * 16384u) chunk = 66u * 16384u;
 
     const double t0 = repack_now_sec();
     std::vector<repack_job> jobs;
     bool ok = true;
-    for (const ds4_repack_tensor &t : *a.records) {
-        if (!ds4_repack_iq2_candidate(t)) continue;
+    for (const ns4_repack_tensor &t : *a.records) {
+        if (!ns4_repack_iq2_candidate(t)) continue;
         const uint64_t nblk = t.bytes / 66u;
         const uint64_t expect_blk = (t.dims[0] / 256u) * t.dims[1] * t.dims[2];
         if (nblk != expect_blk || t.off > m.size || t.bytes > m.size - t.off) {
@@ -922,7 +922,7 @@ bool ds4_repack_build_iq2_aligned(const ds4_repack_build_args &a,
         repack_job j;
         j.chunk = chunk;
         j.art.t = &t;
-        j.art.kind = DS4_REPACK_IQ2_XXS_ALIGNED_MOE;
+        j.art.kind = NS4_REPACK_IQ2_XXS_ALIGNED_MOE;
         j.art.bytes = art_bytes;
         j.art.in_dim = t.dims[0];
         j.art.out_dim = t.dims[1];
@@ -939,7 +939,7 @@ bool ds4_repack_build_iq2_aligned(const ds4_repack_build_args &a,
         ok = run_repack_jobs(a.log_prefix, "iq2", m, a.device, jobs,
             [&m, &a](const repack_job &j, cudaStream_t stream, unsigned char *stage,
                      uint64_t stage_bytes, unsigned char *scratch) -> bool {
-        const ds4_repack_tensor &t = *j.art.t;
+        const ns4_repack_tensor &t = *j.art.t;
         const uint64_t nblk = t.bytes / 66u;
         const uint64_t dq_bytes = repack_align_up(nblk * 2u, 64u);
         __half *dq = (__half *)j.art.dev;
@@ -968,7 +968,7 @@ bool ds4_repack_build_iq2_aligned(const ds4_repack_build_args &a,
 
     if (!ok) {
         for (repack_job &j : jobs) repack_free_artifact(a, &j.art);
-        ds4_repack_unmap_file(m);
+        ns4_repack_unmap_file(m);
         return false;
     }
 
@@ -980,7 +980,7 @@ bool ds4_repack_build_iq2_aligned(const ds4_repack_build_args &a,
         count++;
     }
 
-    ds4_repack_unmap_file(m);
+    ns4_repack_unmap_file(m);
     if (count == 0) {
         fprintf(stderr, "%s: --repack-iq2-aligned found no candidate tensors in %s\n",
                 a.log_prefix, a.model_id);
@@ -1001,21 +1001,21 @@ bool ds4_repack_build_iq2_aligned(const ds4_repack_build_args &a,
  * REPLACE artifacts for the .ffn_down_exps stacks; with npair = nblk/2
  * raw-order row-pair blocks (rows 2p, 2p+1 of an expert),
  *   [uint2 dm2[npair]][pad64][int4 sc4[npair*2]][pad64][uint2 qs2[npair*16]]
- * Layout contract shared with ds4_mmq_q2_K_aligned_moe_vec
- * (cuda/mmq/ds4_mmq.h).  Chunks are whole row pairs so the repack kernel's
+ * Layout contract shared with ns4_mmq_q2_K_aligned_moe_vec
+ * (cuda/mmq/ns4_mmq.h).  Chunks are whole row pairs so the repack kernel's
  * global pair index math holds across chunk boundaries. */
-bool ds4_repack_build_q2k_aligned(const ds4_repack_build_args &a,
-                                  std::vector<ds4_repack_artifact> &out,
+bool ns4_repack_build_q2k_aligned(const ns4_repack_build_args &a,
+                                  std::vector<ns4_repack_artifact> &out,
                                   uint64_t *repacked_bytes_out) {
     if (repacked_bytes_out) *repacked_bytes_out = 0;
-    ds4_repack_file m;
-    if (!ds4_repack_map_file(a.log_prefix, a.path, m)) return false;
+    ns4_repack_file m;
+    if (!ns4_repack_map_file(a.log_prefix, a.path, m)) return false;
 
     const double t0 = repack_now_sec();
     std::vector<repack_job> jobs;
     bool ok = true;
-    for (const ds4_repack_tensor &t : *a.records) {
-        if (!ds4_repack_q2k_candidate(t)) continue;
+    for (const ns4_repack_tensor &t : *a.records) {
+        if (!ns4_repack_q2k_candidate(t)) continue;
         const uint64_t nblk = t.bytes / 84u;
         const uint64_t expect_blk = (t.dims[0] / 256u) * t.dims[1] * t.dims[2];
         if (nblk != expect_blk || t.off > m.size || t.bytes > m.size - t.off) {
@@ -1041,7 +1041,7 @@ bool ds4_repack_build_q2k_aligned(const ds4_repack_build_args &a,
         repack_job j;
         j.chunk = chunk;
         j.art.t = &t;
-        j.art.kind = DS4_REPACK_Q2_K_ALIGNED_MOE;
+        j.art.kind = NS4_REPACK_Q2_K_ALIGNED_MOE;
         j.art.bytes = art_bytes;
         j.art.in_dim = t.dims[0];
         j.art.out_dim = t.dims[1];
@@ -1058,7 +1058,7 @@ bool ds4_repack_build_q2k_aligned(const ds4_repack_build_args &a,
         ok = run_repack_jobs(a.log_prefix, "q2k", m, a.device, jobs,
             [&m, &a](const repack_job &j, cudaStream_t stream, unsigned char *stage,
                      uint64_t stage_bytes, unsigned char *scratch) -> bool {
-        const ds4_repack_tensor &t = *j.art.t;
+        const ns4_repack_tensor &t = *j.art.t;
         const uint64_t nblk = t.bytes / 84u;
         const uint64_t nb_row = t.dims[0] / 256u;
         const uint64_t npair = nblk / 2u;
@@ -1092,7 +1092,7 @@ bool ds4_repack_build_q2k_aligned(const ds4_repack_build_args &a,
 
     if (!ok) {
         for (repack_job &j : jobs) repack_free_artifact(a, &j.art);
-        ds4_repack_unmap_file(m);
+        ns4_repack_unmap_file(m);
         return false;
     }
 
@@ -1104,7 +1104,7 @@ bool ds4_repack_build_q2k_aligned(const ds4_repack_build_args &a,
         count++;
     }
 
-    ds4_repack_unmap_file(m);
+    ns4_repack_unmap_file(m);
     if (count == 0) {
         fprintf(stderr, "%s: --repack-q2k-aligned found no candidate tensors in %s\n",
                 a.log_prefix, a.model_id);

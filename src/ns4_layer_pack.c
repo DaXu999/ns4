@@ -1,26 +1,26 @@
 /* Monotonic-contiguous multi-tier layer placement packer.
  *
  * Pure C99: no CUDA, no platform-specific code. Used by both the CUDA and
- * Metal/CPU builds. See ds4_layer_pack.h for the API contract and the
+ * Metal/CPU builds. See ns4_layer_pack.h for the API contract and the
  * design doc docs/superpowers/specs/2026-05-26-multi-gpu-pp-v0-design.md
  * for the rationale. */
 
-#include "ds4_layer_pack.h"
+#include "ns4_layer_pack.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-int ds4_compute_layer_placement(const size_t *entry_bytes,
+int ns4_compute_layer_placement(const size_t *entry_bytes,
                                 int n_entries,
-                                const ds4_layer_pack_config *cfg,
+                                const ns4_layer_pack_config *cfg,
                                 int *device_for_entry) {
     if (!entry_bytes || !cfg || !device_for_entry) return 1;
     if (n_entries < 0) return 2;
-    if (cfg->n_gpus < 0 || cfg->n_gpus > DS4_LAYER_PACK_MAX_GPUS) return 3;
+    if (cfg->n_gpus < 0 || cfg->n_gpus > NS4_LAYER_PACK_MAX_GPUS) return 3;
 
     /* Work over a local copy of budgets so the caller's struct is untouched. */
-    size_t budget[DS4_LAYER_PACK_MAX_GPUS];
+    size_t budget[NS4_LAYER_PACK_MAX_GPUS];
     for (int d = 0; d < cfg->n_gpus; d++) {
         budget[d] = cfg->gpu_budget_bytes[d];
     }
@@ -36,7 +36,7 @@ int ds4_compute_layer_placement(const size_t *entry_bytes,
             device_for_entry[e] = d;
             budget[d] -= entry_bytes[e];
         } else {
-            device_for_entry[e] = DS4_LAYER_PACK_CPU;
+            device_for_entry[e] = NS4_LAYER_PACK_CPU;
             /* d stays at cfg->n_gpus so every subsequent entry also lands
              * on the CPU tier. */
         }
@@ -87,7 +87,7 @@ static int print_layer_range_for_tier(FILE *out, const int *device_for_entry,
     return 1;
 }
 
-void ds4_layer_pack_print(FILE *out,
+void ns4_layer_pack_print(FILE *out,
                           const int *device_for_entry,
                           int n_entries,
                           int n_layers,
@@ -129,17 +129,17 @@ void ds4_layer_pack_print(FILE *out,
     /* CPU tier: only print if at least one entry is on CPU. */
     int cpu_present = 0;
     for (int i = 0; i < n_entries; i++) {
-        if (device_for_entry[i] == DS4_LAYER_PACK_CPU) { cpu_present = 1; break; }
+        if (device_for_entry[i] == NS4_LAYER_PACK_CPU) { cpu_present = 1; break; }
     }
     if (cpu_present) {
         fprintf(out, "  CPU : ");
         int have_layers = print_layer_range_for_tier(out, device_for_entry,
-                                                      DS4_LAYER_PACK_CPU,
+                                                      NS4_LAYER_PACK_CPU,
                                                       n_entries, n_layers);
         char tags[64];
         tags[0] = '\0';
         append_pseudo_layer_tags(tags, sizeof(tags), device_for_entry,
-                                  DS4_LAYER_PACK_CPU, n_entries, n_layers);
+                                  NS4_LAYER_PACK_CPU, n_entries, n_layers);
         if (tags[0]) {
             (void)have_layers;
             fprintf(out, "%s", tags);

@@ -2,7 +2,7 @@
  *
  * Pure C99: no CUDA, no Metal. Builds and runs on any host. */
 
-#include "ds4_layer_pack.h"
+#include "ns4_layer_pack.h"
 
 #include <locale.h>
 #include <stdio.h>
@@ -31,7 +31,7 @@ static int g_total  = 0;
 static int check_monotonic(const int *dev, int n) {
     int prev_rank = -1;
     for (int i = 0; i < n; i++) {
-        int rank = (dev[i] == DS4_LAYER_PACK_CPU) ? 999999 : dev[i];
+        int rank = (dev[i] == NS4_LAYER_PACK_CPU) ? 999999 : dev[i];
         if (rank < prev_rank) return 0;
         prev_rank = rank;
     }
@@ -42,10 +42,10 @@ static int check_monotonic(const int *dev, int n) {
 
 static void test_all_fit_n1(void) {
     const size_t entries[] = {10, 10, 10, 10, 10, 10};
-    ds4_layer_pack_config cfg = { .n_gpus = 1 };
+    ns4_layer_pack_config cfg = { .n_gpus = 1 };
     cfg.gpu_budget_bytes[0] = 100;
     int dev[6];
-    CHECK(ds4_compute_layer_placement(entries, 6, &cfg, dev) == 0, "rc 0");
+    CHECK(ns4_compute_layer_placement(entries, 6, &cfg, dev) == 0, "rc 0");
     for (int i = 0; i < 6; i++) CHECK(dev[i] == 0, "all on dev 0");
     CHECK(check_monotonic(dev, 6), "monotonic");
 }
@@ -55,11 +55,11 @@ static void test_all_fit_n2(void) {
      * next 20 → 40+20=60 > 50, advance to dev1. dev1 takes 20+20=40.
      * Expected: {0,0,1,1}. */
     const size_t entries[] = {20, 20, 20, 20};
-    ds4_layer_pack_config cfg = { .n_gpus = 2 };
+    ns4_layer_pack_config cfg = { .n_gpus = 2 };
     cfg.gpu_budget_bytes[0] = 50;
     cfg.gpu_budget_bytes[1] = 50;
     int dev[4];
-    CHECK(ds4_compute_layer_placement(entries, 4, &cfg, dev) == 0, "rc 0");
+    CHECK(ns4_compute_layer_placement(entries, 4, &cfg, dev) == 0, "rc 0");
     CHECK(dev[0] == 0 && dev[1] == 0, "entries 0,1 on dev 0");
     CHECK(dev[2] == 1 && dev[3] == 1, "entries 2,3 on dev 1");
     CHECK(check_monotonic(dev, 4), "monotonic");
@@ -70,14 +70,14 @@ static void test_partial_spill_n2(void) {
      * dev0 takes 15+15=30; next 15 → 45 > 30, advance.
      * dev1 takes 15+15=30; next 15 → 45 > 30, advance → CPU. */
     const size_t entries[] = {15, 15, 15, 15, 15};
-    ds4_layer_pack_config cfg = { .n_gpus = 2 };
+    ns4_layer_pack_config cfg = { .n_gpus = 2 };
     cfg.gpu_budget_bytes[0] = 30;
     cfg.gpu_budget_bytes[1] = 30;
     int dev[5];
-    CHECK(ds4_compute_layer_placement(entries, 5, &cfg, dev) == 0, "rc 0");
+    CHECK(ns4_compute_layer_placement(entries, 5, &cfg, dev) == 0, "rc 0");
     CHECK(dev[0] == 0 && dev[1] == 0, "0,1 on dev 0");
     CHECK(dev[2] == 1 && dev[3] == 1, "2,3 on dev 1");
-    CHECK(dev[4] == DS4_LAYER_PACK_CPU, "4 on CPU");
+    CHECK(dev[4] == NS4_LAYER_PACK_CPU, "4 on CPU");
     CHECK(check_monotonic(dev, 5), "monotonic");
 }
 
@@ -86,13 +86,13 @@ static void test_zero_budget_one_gpu_n2(void) {
      * Next 10 → 60 > 50, advance to dev1; dev1 budget 0, 10 > 0, advance →
      * CPU. The zero-budget device is effectively skipped. */
     const size_t entries[] = {10, 10, 10, 10, 10, 10};
-    ds4_layer_pack_config cfg = { .n_gpus = 2 };
+    ns4_layer_pack_config cfg = { .n_gpus = 2 };
     cfg.gpu_budget_bytes[0] = 50;
     cfg.gpu_budget_bytes[1] = 0;
     int dev[6];
-    CHECK(ds4_compute_layer_placement(entries, 6, &cfg, dev) == 0, "rc 0");
+    CHECK(ns4_compute_layer_placement(entries, 6, &cfg, dev) == 0, "rc 0");
     for (int i = 0; i < 5; i++) CHECK(dev[i] == 0, "first five on dev 0");
-    CHECK(dev[5] == DS4_LAYER_PACK_CPU, "sixth on CPU (dev 1 skipped)");
+    CHECK(dev[5] == NS4_LAYER_PACK_CPU, "sixth on CPU (dev 1 skipped)");
     for (int i = 0; i < 6; i++) CHECK(dev[i] != 1, "nothing on dev 1");
     CHECK(check_monotonic(dev, 6), "monotonic");
 }
@@ -100,14 +100,14 @@ static void test_zero_budget_one_gpu_n2(void) {
 static void test_oversized_entry_n2(void) {
     /* Entry too large for any device → CPU, and the rule propagates. */
     const size_t entries[] = {10, 40, 10};
-    ds4_layer_pack_config cfg = { .n_gpus = 2 };
+    ns4_layer_pack_config cfg = { .n_gpus = 2 };
     cfg.gpu_budget_bytes[0] = 30;
     cfg.gpu_budget_bytes[1] = 30;
     int dev[3];
-    CHECK(ds4_compute_layer_placement(entries, 3, &cfg, dev) == 0, "rc 0");
+    CHECK(ns4_compute_layer_placement(entries, 3, &cfg, dev) == 0, "rc 0");
     CHECK(dev[0] == 0, "small first on dev 0");
-    CHECK(dev[1] == DS4_LAYER_PACK_CPU, "oversized on CPU");
-    CHECK(dev[2] == DS4_LAYER_PACK_CPU, "post-oversized stays CPU");
+    CHECK(dev[1] == NS4_LAYER_PACK_CPU, "oversized on CPU");
+    CHECK(dev[2] == NS4_LAYER_PACK_CPU, "post-oversized stays CPU");
     CHECK(check_monotonic(dev, 3), "monotonic");
 }
 
@@ -120,7 +120,7 @@ static void test_mixed_n8(void) {
                 30,  60,  40,  50,  80,  20,  20,  10,  50,  70,  90,  10,  10
     };
     const int n_entries = 13;
-    ds4_layer_pack_config cfg = { .n_gpus = 8 };
+    ns4_layer_pack_config cfg = { .n_gpus = 8 };
     /* Budgets vary intentionally — small / medium / large mix. */
     cfg.gpu_budget_bytes[0] = 100;
     cfg.gpu_budget_bytes[1] =  80;
@@ -131,7 +131,7 @@ static void test_mixed_n8(void) {
     cfg.gpu_budget_bytes[6] =  80;
     cfg.gpu_budget_bytes[7] =  40;
     int dev[13];
-    CHECK(ds4_compute_layer_placement(entries, n_entries, &cfg, dev) == 0, "rc 0");
+    CHECK(ns4_compute_layer_placement(entries, n_entries, &cfg, dev) == 0, "rc 0");
 
     /* Hand-trace under strict greedy fill (advance once entry > current budget):
      *
@@ -162,7 +162,7 @@ static void test_mixed_n8(void) {
      *    e9 70  -> 70 > 40, advance to d=8 (out of GPUs)
      *    e9..e12 all CPU
      */
-    const int expected[13] = {0,0,1,2,3,4,4,4,6,DS4_LAYER_PACK_CPU,DS4_LAYER_PACK_CPU,DS4_LAYER_PACK_CPU,DS4_LAYER_PACK_CPU};
+    const int expected[13] = {0,0,1,2,3,4,4,4,6,NS4_LAYER_PACK_CPU,NS4_LAYER_PACK_CPU,NS4_LAYER_PACK_CPU,NS4_LAYER_PACK_CPU};
     for (int i = 0; i < n_entries; i++) {
         if (dev[i] != expected[i]) {
             fprintf(stderr, "  mismatch e%d: got %d expected %d\n", i, dev[i], expected[i]);
@@ -174,12 +174,12 @@ static void test_mixed_n8(void) {
 
 static void test_n16_stress(void) {
     /* 16 GPUs each budget 100; 32 entries of 50 each → {0,0,1,1,...,15,15}. */
-    ds4_layer_pack_config cfg = { .n_gpus = 16 };
+    ns4_layer_pack_config cfg = { .n_gpus = 16 };
     for (int d = 0; d < 16; d++) cfg.gpu_budget_bytes[d] = 100;
     size_t entries[32];
     for (int i = 0; i < 32; i++) entries[i] = 50;
     int dev[32];
-    CHECK(ds4_compute_layer_placement(entries, 32, &cfg, dev) == 0, "rc 0");
+    CHECK(ns4_compute_layer_placement(entries, 32, &cfg, dev) == 0, "rc 0");
     for (int i = 0; i < 32; i++) {
         CHECK(dev[i] == i / 2, "pair per device");
     }
@@ -195,12 +195,12 @@ static void test_pseudo_layers(void) {
     entries[0] = 5;                 /* embedding */
     for (int i = 1; i <= n_layers; i++) entries[i] = 10;
     entries[n_layers + 1] = 7;      /* output head */
-    ds4_layer_pack_config cfg = { .n_gpus = 3 };
+    ns4_layer_pack_config cfg = { .n_gpus = 3 };
     cfg.gpu_budget_bytes[0] = 60;
     cfg.gpu_budget_bytes[1] = 60;
     cfg.gpu_budget_bytes[2] = 60;
     int dev[45];
-    CHECK(ds4_compute_layer_placement(entries, n_entries, &cfg, dev) == 0, "rc 0");
+    CHECK(ns4_compute_layer_placement(entries, n_entries, &cfg, dev) == 0, "rc 0");
     /* Embedding placed first → on dev 0 (5 bytes, plenty of room). */
     CHECK(dev[0] == 0, "embedding on dev 0");
     /* Total = 5 + 43*10 + 7 = 442. 3 budgets of 60 = 180. Mostly CPU.
@@ -208,24 +208,24 @@ static void test_pseudo_layers(void) {
      * dev 0 (5 embedding + 5 layers), next 10 → 65 > 60 → advance to dev 1.
      * Dev 1 holds 6 layers (60). Dev 2 holds 6 layers (60). After that
      * everything is CPU. Output head ends up on CPU. */
-    CHECK(dev[n_layers + 1] == DS4_LAYER_PACK_CPU, "output head on CPU");
+    CHECK(dev[n_layers + 1] == NS4_LAYER_PACK_CPU, "output head on CPU");
     CHECK(check_monotonic(dev, n_entries), "monotonic");
 }
 
 static void test_null_inputs(void) {
     size_t one = 0;
     int dev = 0;
-    ds4_layer_pack_config cfg = { .n_gpus = 1 };
+    ns4_layer_pack_config cfg = { .n_gpus = 1 };
     cfg.gpu_budget_bytes[0] = 100;
 
-    CHECK(ds4_compute_layer_placement(NULL, 1, &cfg, &dev) != 0, "null entries");
-    CHECK(ds4_compute_layer_placement(&one, 1, NULL, &dev) != 0, "null cfg");
-    CHECK(ds4_compute_layer_placement(&one, 1, &cfg, NULL) != 0, "null out");
+    CHECK(ns4_compute_layer_placement(NULL, 1, &cfg, &dev) != 0, "null entries");
+    CHECK(ns4_compute_layer_placement(&one, 1, NULL, &dev) != 0, "null cfg");
+    CHECK(ns4_compute_layer_placement(&one, 1, &cfg, NULL) != 0, "null out");
 
-    ds4_layer_pack_config bad = { .n_gpus = -1 };
-    CHECK(ds4_compute_layer_placement(&one, 1, &bad, &dev) != 0, "n_gpus<0");
-    bad.n_gpus = DS4_LAYER_PACK_MAX_GPUS + 1;
-    CHECK(ds4_compute_layer_placement(&one, 1, &bad, &dev) != 0, "n_gpus too big");
+    ns4_layer_pack_config bad = { .n_gpus = -1 };
+    CHECK(ns4_compute_layer_placement(&one, 1, &bad, &dev) != 0, "n_gpus<0");
+    bad.n_gpus = NS4_LAYER_PACK_MAX_GPUS + 1;
+    CHECK(ns4_compute_layer_placement(&one, 1, &bad, &dev) != 0, "n_gpus too big");
 }
 
 /* Golden-string print test.
@@ -245,7 +245,7 @@ static void test_print_golden(void) {
     setlocale(LC_ALL, "C");
     const int n_layers = 4;
     const int n_entries = n_layers + 2;
-    int dev[6] = { 0, 0, 0, 1, DS4_LAYER_PACK_CPU, DS4_LAYER_PACK_CPU };
+    int dev[6] = { 0, 0, 0, 1, NS4_LAYER_PACK_CPU, NS4_LAYER_PACK_CPU };
     size_t entry_bytes[6] = {0, 0, 0, 0, 0, 0};
     size_t used[2]   = {10ull * 1073741824ull, 10ull * 1073741824ull};
     size_t budget[2] = {20ull * 1073741824ull, 20ull * 1073741824ull};
@@ -258,7 +258,7 @@ static void test_print_golden(void) {
     FILE *f = tmpfile();
     CHECK(f != NULL, "tmpfile");
     if (!f) return;
-    ds4_layer_pack_print(f, dev, n_entries, n_layers, entry_bytes,
+    ns4_layer_pack_print(f, dev, n_entries, n_layers, entry_bytes,
                           used, budget, 2);
     fflush(f);
     rewind(f);

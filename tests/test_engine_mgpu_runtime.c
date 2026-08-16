@@ -2,7 +2,7 @@
  * execution.
  *
  * Compares first-token + 4 decode steps from a single-tier baseline against
- * an explicit GPU-only multi-tier run, both with DS4_CUDA_NO_TF32=1 pinning
+ * an explicit GPU-only multi-tier run, both with NS4_CUDA_NO_TF32=1 pinning
  * CUBLAS_DEFAULT_MATH. Asserts:
  *   - prefill max-abs logit delta < 1e-4
  *   - decode step max-abs logit delta < 1e-3
@@ -12,14 +12,14 @@
  *     baseline tier; if all entries went to tier 0 the test would be a
  *     tautology).
  *
- * Skips with PASS if cudaGetDeviceCount < 2 or DS4_TEST_MODEL is unset.
+ * Skips with PASS if cudaGetDeviceCount < 2 or NS4_TEST_MODEL is unset.
  *
- * Requires DS4_TEST_HOOKS so ds4_test_session_read_logits +
- * ds4_test_engine_placement are exported. */
+ * Requires NS4_TEST_HOOKS so ns4_test_session_read_logits +
+ * ns4_test_engine_placement are exported. */
 
-#include "ds4.h"
-#include "ds4_gpu_mgpu.h"
-#include "ds4_layer_pack.h"   /* DS4_LAYER_PACK_CPU */
+#include "ns4.h"
+#include "ns4_gpu_mgpu.h"
+#include "ns4_layer_pack.h"   /* NS4_LAYER_PACK_CPU */
 
 #include <cuda_runtime.h>
 #include <math.h>
@@ -27,19 +27,19 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifndef DS4_N_VOCAB
-#define DS4_N_VOCAB 129280
+#ifndef NS4_N_VOCAB
+#define NS4_N_VOCAB 129280
 #endif
 
-/* DS4_N_LAYER is an internal enum in ds4.c. Hardcoded here for the test
- * placement-size assertion; matches the constant in ds4.c. */
-#ifndef DS4_TEST_N_LAYER
-#define DS4_TEST_N_LAYER 43
+/* NS4_N_LAYER is an internal enum in ns4.c. Hardcoded here for the test
+ * placement-size assertion; matches the constant in ns4.c. */
+#ifndef NS4_TEST_N_LAYER
+#define NS4_TEST_N_LAYER 43
 #endif
 
-/* Declared in ds4.c under DS4_TEST_HOOKS. */
-int ds4_test_session_read_logits(ds4_session *s, float *out, uint64_t out_bytes);
-const int *ds4_test_engine_placement(const ds4_engine *e);
+/* Declared in ns4.c under NS4_TEST_HOOKS. */
+int ns4_test_session_read_logits(ns4_session *s, float *out, uint64_t out_bytes);
+const int *ns4_test_engine_placement(const ns4_engine *e);
 
 #define CHECK(cond, msg)                                                    \
     do {                                                                    \
@@ -109,14 +109,14 @@ static int argmax_f32(const float *a, size_t n) {
 /* Read a short hard-coded test prompt suitable for prefill comparison.
  * The test needs a prompt long enough to exercise prefill but short
  * enough to run in seconds. We tokenize a hard-coded UTF-8 string via
- * ds4_tokenize. */
-static void build_prompt(ds4_engine *e, ds4_tokens *out) {
+ * ns4_tokenize. */
+static void build_prompt(ns4_engine *e, ns4_tokens *out) {
     /* A short English-only prompt with enough tokens to exercise prefill.
      * Tokenizer is deterministic. */
     const char *text = "The quick brown fox jumps over the lazy dog. " \
                        "It was a dark and stormy night, and the wind " \
                        "howled across the empty fields beyond the village.";
-    ds4_tokenize_text(e, text, out);
+    ns4_tokenize_text(e, text, out);
 }
 
 int main(void) {
@@ -128,71 +128,71 @@ int main(void) {
         return 0;
     }
 
-    const char *model_path = getenv("DS4_TEST_MODEL");
+    const char *model_path = getenv("NS4_TEST_MODEL");
     if (!model_path || !model_path[0]) {
-        fprintf(stderr, "FAIL: DS4_TEST_MODEL not set\n");
+        fprintf(stderr, "FAIL: NS4_TEST_MODEL not set\n");
         return 1;
     }
 
     /* Pin cuBLAS default math so reduction-order across devices yields the
      * tightest possible equivalence. */
-    setenv("DS4_CUDA_NO_TF32", "1", 1);
+    setenv("NS4_CUDA_NO_TF32", "1", 1);
     /* Exercise the peer path when available; copy_xdev falls back to
      * pinned-host bounce automatically when peer is non-functional. */
-    unsetenv("DS4_FORCE_HOST_BOUNCE");
+    unsetenv("NS4_FORCE_HOST_BOUNCE");
 
     /* ---- Run #1: single-GPU baseline. ---- */
     fprintf(stderr, "test_engine_mgpu_runtime: single-tier baseline\n");
-    ds4_engine_options opt;
+    ns4_engine_options opt;
     memset(&opt, 0, sizeof(opt));
     opt.model_path = model_path;
-    opt.backend = DS4_BACKEND_CUDA;
+    opt.backend = NS4_BACKEND_CUDA;
     opt.n_threads = 1;
     opt.warm_weights = false;
     opt.quality = false;
 
-    ds4_engine *e1 = NULL;
-    int rc = ds4_engine_open(&e1, &opt);
+    ns4_engine *e1 = NULL;
+    int rc = ns4_engine_open(&e1, &opt);
     CHECKF(rc == 0 && e1 != NULL, "single-tier engine_open failed (rc=%d)", rc);
 
-    ds4_tokens prompt1 = {0};
+    ns4_tokens prompt1 = {0};
     build_prompt(e1, &prompt1);
     CHECK(prompt1.len > 0, "tokenize prompt");
 
-    ds4_session *s1 = NULL;
-    rc = ds4_session_create(&s1, e1, 4096);
+    ns4_session *s1 = NULL;
+    rc = ns4_session_create(&s1, e1, 4096);
     CHECKF(rc == 0 && s1 != NULL, "single-tier session_create failed (rc=%d)", rc);
 
     char err[256] = {0};
-    rc = ds4_session_sync(s1, &prompt1, err, sizeof(err));
+    rc = ns4_session_sync(s1, &prompt1, err, sizeof(err));
     CHECKF(rc == 0, "single-tier session_sync failed (rc=%d, err=%s)", rc, err);
 
-    float *prefill_a = (float *)malloc((size_t)DS4_N_VOCAB * sizeof(float));
+    float *prefill_a = (float *)malloc((size_t)NS4_N_VOCAB * sizeof(float));
     CHECK(prefill_a != NULL, "alloc prefill_a");
-    CHECK(ds4_test_session_read_logits(s1, prefill_a, (uint64_t)DS4_N_VOCAB * sizeof(float)) == 0,
+    CHECK(ns4_test_session_read_logits(s1, prefill_a, (uint64_t)NS4_N_VOCAB * sizeof(float)) == 0,
           "read single-tier prefill logits");
 
     /* 4 greedy decode steps. */
     int decoded_a[4];
-    float (*decoded_logits_a)[DS4_N_VOCAB] =
-        (float (*)[DS4_N_VOCAB])malloc(4u * (size_t)DS4_N_VOCAB * sizeof(float));
+    float (*decoded_logits_a)[NS4_N_VOCAB] =
+        (float (*)[NS4_N_VOCAB])malloc(4u * (size_t)NS4_N_VOCAB * sizeof(float));
     CHECK(decoded_logits_a != NULL, "alloc decoded_logits_a");
     for (int i = 0; i < 4; i++) {
-        int tok = ds4_session_argmax(s1);
+        int tok = ns4_session_argmax(s1);
         decoded_a[i] = tok;
-        rc = ds4_session_eval(s1, tok, err, sizeof(err));
+        rc = ns4_session_eval(s1, tok, err, sizeof(err));
         CHECKF(rc == 0, "single-tier decode eval %d failed (rc=%d, err=%s)", i, rc, err);
-        CHECK(ds4_test_session_read_logits(s1, decoded_logits_a[i], (uint64_t)DS4_N_VOCAB * sizeof(float)) == 0,
+        CHECK(ns4_test_session_read_logits(s1, decoded_logits_a[i], (uint64_t)NS4_N_VOCAB * sizeof(float)) == 0,
               "read single-tier decode logits");
     }
 
-    ds4_session_free(s1);
-    ds4_tokens_free(&prompt1);
-    ds4_engine_close(e1);
+    ns4_session_free(s1);
+    ns4_tokens_free(&prompt1);
+    ns4_engine_close(e1);
 
     /* ---- Run #2: GPU-only multi-tier. ---- */
     fprintf(stderr, "test_engine_mgpu_runtime: GPU-only multi-tier\n");
-    ds4_gpu_config cfg;
+    ns4_gpu_config cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.n_gpus = 2;
     cfg.device_indices[0] = 0;
@@ -205,8 +205,8 @@ int main(void) {
     cfg.vram_bytes[1] = (size_t)14ull * 1024ull * 1024ull * 1024ull;
     cfg.safety_margin_bytes = (size_t)1024u * 1024u * 1024u;
 
-    ds4_engine *e2 = NULL;
-    rc = ds4_engine_create_with_gpu_config(&e2, &opt, &cfg);
+    ns4_engine *e2 = NULL;
+    rc = ns4_engine_create_with_gpu_config(&e2, &opt, &cfg);
     if (rc != 0 || e2 == NULL) {
         /* Common case on a constrained box: GPU1 may be in use by other
          * workloads, forcing the placement to spill some layers to CPU.
@@ -229,40 +229,40 @@ int main(void) {
     /* Assert the placement is genuinely multi-tier (not all-CPU spill and
      * not all-tier-0). The placement is captured by engine_classify_multi_tier.
      */
-    const int *placement = ds4_test_engine_placement(e2);
+    const int *placement = ns4_test_engine_placement(e2);
     CHECK(placement != NULL, "engine placement should be exposed");
     int any_tier_1 = 0;
-    int n_entries = DS4_TEST_N_LAYER + 2; /* embedding, per-layer, head */
+    int n_entries = NS4_TEST_N_LAYER + 2; /* embedding, per-layer, head */
     for (int i = 0; i < n_entries; i++) {
-        if (placement[i] == DS4_LAYER_PACK_CPU) {
+        if (placement[i] == NS4_LAYER_PACK_CPU) {
             fprintf(stderr, "FAIL: placement crossed to CPU at entry %d but engine_create returned 0?\n", i);
-            ds4_engine_close(e2);
+            ns4_engine_close(e2);
             return 1;
         }
         if (placement[i] == 1) any_tier_1 = 1;
     }
     CHECK(any_tier_1, "test budgets should force at least one entry on tier 1");
 
-    ds4_tokens prompt2 = {0};
+    ns4_tokens prompt2 = {0};
     build_prompt(e2, &prompt2);
     CHECK(prompt2.len > 0, "tokenize prompt (multi-tier)");
 
-    ds4_session *s2 = NULL;
-    rc = ds4_session_create(&s2, e2, 4096);
+    ns4_session *s2 = NULL;
+    rc = ns4_session_create(&s2, e2, 4096);
     CHECKF(rc == 0 && s2 != NULL, "multi-tier session_create failed (rc=%d)", rc);
 
-    rc = ds4_session_sync(s2, &prompt2, err, sizeof(err));
+    rc = ns4_session_sync(s2, &prompt2, err, sizeof(err));
     CHECKF(rc == 0, "multi-tier session_sync failed (rc=%d, err=%s)", rc, err);
 
-    float *prefill_b = (float *)malloc((size_t)DS4_N_VOCAB * sizeof(float));
+    float *prefill_b = (float *)malloc((size_t)NS4_N_VOCAB * sizeof(float));
     CHECK(prefill_b != NULL, "alloc prefill_b");
-    CHECK(ds4_test_session_read_logits(s2, prefill_b, (uint64_t)DS4_N_VOCAB * sizeof(float)) == 0,
+    CHECK(ns4_test_session_read_logits(s2, prefill_b, (uint64_t)NS4_N_VOCAB * sizeof(float)) == 0,
           "read multi-tier prefill logits");
 
     /* Prefill numerical-eq. */
-    float prefill_delta = max_abs_delta(prefill_a, prefill_b, DS4_N_VOCAB);
-    int prefill_top_a = argmax_f32(prefill_a, DS4_N_VOCAB);
-    int prefill_top_b = argmax_f32(prefill_b, DS4_N_VOCAB);
+    float prefill_delta = max_abs_delta(prefill_a, prefill_b, NS4_N_VOCAB);
+    int prefill_top_a = argmax_f32(prefill_a, NS4_N_VOCAB);
+    int prefill_top_b = argmax_f32(prefill_b, NS4_N_VOCAB);
     fprintf(stderr, "  prefill delta=%g (top1: a=%d b=%d)\n",
             (double)prefill_delta, prefill_top_a, prefill_top_b);
     CHECKF(prefill_delta < 1e-4f, "prefill delta %g exceeds gate 1e-4", (double)prefill_delta);
@@ -271,20 +271,20 @@ int main(void) {
 
     /* Decode steps. */
     for (int i = 0; i < 4; i++) {
-        int tok = ds4_session_argmax(s2);
+        int tok = ns4_session_argmax(s2);
         CHECKF(tok == decoded_a[i],
                "decode top-1 mismatch at step %d (a=%d b=%d)", i, decoded_a[i], tok);
-        rc = ds4_session_eval(s2, tok, err, sizeof(err));
+        rc = ns4_session_eval(s2, tok, err, sizeof(err));
         CHECKF(rc == 0, "multi-tier decode eval %d failed (rc=%d, err=%s)", i, rc, err);
-        float decoded_b[DS4_N_VOCAB];
-        CHECK(ds4_test_session_read_logits(s2, decoded_b, (uint64_t)DS4_N_VOCAB * sizeof(float)) == 0,
+        float decoded_b[NS4_N_VOCAB];
+        CHECK(ns4_test_session_read_logits(s2, decoded_b, (uint64_t)NS4_N_VOCAB * sizeof(float)) == 0,
               "read multi-tier decode logits");
-        float d = max_abs_delta(decoded_logits_a[i], decoded_b, DS4_N_VOCAB);
+        float d = max_abs_delta(decoded_logits_a[i], decoded_b, NS4_N_VOCAB);
         fprintf(stderr, "  decode step %d delta=%g\n", i, (double)d);
         CHECKF(d < 1e-3f, "decode delta %g exceeds gate 1e-3 at step %d", (double)d, i);
         int top5_a[5], top5_b[5];
-        top_k(decoded_logits_a[i], DS4_N_VOCAB, top5_a, 5);
-        top_k(decoded_b, DS4_N_VOCAB, top5_b, 5);
+        top_k(decoded_logits_a[i], NS4_N_VOCAB, top5_a, 5);
+        top_k(decoded_b, NS4_N_VOCAB, top5_b, 5);
         CHECKF(top_k_set_equal(top5_a, top5_b, 5),
                "decode top-5 set mismatch at step %d", i);
     }
@@ -292,9 +292,9 @@ int main(void) {
     free(prefill_a);
     free(prefill_b);
     free(decoded_logits_a);
-    ds4_session_free(s2);
-    ds4_tokens_free(&prompt2);
-    ds4_engine_close(e2);
+    ns4_session_free(s2);
+    ns4_tokens_free(&prompt2);
+    ns4_engine_close(e2);
 
     fprintf(stderr, "test_engine_mgpu_runtime PASS\n");
     return 0;

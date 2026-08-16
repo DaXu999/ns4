@@ -28,7 +28,7 @@
 #define CK(x) do { cudaError_t e = (x); if (e != cudaSuccess) { \
     fprintf(stderr, "%s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(e)); exit(1); } } while (0)
 
-/* ---- verbatim device helpers from ds4_cuda.cu ---- */
+/* ---- verbatim device helpers from ns4_cuda.cu ---- */
 __device__ static float warp_sum_f32(float v) {
     for (int offset = 16; offset > 0; offset >>= 1) {
         v += __shfl_down_sync(0xffffffffu, v, offset);

@@ -116,7 +116,7 @@ static int get_mmq_x_max_host(const int cc) {
 #else
             MMQ_DP4A_MAX_BATCH_SIZE : 64;
 #endif // GGML_CUDA_FORCE_MMQ
-    // ds4: optional Step-4 experiment hook. DS4_CUDA_MMQ_X_MAX=N clips the
+    // ns4: optional Step-4 experiment hook. NS4_CUDA_MMQ_X_MAX=N clips the
     // tile-width selector to N when sweeping for an sm_120-specific
     // optimum.  Value rounded down to a multiple of 8 (the iteration step
     // of the mmq_x picker) and capped at base.  Cached on first call.
@@ -124,7 +124,7 @@ static int get_mmq_x_max_host(const int cc) {
     static int g_override      = 0;
     if (!g_override_init) {
         g_override_init = 1;
-        const char * env = getenv("DS4_CUDA_MMQ_X_MAX");
+        const char * env = getenv("NS4_CUDA_MMQ_X_MAX");
         if (env && env[0]) {
             char * end = nullptr;
             long v = strtol(env, &end, 10);
@@ -1704,9 +1704,9 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
     }
 }
 
-// ds4 (P4 Inc3): aligned row-pair-SoA twin of load_tiles_q2_K.  x points at
+// ns4 (P4 Inc3): aligned row-pair-SoA twin of load_tiles_q2_K.  x points at
 // the weight-server artifact [uint2 dm2 | int4 sc4 | uint2 qs2] (row pairs
-// interleaved; q2_k_aligned_derepack_kernel in ds4_mmq.cu is the byte-level
+// interleaved; q2_k_aligned_derepack_kernel in ns4_mmq.cu is the byte-level
 // spec this inverts) and soa_npair is the total pair count = nblk/2, from
 // which the section offsets derive.  Every tile_x element is the same value
 // the standard loader reads from the raw 84-byte block, moved through
@@ -2918,9 +2918,9 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
     }
 }
 
-// ds4 (P4 Inc3): aligned-SoA twin of load_tiles_iq2_xxs.  x points at the
+// ns4 (P4 Inc3): aligned-SoA twin of load_tiles_iq2_xxs.  x points at the
 // weight-server artifact [__half dq | uint2 qs] (iq2_xxs_aligned_derepack_kernel
-// in ds4_mmq.cu is the byte-level spec) and soa_nblk is the total block
+// in ns4_mmq.cu is the byte-level spec) and soa_nblk is the total block
 // count.  Each lane's (q2, aux32) int pair is exactly one artifact uint2, so
 // the loads are 8-byte aligned and fully coalesced; the unpack math is the
 // standard loader's, making tile_x bit-identical.
@@ -3679,7 +3679,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
-        // ds4 (P4 Inc3): when the caller supplies an aligned-SoA weight
+        // ns4 (P4 Inc3): when the caller supplies an aligned-SoA weight
         // artifact, load tiles from it directly instead of the raw block
         // stream (which, for repacked MoE tensors, would have to be
         // re-derepacked into a scratch every layer switch).  x_soa is
@@ -3830,7 +3830,7 @@ static __global__ void mul_mat_q(
                     break;
                 }
 
-                // ds4 (S1.1a): the final column tile of an expert is partial
+                // ns4 (S1.1a): the final column tile of an expert is partial
                 // when col_diff % mmq_x != 0; reading all mmq_x lanes over-reads
                 // ids_dst past col_high (OOB for the last expert -- confirmed by
                 // compute-sanitizer memcheck).  These lanes are masked out of
@@ -3916,7 +3916,7 @@ static __global__ void mul_mat_q(
                     break;
                 }
 
-                // ds4 (S1.1a): the final column tile of an expert is partial
+                // ns4 (S1.1a): the final column tile of an expert is partial
                 // when col_diff % mmq_x != 0; reading all mmq_x lanes over-reads
                 // ids_dst past col_high (OOB for the last expert -- confirmed by
                 // compute-sanitizer memcheck).  These lanes are masked out of
@@ -4124,7 +4124,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
     const int col_diff = col_high - col_low;
 
     for (int j = threadIdx.y*warp_size + threadIdx.x; j < mmq_x; j += nwarps*warp_size) {
-        // ds4 (S1.1a): clamp the partial last-tile read to valid columns; the
+        // ns4 (S1.1a): clamp the partial last-tile read to valid columns; the
         // masked-out lanes (tile_y_max_j) otherwise over-read ids_dst past
         // col_high -- OOB for the last expert (compute-sanitizer memcheck).
         const int j_col = jt*mmq_x + j;
@@ -4159,7 +4159,7 @@ struct mmq_args {
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     bool use_stream_k; int64_t ncols_max;
-    // ds4 (P4 Inc3): optional aligned-SoA weight artifact.  When x_soa is
+    // ns4 (P4 Inc3): optional aligned-SoA weight artifact.  When x_soa is
     // non-null (Q2_K / IQ2_XXS only) the kernel loads tiles from it and x is
     // ignored; soa_blocks = pair count (Q2_K) or block count (IQ2_XXS).
     // Trailing fields so existing aggregate initializers value-init them.

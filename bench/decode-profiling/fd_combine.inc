@@ -43,7 +43,7 @@ static constexpr uint32_t kFDCombDims = 128u;
  * Decode issues this eagerly, so what lands is the eager column: 1.3-2.1 us
  * per layer, 43 layers, ~0.3-0.45% of a 19 ms token.  Real, free, and an order
  * of magnitude under the +/-5% this box drifts between runs -- which is why it
- * has to be measured standalone and cannot be read off a ds4-bench pair. */
+ * has to be measured standalone and cannot be read off a ns4-bench pair. */
 __global__ __launch_bounds__(kFDCombDims)
 static void attention_flash_decode_combine_kernel(
         float *heads,

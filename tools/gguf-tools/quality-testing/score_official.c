@@ -1,6 +1,6 @@
-#include "ds4.h"
-#include "ds4_gpu_args.h"
-#include "ds4_ssd.h"
+#include "ns4.h"
+#include "ns4_gpu_args.h"
+#include "ns4_ssd.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -398,7 +398,7 @@ static bool api_ref_load(const char *path, api_ref *ref) {
     }
 }
 
-static int api_alt_token_id(ds4_engine *engine, const api_alt *alt) {
+static int api_alt_token_id(ns4_engine *engine, const api_alt *alt) {
     if (!alt || !alt->bytes || alt->len <= 0) return -1;
     for (int i = 0; i < alt->len; i++) {
         if (alt->bytes[i] == 0) return -1;
@@ -408,25 +408,25 @@ static int api_alt_token_id(ds4_engine *engine, const api_alt *alt) {
     memcpy(text, alt->bytes, (size_t)alt->len);
     text[alt->len] = '\0';
 
-    ds4_tokens tv = {0};
-    ds4_tokenize_text(engine, text, &tv);
+    ns4_tokens tv = {0};
+    ns4_tokenize_text(engine, text, &tv);
     int id = tv.len == 1 ? tv.v[0] : -1;
     if (id >= 0) {
         size_t got_len = 0;
-        char *got = ds4_token_text(engine, id, &got_len);
+        char *got = ns4_token_text(engine, id, &got_len);
         if (got_len != (size_t)alt->len || memcmp(got, alt->bytes, (size_t)alt->len) != 0) {
             id = -1;
         }
         free(got);
     }
-    ds4_tokens_free(&tv);
+    ns4_tokens_free(&tv);
     free(text);
     return id;
 }
 
-static bool local_logits(ds4_session *session, float *logits, int n_vocab,
+static bool local_logits(ns4_session *session, float *logits, int n_vocab,
                          double *logsum, int *argmax) {
-    if (ds4_session_copy_logits(session, logits, n_vocab) != n_vocab) return false;
+    if (ns4_session_copy_logits(session, logits, n_vocab) != n_vocab) return false;
     float max_logit = -INFINITY;
     int best = -1;
     for (int i = 0; i < n_vocab; i++) {
@@ -546,7 +546,7 @@ int main(int argc, char **argv) {
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             ssd_streaming_cold = true;
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
-            if (!ds4_parse_streaming_cache_experts_arg(
+            if (!ns4_parse_streaming_cache_experts_arg(
                     need_arg(&i, argc, argv, arg),
                     &ssd_streaming_cache_experts,
                     &ssd_streaming_cache_bytes)) {
@@ -568,12 +568,12 @@ int main(int argc, char **argv) {
     }
     if (ctx_size < 1024) ctx_size = 1024;
 
-    ds4_engine_options opt = {
+    ns4_engine_options opt = {
         .model_path = model_path,
 #ifdef __APPLE__
-        .backend = DS4_BACKEND_CUDA,
+        .backend = NS4_BACKEND_CUDA,
 #else
-        .backend = DS4_BACKEND_CUDA,
+        .backend = NS4_BACKEND_CUDA,
 #endif
         .n_threads = 0,
         .context_size = ctx_size,
@@ -588,12 +588,12 @@ int main(int argc, char **argv) {
         .ssd_streaming_cold = ssd_streaming_cold,
     };
 
-    ds4_engine *engine = NULL;
+    ns4_engine *engine = NULL;
     if (gpu_vram_arg || gpu_devices_arg) {
 #ifdef __APPLE__
         die("score_official: CUDA GPU placement is unavailable on macOS");
 #else
-        ds4_gpu_config gpu_cfg = {0};
+        ns4_gpu_config gpu_cfg = {0};
         bool skip_cuda = false;
         char gpu_err[256];
         if (parse_gpu_vram_arg(gpu_vram_arg, gpu_devices_arg,
@@ -605,7 +605,7 @@ int main(int argc, char **argv) {
         if (skip_cuda) {
             die("score_official: --gpu-vram 0 is not supported");
         }
-        if (ds4_engine_create_with_gpu_config(&engine, &opt, &gpu_cfg) != 0) {
+        if (ns4_engine_create_with_gpu_config(&engine, &opt, &gpu_cfg) != 0) {
             die("failed to open model");
         }
 #endif
@@ -613,13 +613,13 @@ int main(int argc, char **argv) {
         if (cuda_tensor_parallel) {
             die("score_official: --cuda-tensor-parallel requires --gpu-vram or --gpu-devices");
         }
-        if (ds4_engine_open(&engine, &opt) != 0) die("failed to open model");
+        if (ns4_engine_open(&engine, &opt) != 0) die("failed to open model");
     }
 
-    ds4_session *session = NULL;
-    if (ds4_session_create(&session, engine, ctx_size) != 0) die("failed to create session");
+    ns4_session *session = NULL;
+    if (ns4_session_create(&session, engine, ctx_size) != 0) die("failed to create session");
 
-    const int n_vocab = ds4_engine_vocab_size(engine);
+    const int n_vocab = ns4_engine_vocab_size(engine);
     float *logits = malloc((size_t)n_vocab * sizeof(logits[0]));
     if (!logits) die("out of memory");
 
@@ -669,10 +669,10 @@ int main(int argc, char **argv) {
         bool api_aligned = false;
         api_metrics cm = {0};
 
-        ds4_tokens prompt = {0};
-        ds4_tokens target = {0};
-        ds4_encode_chat_prompt(engine, NULL, prompt_text, DS4_THINK_NONE, &prompt);
-        ds4_tokenize_text(engine, cont_text, &target);
+        ns4_tokens prompt = {0};
+        ns4_tokens target = {0};
+        ns4_encode_chat_prompt(engine, NULL, prompt_text, NS4_THINK_NONE, &prompt);
+        ns4_tokenize_text(engine, cont_text, &target);
 
         if (prompt.len + target.len + 1 >= ctx_size) {
             fprintf(stderr, "%s exceeds ctx=%d\n", id, ctx_size);
@@ -693,7 +693,7 @@ int main(int argc, char **argv) {
         }
         total_api_ref_tokens += have_api ? ref.n_pos : 0;
 
-        if (ds4_session_sync(session, &prompt, err, sizeof(err)) != 0) {
+        if (ns4_session_sync(session, &prompt, err, sizeof(err)) != 0) {
             fprintf(stderr, "%s sync failed: %s\n", id, err);
             return 1;
         }
@@ -780,7 +780,7 @@ int main(int argc, char **argv) {
                 }
             }
 
-            if (ds4_session_eval(session, target.v[i], err, sizeof(err)) != 0) {
+            if (ns4_session_eval(session, target.v[i], err, sizeof(err)) != 0) {
                 fprintf(stderr, "%s eval failed at target token %d: %s\n", id, i, err);
                 return 1;
             }
@@ -836,8 +836,8 @@ int main(int argc, char **argv) {
                 safe_ratio(cm.pair_agree, cm.pair_total));
 
         api_ref_free(&ref);
-        ds4_tokens_free(&prompt);
-        ds4_tokens_free(&target);
+        ns4_tokens_free(&prompt);
+        ns4_tokens_free(&target);
         free(prompt_text);
         free(cont_text);
     }
@@ -878,7 +878,7 @@ int main(int argc, char **argv) {
     fclose(out);
     fclose(mf);
     free(logits);
-    ds4_session_free(session);
-    ds4_engine_close(engine);
+    ns4_session_free(session);
+    ns4_engine_close(engine);
     return 0;
 }

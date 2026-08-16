@@ -426,7 +426,7 @@ static __global__ void mul_mat_vec_q(
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
     sample_dst = blockIdx.z;
 
-    // ds4 task #23 (same guard as mul_mat_vec_q_moe): a -1 router id cast to
+    // ns4 task #23 (same guard as mul_mat_vec_q_moe): a -1 router id cast to
     // uint32 is a wild weight-channel offset.  Redirect to channel 0 and skip
     // the dot loop below so the output is a clean 0.
     const bool invalid_id = ncols_dst == 1 && ids && (int32_t)channel_x < 0;
@@ -631,7 +631,7 @@ static __global__ void mul_mat_vec_q_moe(
         return;
     }
 
-    // ds4 task #23: the router's NaN path emits -1 expert ids by design; cast
+    // ns4 task #23: the router's NaN path emits -1 expert ids by design; cast
     // to uint32 that becomes a wild weight-channel offset (cuda-gdb-convicted
     // Warp Illegal Address in vec_dot_q4_K_q8_1 on sm_100).  Redirect the
     // pointer math to expert 0 and skip the dot loop so the row writes a
@@ -896,7 +896,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
     GGML_UNUSED(has_fusion);
 }
-// ds4: was `static` in upstream. Exposed here so ds4_mmq.cu can call mmvq
+// ns4: was `static` in upstream. Exposed here so ns4_mmq.cu can call mmvq
 // directly without going through the ggml_tensor dispatch entries below.
 void mul_mat_vec_q_switch_type(
         const void * vx, const ggml_type type_x, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -1045,11 +1045,11 @@ void mul_mat_vec_q_switch_type(
     }
 }
 
-// ds4: ggml-graph entry points elided.  ds4 calls mul_mat_vec_q_switch_type
-// (above) directly through ds4_mmq.cu and never builds ggml_tensor structs.
-// Re-enable with DS4_MMVQ_INCLUDE_GGML_ENTRIES if the full upstream entries
+// ns4: ggml-graph entry points elided.  ns4 calls mul_mat_vec_q_switch_type
+// (above) directly through ns4_mmq.cu and never builds ggml_tensor structs.
+// Re-enable with NS4_MMVQ_INCLUDE_GGML_ENTRIES if the full upstream entries
 // are needed for parity comparisons against llama.cpp.
-#ifdef DS4_MMVQ_INCLUDE_GGML_ENTRIES
+#ifdef NS4_MMVQ_INCLUDE_GGML_ENTRIES
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -1180,4 +1180,4 @@ void ggml_cuda_op_mul_mat_vec_q(
 
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
 }
-#endif // DS4_MMVQ_INCLUDE_GGML_ENTRIES
+#endif // NS4_MMVQ_INCLUDE_GGML_ENTRIES

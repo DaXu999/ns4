@@ -1,4 +1,4 @@
-#include "ds4_mmq.h"
+#include "ns4_mmq.h"
 
 #include <cuda_runtime.h>
 
@@ -10,7 +10,7 @@
 #include <random>
 #include <vector>
 
-extern "C" int ds4_cuda_q8_fold_take_q81(
+extern "C" int ns4_cuda_q8_fold_take_q81(
         const void *src, uint64_t in_dim, const void **q81) {
     (void)src;
     (void)in_dim;
@@ -155,7 +155,7 @@ bool test_dense_and_moe() {
                     cudaMemcpyHostToDevice, stream);
     cudaMemcpyAsync(d_x, dense_x.data(), dense_x.size() * sizeof(float),
                     cudaMemcpyHostToDevice, stream);
-    int rc = ds4_mmq_mxfp4_dense(d_weights, d_x, d_out, M, N, K, stream);
+    int rc = ns4_mmq_mxfp4_dense(d_weights, d_x, d_out, M, N, K, stream);
     std::vector<float> dense_got(dense_ref.size());
     cudaMemcpyAsync(dense_got.data(), d_out,
                     dense_got.size() * sizeof(float),
@@ -166,7 +166,7 @@ bool test_dense_and_moe() {
                      "MXFP4 dense MMQ");
     bool ok = dense_ok;
     if (native_fp4) {
-        const int guard_rc = ds4_mmq_mxfp4_dense(
+        const int guard_rc = ns4_mmq_mxfp4_dense(
             d_weights, d_x, d_out, M, N, K / 2, stream);
         const bool guard_ok = guard_rc != 0;
         std::fprintf(stderr, "MXFP4 Blackwell K-tile guard: %s\n",
@@ -225,7 +225,7 @@ bool test_dense_and_moe() {
                     cudaMemcpyHostToDevice, stream);
     cudaMemcpyAsync(d_ids, ids.data(), ids.size() * sizeof(int32_t),
                     cudaMemcpyHostToDevice, stream);
-    rc = ds4_mmq_mxfp4_moe(d_weights, d_x, d_ids, d_out,
+    rc = ns4_mmq_mxfp4_moe(d_weights, d_x, d_ids, d_out,
                             M, K, n_tokens, n_experts, n_used, stream);
     std::vector<float> moe_got(moe_ref.size());
     cudaMemcpyAsync(moe_got.data(), d_out, moe_got.size() * sizeof(float),
@@ -236,7 +236,7 @@ bool test_dense_and_moe() {
                      "MXFP4 routed MMQ");
     ok = ok && moe_mmq_ok;
 
-    rc = ds4_mmq_mxfp4_moe_vec(d_weights, d_x, d_ids, d_out,
+    rc = ns4_mmq_mxfp4_moe_vec(d_weights, d_x, d_ids, d_out,
                                 M, K, n_tokens, n_experts, n_used, stream);
     std::vector<float> moe_vec_got(moe_ref.size());
     cudaMemcpyAsync(moe_vec_got.data(), d_out,
@@ -307,13 +307,13 @@ bool test_fused_decode() {
     cudaMemcpyAsync(d_router, router.data(), router.size() * sizeof(float),
                     cudaMemcpyHostToDevice, stream);
 
-    int rc_gate = ds4_mmq_mxfp4_moe_vec(
+    int rc_gate = ns4_mmq_mxfp4_moe_vec(
         d_gate, d_x, d_ids, d_gate_out, mid_dim, input_dim,
         1, n_experts, n_used, stream);
-    int rc_up = ds4_mmq_mxfp4_moe_vec(
+    int rc_up = ns4_mmq_mxfp4_moe_vec(
         d_up, d_x, d_ids, d_up_out, mid_dim, input_dim,
         1, n_experts, n_used, stream);
-    int rc_mid = ds4_mmq_mxfp4_moe_gate_up_mid_vec(
+    int rc_mid = ns4_mmq_mxfp4_moe_gate_up_mid_vec(
         d_gate, d_up, d_x, d_ids, d_router, d_mid,
         mid_dim, input_dim, 1, n_experts, n_used, 7.0f, stream);
 
@@ -339,10 +339,10 @@ bool test_fused_decode() {
         close_enough(mid, mid_ref, 0.02f, 0.002f,
                      "MXFP4 fused gate/up decode");
 
-    int rc_slots = ds4_mmq_mxfp4_moe_vec(
+    int rc_slots = ns4_mmq_mxfp4_moe_vec(
         d_down, d_mid, d_ids, d_slots, out_dim, mid_dim,
         n_used, n_experts, 1, stream);
-    int rc_sum = ds4_mmq_mxfp4_moe_down_sum6_vec(
+    int rc_sum = ns4_mmq_mxfp4_moe_down_sum6_vec(
         d_down, d_mid, d_ids, d_out, out_dim, mid_dim,
         1, n_experts, n_used, stream);
     std::vector<float> slots((size_t)n_used * out_dim), out(out_dim);
@@ -379,8 +379,8 @@ bool test_fused_decode() {
 } // namespace
 
 int main() {
-    if (ds4_mmq_init(0) != 0) {
-        std::fprintf(stderr, "ds4_mmq_init failed\n");
+    if (ns4_mmq_init(0) != 0) {
+        std::fprintf(stderr, "ns4_mmq_init failed\n");
         return 1;
     }
     const bool matrix_ok = test_dense_and_moe();

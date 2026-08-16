@@ -48,7 +48,7 @@
 #define ROOFLINE 1642.0   /* GB/s, bw_probe.cu, 8 GB stream */
 
 /* ---- the shipped kernel, extracted verbatim ------------------------------
- * sed -n '4845,4886p' ds4_cuda.cu > f16pair_baseline.inc                  */
+ * sed -n '4845,4886p' ns4_cuda.cu > f16pair_baseline.inc                  */
 #include "f16pair_baseline.inc"
 
 /* ---- variant: stage the row pair through shared, compute unchanged ------

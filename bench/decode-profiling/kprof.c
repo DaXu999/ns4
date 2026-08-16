@@ -177,7 +177,7 @@ __attribute__((destructor)) static void kprof_fini(void) {
 }
 
 /* Recording an event on a stream that is mid-capture makes the capture
- * invalid ("invalid argument" at the next launch), so ds4 loses every decode
+ * invalid ("invalid argument" at the next launch), so ns4 loses every decode
  * island and silently runs eager -- i.e. profiling would destroy the thing
  * being profiled.  Skip those launches: they are captured once and then
  * replayed via cudaGraphLaunch, which this interposer does not see anyway.

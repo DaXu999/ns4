@@ -124,7 +124,7 @@ static __global__ void mm_ids_helper(
     expert_bounds[gridDim.x] = nex_prev + it_compact;
 }
 
-// ds4 local (P5): large-n variant of mm_ids_helper with NO shared-memory
+// ns4 local (P5): large-n variant of mm_ids_helper with NO shared-memory
 // staging.  The smem kernel above stages the compact (it, iex_used) list in
 // n_tokens*4 B of dynamic shared memory, capping n_tokens at smpbo/4 (~25k on
 // GB10); the routed-MoE down matmul passes n_tokens = assignment rows
@@ -236,13 +236,13 @@ static __global__ void mm_ids_helper_global(
     expert_bounds[gridDim.x] = nex_prev + it_compact_count;
 }
 
-// ds4 local: kill switch for the large-n global path (DS4_MMID_LARGE=0).
-// With the switch off the ds4_mmq.cu callers refuse past-cap shapes exactly
+// ns4 local: kill switch for the large-n global path (NS4_MMID_LARGE=0).
+// With the switch off the ns4_mmq.cu callers refuse past-cap shapes exactly
 // as before (whole-MoE fallback to the expert-tile kernels).
-bool ds4_mmid_large_enabled(void) {
+bool ns4_mmid_large_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
-        const char * env = getenv("DS4_MMID_LARGE");
+        const char * env = getenv("NS4_MMID_LARGE");
         cached = !(env && env[0] == '0');
     }
     return cached != 0;
@@ -263,14 +263,14 @@ static void launch_mm_ids_helper(
     const dim3 block_size(warp_size, 1, 1);
     const size_t nbytes_shared = n_tokens*sizeof(mm_ids_helper_store);
 
-    // ds4 local (P5): past the smem cap, take the two-pass global variant
+    // ns4 local (P5): past the smem cap, take the two-pass global variant
     // (bit-identical outputs, see mm_ids_helper_global).  One-shot stderr
     // line = path proof for the gate harnesses.
     if (nbytes_shared > smpbo) {
         static bool logged = false;
         if (!logged) {
             logged = true;
-            fprintf(stderr, "ds4: mm_ids_helper large-n global path engaged (P5, n_tokens=%d > cap %zu)\n",
+            fprintf(stderr, "ns4: mm_ids_helper large-n global path engaged (P5, n_tokens=%d > cap %zu)\n",
                     n_tokens, smpbo / sizeof(mm_ids_helper_store));
         }
         mm_ids_helper_global<n_expert_used_template><<<num_blocks, block_size, 0, stream>>>
@@ -283,11 +283,11 @@ static void launch_mm_ids_helper(
         (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1);
 }
 
-// ds4 local: kill switch for the case-1 fast path below (DS4_MMID_CASE1=0).
-static bool ds4_mmid_case1_enabled() {
+// ns4 local: kill switch for the case-1 fast path below (NS4_MMID_CASE1=0).
+static bool ns4_mmid_case1_enabled() {
     static int cached = -1;
     if (cached < 0) {
-        const char * env = getenv("DS4_MMID_CASE1");
+        const char * env = getenv("NS4_MMID_CASE1");
         cached = !(env && env[0] == '0');
     }
     return cached != 0;
@@ -298,17 +298,17 @@ void ggml_cuda_launch_mm_ids_helper(
         const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, cudaStream_t stream) {
     switch (n_expert_used) {
         case  1:
-            // ds4 local: the routed-MoE down matmul reinterprets (token, slot)
-            // assignment rows as single-expert "tokens" (ds4_mmq.cu
-            // ds4_mmq_moe_impl, n_expert_used=1).  Without this case it fell to
+            // ns4 local: the routed-MoE down matmul reinterprets (token, slot)
+            // assignment rows as single-expert "tokens" (ns4_mmq.cu
+            // ns4_mmq_moe_impl, n_expert_used=1).  Without this case it fell to
             // the generic <0> template: one warp per expert scanning all
             // assignment rows with a single active lane -> 22.5 ms/launch at
             // W4096 prefill (2.90 s of a 12k admission).  The optimized template
             // at neu_padded=1 covers 32 rows/iteration and emits bit-identical
             // id maps (proto_mm_ids.cu: parity on uniform/skewed/2%-invalid/
-            // decode shapes, 20.4x at the W4096 shape).  DS4_MMID_CASE1=0
+            // decode shapes, 20.4x at the W4096 shape).  NS4_MMID_CASE1=0
             // reverts to the generic path.
-            if (ds4_mmid_case1_enabled()) {
+            if (ns4_mmid_case1_enabled()) {
                 launch_mm_ids_helper< 1>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, stream);
             } else {
                 launch_mm_ids_helper< 0>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, stream);

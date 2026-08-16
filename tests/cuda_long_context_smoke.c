@@ -1,4 +1,4 @@
-#include "ds4_gpu.h"
+#include "ns4_gpu.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -34,23 +34,23 @@ static int check_large_topk(void) {
         }
     }
 
-    ds4_gpu_tensor *scores = ds4_gpu_tensor_alloc(score_count * sizeof(float));
-    ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc((uint64_t)n_tokens * top_k * sizeof(uint32_t));
+    ns4_gpu_tensor *scores = ns4_gpu_tensor_alloc(score_count * sizeof(float));
+    ns4_gpu_tensor *selected = ns4_gpu_tensor_alloc((uint64_t)n_tokens * top_k * sizeof(uint32_t));
     int rc = 1;
     double elapsed = 0.0;
     if (scores && selected &&
-        ds4_gpu_tensor_write(scores, 0, scores_host, score_count * sizeof(float))) {
+        ns4_gpu_tensor_write(scores, 0, scores_host, score_count * sizeof(float))) {
         /* Exclude one-time CUDA module/kernel setup from the throughput guard. */
-        if (!ds4_gpu_indexer_topk_tensor(selected, scores, n_comp, n_tokens, top_k) ||
-            !ds4_gpu_synchronize()) {
+        if (!ns4_gpu_indexer_topk_tensor(selected, scores, n_comp, n_tokens, top_k) ||
+            !ns4_gpu_synchronize()) {
             rc = 1;
             goto cleanup;
         }
         const double t0 = monotonic_seconds();
-        if (ds4_gpu_indexer_topk_tensor(selected, scores, n_comp, n_tokens, top_k) &&
-            ds4_gpu_synchronize()) {
+        if (ns4_gpu_indexer_topk_tensor(selected, scores, n_comp, n_tokens, top_k) &&
+            ns4_gpu_synchronize()) {
             elapsed = monotonic_seconds() - t0;
-            rc = ds4_gpu_tensor_read(selected, 0, selected_host,
+            rc = ns4_gpu_tensor_read(selected, 0, selected_host,
                                      (uint64_t)n_tokens * top_k * sizeof(uint32_t)) ? 0 : 1;
         }
     }
@@ -69,7 +69,7 @@ static int check_large_topk(void) {
         }
     }
     if (rc == 0) {
-        const double max_seconds = getenv_seconds("DS4_CUDA_TOPK_REGRESSION_SEC", 2.0);
+        const double max_seconds = getenv_seconds("NS4_CUDA_TOPK_REGRESSION_SEC", 2.0);
         fprintf(stderr, "cuda-regression: top-k n_comp=%u n_tokens=%u elapsed=%.3fs\n",
                 n_comp, n_tokens, elapsed);
         if (elapsed > max_seconds) {
@@ -79,8 +79,8 @@ static int check_large_topk(void) {
     }
 
 cleanup:
-    ds4_gpu_tensor_free(selected);
-    ds4_gpu_tensor_free(scores);
+    ns4_gpu_tensor_free(selected);
+    ns4_gpu_tensor_free(scores);
     free(selected_host);
     free(scores_host);
     return rc;
@@ -106,16 +106,16 @@ static int check_decode_attention_overflow_path(void) {
         comp_host[(uint64_t)c * head_dim] = 1.0f;
     }
 
-    ds4_gpu_tensor *heads = ds4_gpu_tensor_alloc(q_count * sizeof(float));
-    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(q_count * sizeof(float));
-    ds4_gpu_tensor *raw = ds4_gpu_tensor_alloc(raw_count * sizeof(float));
-    ds4_gpu_tensor *comp = ds4_gpu_tensor_alloc(comp_count * sizeof(float));
+    ns4_gpu_tensor *heads = ns4_gpu_tensor_alloc(q_count * sizeof(float));
+    ns4_gpu_tensor *q = ns4_gpu_tensor_alloc(q_count * sizeof(float));
+    ns4_gpu_tensor *raw = ns4_gpu_tensor_alloc(raw_count * sizeof(float));
+    ns4_gpu_tensor *comp = ns4_gpu_tensor_alloc(comp_count * sizeof(float));
     int rc = 1;
     if (heads && q && raw && comp &&
-        ds4_gpu_tensor_write(q, 0, q_host, q_count * sizeof(float)) &&
-        ds4_gpu_tensor_write(raw, 0, raw_host, raw_count * sizeof(float)) &&
-        ds4_gpu_tensor_write(comp, 0, comp_host, comp_count * sizeof(float)) &&
-        ds4_gpu_attention_decode_heads_tensor(heads,
+        ns4_gpu_tensor_write(q, 0, q_host, q_count * sizeof(float)) &&
+        ns4_gpu_tensor_write(raw, 0, raw_host, raw_count * sizeof(float)) &&
+        ns4_gpu_tensor_write(comp, 0, comp_host, comp_count * sizeof(float)) &&
+        ns4_gpu_attention_decode_heads_tensor(heads,
                                               sinks,
                                               n_head * sizeof(float),
                                               0,
@@ -131,8 +131,8 @@ static int check_decode_attention_overflow_path(void) {
                                               0,
                                               n_head,
                                               head_dim) &&
-        ds4_gpu_synchronize() &&
-        ds4_gpu_tensor_read(heads, 0, heads_host, q_count * sizeof(float))) {
+        ns4_gpu_synchronize() &&
+        ns4_gpu_tensor_read(heads, 0, heads_host, q_count * sizeof(float))) {
         rc = 0;
         for (uint32_t h = 0; h < n_head; h++) {
             const float v = heads_host[(uint64_t)h * head_dim];
@@ -144,10 +144,10 @@ static int check_decode_attention_overflow_path(void) {
         }
     }
 
-    ds4_gpu_tensor_free(comp);
-    ds4_gpu_tensor_free(raw);
-    ds4_gpu_tensor_free(q);
-    ds4_gpu_tensor_free(heads);
+    ns4_gpu_tensor_free(comp);
+    ns4_gpu_tensor_free(raw);
+    ns4_gpu_tensor_free(q);
+    ns4_gpu_tensor_free(heads);
     free(heads_host);
     free(comp_host);
     free(raw_host);
@@ -157,10 +157,10 @@ static int check_decode_attention_overflow_path(void) {
 }
 
 int main(void) {
-    if (!ds4_gpu_init()) return 1;
+    if (!ns4_gpu_init()) return 1;
     int rc = check_large_topk();
     if (check_decode_attention_overflow_path() != 0) rc = 1;
-    ds4_gpu_cleanup();
+    ns4_gpu_cleanup();
     if (rc == 0) puts("cuda long-context regression: OK");
     return rc;
 }

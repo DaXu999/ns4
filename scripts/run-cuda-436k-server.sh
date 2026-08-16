@@ -14,7 +14,7 @@
 #      --ctx 468000 sits at 8164 MiB, just under it.
 #   2. free VRAM for prefill scratch -- prefill's transient buffers and cuBLAS
 #      workspace come out of whatever the planned KV leaves behind, and the
-#      VRAM reserve does not guard them (ds4_cuda.cu:1417). This one binds
+#      VRAM reserve does not guard them (ns4_cuda.cu:1417). This one binds
 #      well before (1), degrades gradually rather than failing, and is the
 #      reason for 436000.
 #
@@ -51,7 +51,7 @@
 # 68.8 -> 3.2 t/s). The tells in the log are `free=0.00 GiB` on the
 # `q8 fp16 cache budget exhausted` line.
 #
-# Every value below can be overridden from the environment; extra ds4-server
+# Every value below can be overridden from the environment; extra ns4-server
 # flags are passed through.
 
 set -euo pipefail
@@ -59,30 +59,30 @@ set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd -- "$ROOT"
 
-MODEL="${DS4_MODEL:-$ROOT/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf}"
-CTX="${DS4_CTX:-436000}"
-PREFILL_CHUNK="${DS4_PREFILL_CHUNK:-2048}"
-GPU_VRAM="${DS4_GPU_VRAM:-94}"
-SERVER_HOST="${DS4_SERVER_HOST:-127.0.0.1}"
-SERVER_PORT="${DS4_SERVER_PORT:-8000}"
+MODEL="${NS4_MODEL:-$ROOT/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf}"
+CTX="${NS4_CTX:-436000}"
+PREFILL_CHUNK="${NS4_PREFILL_CHUNK:-2048}"
+GPU_VRAM="${NS4_GPU_VRAM:-94}"
+SERVER_HOST="${NS4_SERVER_HOST:-127.0.0.1}"
+SERVER_PORT="${NS4_SERVER_PORT:-8000}"
 
 die() { printf 'run-cuda-436k-server: %s\n' "$*" >&2; exit 1; }
 
-[[ -f "$MODEL" ]] || die "model not found: $MODEL (set DS4_MODEL)"
-[[ -x ./ds4-server ]] || die "./ds4-server not built -- make ds4-server CUDA_ARCH=sm_120"
+[[ -f "$MODEL" ]] || die "model not found: $MODEL (set NS4_MODEL)"
+[[ -x ./ns4-server ]] || die "./ns4-server not built -- make ns4-server CUDA_ARCH=sm_120"
 
-# ds4-server links ds4_cuda.o but has its own link step, so a rebuild of the
+# ns4-server links ns4_cuda.o but has its own link step, so a rebuild of the
 # CUDA object does not update it. This has silently served a stale binary
 # before -- once after the FA2 work landed, and again after the 2026-08-12
 # decode kernels. Refuse rather than serve last week's kernels.
-if [[ -f ./src/ds4_cuda.o && ./src/ds4_cuda.o -nt ./ds4-server ]]; then
-    die "ds4-server is older than src/ds4_cuda.o -- relink first:
-       make ds4-server CUDA_ARCH=sm_120   (takes <1s if the objects are current)"
+if [[ -f ./src/ns4_cuda.o && ./src/ns4_cuda.o -nt ./ns4-server ]]; then
+    die "ns4-server is older than src/ns4_cuda.o -- relink first:
+       make ns4-server CUDA_ARCH=sm_120   (takes <1s if the objects are current)"
 fi
 
-export DS4_CUDA_NO_Q8_F16_CACHE="${DS4_CUDA_NO_Q8_F16_CACHE:-1}"
-export DS4_CUDA_WEIGHT_ARENA_CHUNK_MB="${DS4_CUDA_WEIGHT_ARENA_CHUNK_MB:-5184}"
-export DS4_CUDA_WEIGHT_PRELOAD_SPAN_MB="${DS4_CUDA_WEIGHT_PRELOAD_SPAN_MB:-512}"
+export NS4_CUDA_NO_Q8_F16_CACHE="${NS4_CUDA_NO_Q8_F16_CACHE:-1}"
+export NS4_CUDA_WEIGHT_ARENA_CHUNK_MB="${NS4_CUDA_WEIGHT_ARENA_CHUNK_MB:-5184}"
+export NS4_CUDA_WEIGHT_PRELOAD_SPAN_MB="${NS4_CUDA_WEIGHT_PRELOAD_SPAN_MB:-512}"
 
 # Decode levers validated 2026-08-15 (summation-order NLL protocol; see the
 # memory notes).  All are numerically different from the bit-exact default
@@ -92,19 +92,19 @@ export DS4_CUDA_WEIGHT_PRELOAD_SPAN_MB="${DS4_CUDA_WEIGHT_PRELOAD_SPAN_MB:-512}"
 #   F16_ONE_WIDE replaces the cuBLAS one-token f16 GEMVs (router, indexer
 #                projection, hc fns) and their f32->f16 feed conversions
 #   F16_PAIR_WIDE / Q8_PAIR_WIDE  wide compressor / q8 pair GEMVs
-export DS4_CUDA_INDEXER_SCAN_INT="${DS4_CUDA_INDEXER_SCAN_INT:-1}"
-export DS4_CUDA_F16_ONE_WIDE="${DS4_CUDA_F16_ONE_WIDE:-256}"
-export DS4_CUDA_F16_PAIR_WIDE="${DS4_CUDA_F16_PAIR_WIDE:-256}"
-export DS4_CUDA_Q8_PAIR_WIDE="${DS4_CUDA_Q8_PAIR_WIDE:-256}"
+export NS4_CUDA_INDEXER_SCAN_INT="${NS4_CUDA_INDEXER_SCAN_INT:-1}"
+export NS4_CUDA_F16_ONE_WIDE="${NS4_CUDA_F16_ONE_WIDE:-256}"
+export NS4_CUDA_F16_PAIR_WIDE="${NS4_CUDA_F16_PAIR_WIDE:-256}"
+export NS4_CUDA_Q8_PAIR_WIDE="${NS4_CUDA_Q8_PAIR_WIDE:-256}"
 # +7.5% decode at ctx 4096-8192, inert at 16k and above (accepted range ends
 # at 4096; the dense path cannot reach long context -- shared-memory bound).
-export DS4_CUDA_DECODE_INDEXER_SPARSE_THRESHOLD="${DS4_CUDA_DECODE_INDEXER_SPARSE_THRESHOLD:-4096}"
+export NS4_CUDA_DECODE_INDEXER_SPARSE_THRESHOLD="${NS4_CUDA_DECODE_INDEXER_SPARSE_THRESHOLD:-4096}"
 
 printf 'run-cuda-436k-server: ctx=%s prefill-chunk=%s gpu-vram=%s -> %s:%s\n' \
     "$CTX" "$PREFILL_CHUNK" "$GPU_VRAM" "$SERVER_HOST" "$SERVER_PORT"
 printf 'run-cuda-436k-server: expect "context buffers 7619.27 MiB"; over ~7800 and prefill starts to drop\n'
 
-exec ./ds4-server --cuda -m "$MODEL" \
+exec ./ns4-server --cuda -m "$MODEL" \
     --gpu-vram "$GPU_VRAM" \
     --prefill-chunk "$PREFILL_CHUNK" \
     --ctx "$CTX" \

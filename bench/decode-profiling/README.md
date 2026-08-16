@@ -18,7 +18,7 @@ time per kernel symbol, resolving names with `cuKernelGetName`.
         -L/usr/local/cuda/lib64/stubs -lcudart -lcuda -ldl
 
     KPROF_SKIP=1500 KPROF_MAX=32000 KPROF_OUT=decode.txt \
-      LD_PRELOAD=./kprof.so ./ds4-bench --cuda -m MODEL ... --gen-tokens 40
+      LD_PRELOAD=./kprof.so ./ns4-bench --cuda -m MODEL ... --gen-tokens 40
 
 `KPROF_SKIP` steps over prefill, `KPROF_MAX` caps the pool, `KPROF_AFTER_MS`
 delays arming, `KPROF_ROLL` recycles the pool so the surviving report covers
@@ -44,11 +44,11 @@ chain lengths from 4 to 1600 (a decode token). Shows the ~8x amortisation.
 ## fd_bench.cu / fd_sweep.cu - the shipped flash decode kernel
 
 Both `#include "fd_baseline.inc"`, which is extracted verbatim from
-`ds4_cuda.cu` so the comparison stays honest:
+`ns4_cuda.cu` so the comparison stays honest:
 
-    sed -n '9635,9640p' ds4_cuda.cu  > fd_baseline.inc
-    sed -n '9666,9713p' ds4_cuda.cu >> fd_baseline.inc
-    sed -n '9715,9888p' ds4_cuda.cu >> fd_baseline.inc
+    sed -n '9635,9640p' ns4_cuda.cu  > fd_baseline.inc
+    sed -n '9666,9713p' ns4_cuda.cu >> fd_baseline.inc
+    sed -n '9715,9888p' ns4_cuda.cu >> fd_baseline.inc
 
 (line numbers as of `8890139`; re-extract if the kernel moves). `fd_sweep`
 walks the kernel's `<WARPS, TILE>` template parameters and the rows-per-split
@@ -69,8 +69,8 @@ Shapes are hardcoded to DeepSeek-V4-Flash: 64 heads, 512-wide latent,
 Times `attention_flash_decode_combine_kernel` against the shape it replaced,
 and `memcmp`s their outputs to hold the "bit-identical" claim honest. The
 production kernel is `#include`d from `fd_combine.inc` (extracted verbatim from
-`ds4_cuda.cu`, recipe in the file header); the pre-rewrite control is frozen in
-the bench, since it is no longer in `ds4_cuda.cu` to extract.
+`ns4_cuda.cu`, recipe in the file header); the pre-rewrite control is frozen in
+the bench, since it is no longer in `ns4_cuda.cu` to extract.
 
     nvcc -O3 -arch=sm_120 -o fd_combine_bench fd_combine_bench.cu
     ./fd_combine_bench              # L2-warm, as in real decode
@@ -88,7 +88,7 @@ At the live `n_split = 27` the rewrite is 1.7x graph-amortised (5.2 -> 3.0 us)
 but only 1.5 us/call eager (9.6 -> 8.1), because submission and execution
 partly overlap. Over 43 layers that is ~0.3-0.45% of a token -- an order of
 magnitude under this box's run-to-run drift. Read a kernel win off the eager
-column before assuming ds4-bench could ever show it.
+column before assuming ns4-bench could ever show it.
 
 `--nscore=N` picks the sweep points; the default set ends at 640 (raw window
 128 + 512 top-k slots), which is every position past ctx 2048.
@@ -126,7 +126,7 @@ load-stall slack looks like. `cuda_block_iq2_xxs` is `{uint16 d; uint16
 qs[32];}`, so `qs` sits at offset 2 of a 66-byte block and block b's quants
 land at `66b + 2`, which is 2 mod 4 for even b: the compiler cannot merge the
 four `q2[0..3]` reads and the PTX shows `ld.global.b16`. Sourcing the same
-kernel from the aligned-SoA artifact `ds4_repack_build_iq2_aligned` already
+kernel from the aligned-SoA artifact `ns4_repack_build_iq2_aligned` already
 emits - `[__half dq[nblk]][pad 64B][uint2 qs[nblk*8]]`, byte-neutral - is
 **1.36x with uint2 loads and 1.40x with uint4**, and only then does ALU begin
 to bind (+4 ops then costs 11%).
@@ -141,7 +141,7 @@ clock averaging 1760 MHz.
 Times the shipped chunked-bitonic selection against a radix select at the live
 decode shape (`n_comp` 8202, `top_k` 512, one token) and at the frontiers a
 long context reaches. Baselines are `#include`d from `topk_baseline.inc`,
-extracted verbatim from `ds4_cuda.cu` (recipe in the file header).
+extracted verbatim from `ns4_cuda.cu` (recipe in the file header).
 
     nvcc -O3 -arch=sm_120 -o topk_bench topk_bench.cu
     ./topk_bench --n=16394          # ctx 65536

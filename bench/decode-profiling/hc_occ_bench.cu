@@ -11,8 +11,8 @@
  *   - the 64 KB weighted sum       (full kernel minus the above)
  *
  * Extraction recipe for the two verbatim pieces:
- *   sed -n '/^__device__ static void hc4_split_one/,/^}/p' ds4_cuda.cu
- *   sed -n '/^__global__ static void hc_split_weighted_sum_norm_fused_kernel/,/^}/p' ds4_cuda.cu
+ *   sed -n '/^__device__ static void hc4_split_one/,/^}/p' ns4_cuda.cu
+ *   sed -n '/^__global__ static void hc_split_weighted_sum_norm_fused_kernel/,/^}/p' ns4_cuda.cu
  *
  *   nvcc -O3 -arch=sm_120 -o hc_occ_bench hc_occ_bench.cu
  */

@@ -1,19 +1,19 @@
 /* Cross-device GPU tensor copy test (mgpu-device-aware-cuda).
  *
  * Exercises:
- *   - ds4_gpu_init_multi single-device and multi-device init paths.
- *   - ds4_gpu_tensor_alloc_on / ds4_gpu_tensor_free_in_place.
- *   - ds4_gpu_tensor_copy_xdev same-device fast path.
- *   - ds4_gpu_tensor_copy_xdev peer-auto and DS4_FORCE_HOST_BOUNCE paths
+ *   - ns4_gpu_init_multi single-device and multi-device init paths.
+ *   - ns4_gpu_tensor_alloc_on / ns4_gpu_tensor_free_in_place.
+ *   - ns4_gpu_tensor_copy_xdev same-device fast path.
+ *   - ns4_gpu_tensor_copy_xdev peer-auto and NS4_FORCE_HOST_BOUNCE paths
  *     (when 2+ GPUs are visible). */
 
-/* ds4_gpu_mgpu.h is standalone-C-compatible — it now provides the
- * complete ds4_gpu_tensor struct + typedef so callers can use the
- * bare type name. ds4_gpu.h is also included here only for the
- * legacy ds4_gpu_init / _cleanup / _tensor_read / _tensor_write
+/* ns4_gpu_mgpu.h is standalone-C-compatible — it now provides the
+ * complete ns4_gpu_tensor struct + typedef so callers can use the
+ * bare type name. ns4_gpu.h is also included here only for the
+ * legacy ns4_gpu_init / _cleanup / _tensor_read / _tensor_write
  * prototypes the test uses; the mgpu header does not duplicate them. */
-#include "ds4_gpu.h"
-#include "ds4_gpu_mgpu.h"
+#include "ns4_gpu.h"
+#include "ns4_gpu_mgpu.h"
 
 #include <cuda_runtime.h>
 #include <math.h>
@@ -42,13 +42,13 @@ static int run_one(int n_gpus_wanted, int force_bounce) {
         return 0;
     }
 
-    ds4_gpu_config cfg;
+    ns4_gpu_config cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.n_gpus = n_gpus_wanted;
     for (int i = 0; i < n_gpus_wanted; i++) cfg.device_indices[i] = i;
-    if (force_bounce) setenv("DS4_FORCE_HOST_BOUNCE", "1", 1);
-    else              unsetenv("DS4_FORCE_HOST_BOUNCE");
-    CHECK(ds4_gpu_init_multi(&cfg), "init_multi");
+    if (force_bounce) setenv("NS4_FORCE_HOST_BOUNCE", "1", 1);
+    else              unsetenv("NS4_FORCE_HOST_BOUNCE");
+    CHECK(ns4_gpu_init_multi(&cfg), "init_multi");
 
     const size_t N = 256 * 1024;
     float *host_src = (float *)malloc(N * sizeof(float));
@@ -56,32 +56,32 @@ static int run_one(int n_gpus_wanted, int force_bounce) {
     CHECK(host_src && host_dst, "host alloc");
     for (size_t i = 0; i < N; i++) host_src[i] = (float)(i % 997) * 0.5f;
 
-    ds4_gpu_tensor a; memset(&a, 0, sizeof(a));
-    ds4_gpu_tensor b; memset(&b, 0, sizeof(b));
-    CHECK(ds4_gpu_tensor_alloc_on(&a, 0, N * sizeof(float)) == 0,
+    ns4_gpu_tensor a; memset(&a, 0, sizeof(a));
+    ns4_gpu_tensor b; memset(&b, 0, sizeof(b));
+    CHECK(ns4_gpu_tensor_alloc_on(&a, 0, N * sizeof(float)) == 0,
           "alloc_on dev 0");
     int dst_dev = (n_gpus_wanted == 2) ? 1 : 0;
-    CHECK(ds4_gpu_tensor_alloc_on(&b, dst_dev, N * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&b, dst_dev, N * sizeof(float)) == 0,
           "alloc_on dst dev");
 
-    CHECK(ds4_gpu_tensor_write(&a, 0, host_src, N * sizeof(float)),
+    CHECK(ns4_gpu_tensor_write(&a, 0, host_src, N * sizeof(float)),
           "tensor_write");
-    CHECK(ds4_gpu_tensor_copy_xdev(&b, &a, N * sizeof(float)),
+    CHECK(ns4_gpu_tensor_copy_xdev(&b, &a, N * sizeof(float)),
           "tensor_copy_xdev");
-    CHECK(ds4_gpu_tensor_read(&b, 0, host_dst, N * sizeof(float)),
+    CHECK(ns4_gpu_tensor_read(&b, 0, host_dst, N * sizeof(float)),
           "tensor_read");
     CHECK(memcmp(host_src, host_dst, N * sizeof(float)) == 0,
           "data mismatch");
 
     /* device_id round-trip. */
-    CHECK(ds4_gpu_tensor_device(&a) == 0, "device_id a");
-    CHECK(ds4_gpu_tensor_device(&b) == dst_dev, "device_id b");
+    CHECK(ns4_gpu_tensor_device(&a) == 0, "device_id a");
+    CHECK(ns4_gpu_tensor_device(&b) == dst_dev, "device_id b");
 
-    ds4_gpu_tensor_free_in_place(&a);
-    ds4_gpu_tensor_free_in_place(&b);
+    ns4_gpu_tensor_free_in_place(&a);
+    ns4_gpu_tensor_free_in_place(&b);
     free(host_src);
     free(host_dst);
-    ds4_gpu_cleanup();
+    ns4_gpu_cleanup();
     fprintf(stderr, "  test_gpu_xdev OK (n_gpus=%d, force_bounce=%d)\n",
             n_gpus_wanted, force_bounce);
     return 0;
@@ -100,12 +100,12 @@ static int run_copy3(int n_gpus_wanted, int force_bounce) {
         return 0;
     }
 
-    ds4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
+    ns4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
     cfg.n_gpus = n_gpus_wanted;
     for (int i = 0; i < n_gpus_wanted; i++) cfg.device_indices[i] = i;
-    if (force_bounce) setenv("DS4_FORCE_HOST_BOUNCE", "1", 1);
-    else              unsetenv("DS4_FORCE_HOST_BOUNCE");
-    CHECK(ds4_gpu_init_multi(&cfg), "copy3 init_multi");
+    if (force_bounce) setenv("NS4_FORCE_HOST_BOUNCE", "1", 1);
+    else              unsetenv("NS4_FORCE_HOST_BOUNCE");
+    CHECK(ns4_gpu_init_multi(&cfg), "copy3 init_multi");
 
     const uint32_t n_embd = 4096u;
     const uint32_t n_expert = 3u;
@@ -122,42 +122,42 @@ static int run_copy3(int n_gpus_wanted, int force_bounce) {
     for (uint32_t i = 0; i < n_embd; i++) host_norm[i] = (float)((int)i - 1024) * 0.015625f;
 
     const int dst_dev = (n_gpus_wanted == 2) ? 1 : 0;
-    ds4_gpu_tensor norm_src; memset(&norm_src, 0, sizeof(norm_src));
-    ds4_gpu_tensor sel_src; memset(&sel_src, 0, sizeof(sel_src));
-    ds4_gpu_tensor w_src; memset(&w_src, 0, sizeof(w_src));
-    ds4_gpu_tensor norm_dst; memset(&norm_dst, 0, sizeof(norm_dst));
-    ds4_gpu_tensor sel_dst; memset(&sel_dst, 0, sizeof(sel_dst));
-    ds4_gpu_tensor w_dst; memset(&w_dst, 0, sizeof(w_dst));
-    CHECK(ds4_gpu_tensor_alloc_on(&norm_src, 0, norm_bytes) == 0, "copy3 alloc norm_src");
-    CHECK(ds4_gpu_tensor_alloc_on(&sel_src, 0, selected_bytes) == 0, "copy3 alloc sel_src");
-    CHECK(ds4_gpu_tensor_alloc_on(&w_src, 0, weights_bytes) == 0, "copy3 alloc w_src");
-    CHECK(ds4_gpu_tensor_alloc_on(&norm_dst, dst_dev, norm_bytes) == 0, "copy3 alloc norm_dst");
-    CHECK(ds4_gpu_tensor_alloc_on(&sel_dst, dst_dev, selected_bytes) == 0, "copy3 alloc sel_dst");
-    CHECK(ds4_gpu_tensor_alloc_on(&w_dst, dst_dev, weights_bytes) == 0, "copy3 alloc w_dst");
+    ns4_gpu_tensor norm_src; memset(&norm_src, 0, sizeof(norm_src));
+    ns4_gpu_tensor sel_src; memset(&sel_src, 0, sizeof(sel_src));
+    ns4_gpu_tensor w_src; memset(&w_src, 0, sizeof(w_src));
+    ns4_gpu_tensor norm_dst; memset(&norm_dst, 0, sizeof(norm_dst));
+    ns4_gpu_tensor sel_dst; memset(&sel_dst, 0, sizeof(sel_dst));
+    ns4_gpu_tensor w_dst; memset(&w_dst, 0, sizeof(w_dst));
+    CHECK(ns4_gpu_tensor_alloc_on(&norm_src, 0, norm_bytes) == 0, "copy3 alloc norm_src");
+    CHECK(ns4_gpu_tensor_alloc_on(&sel_src, 0, selected_bytes) == 0, "copy3 alloc sel_src");
+    CHECK(ns4_gpu_tensor_alloc_on(&w_src, 0, weights_bytes) == 0, "copy3 alloc w_src");
+    CHECK(ns4_gpu_tensor_alloc_on(&norm_dst, dst_dev, norm_bytes) == 0, "copy3 alloc norm_dst");
+    CHECK(ns4_gpu_tensor_alloc_on(&sel_dst, dst_dev, selected_bytes) == 0, "copy3 alloc sel_dst");
+    CHECK(ns4_gpu_tensor_alloc_on(&w_dst, dst_dev, weights_bytes) == 0, "copy3 alloc w_dst");
 
-    int ok = ds4_gpu_tensor_write(&norm_src, 0, host_norm, norm_bytes) &&
-             ds4_gpu_tensor_write(&sel_src, 0, host_selected, selected_bytes) &&
-             ds4_gpu_tensor_write(&w_src, 0, host_weights, weights_bytes) &&
-             ds4_gpu_tensor_copy_xdev3(&norm_dst, &norm_src, norm_bytes,
+    int ok = ns4_gpu_tensor_write(&norm_src, 0, host_norm, norm_bytes) &&
+             ns4_gpu_tensor_write(&sel_src, 0, host_selected, selected_bytes) &&
+             ns4_gpu_tensor_write(&w_src, 0, host_weights, weights_bytes) &&
+             ns4_gpu_tensor_copy_xdev3(&norm_dst, &norm_src, norm_bytes,
                                        &sel_dst, &sel_src, selected_bytes,
                                        &w_dst, &w_src, weights_bytes) &&
-             ds4_gpu_tensor_read(&norm_dst, 0, got_norm, norm_bytes) &&
-             ds4_gpu_tensor_read(&sel_dst, 0, got_selected, selected_bytes) &&
-             ds4_gpu_tensor_read(&w_dst, 0, got_weights, weights_bytes);
+             ns4_gpu_tensor_read(&norm_dst, 0, got_norm, norm_bytes) &&
+             ns4_gpu_tensor_read(&sel_dst, 0, got_selected, selected_bytes) &&
+             ns4_gpu_tensor_read(&w_dst, 0, got_weights, weights_bytes);
     CHECK(ok, "copy3 IO");
     CHECK(memcmp(host_norm, got_norm, norm_bytes) == 0, "copy3 norm");
     CHECK(memcmp(host_selected, got_selected, selected_bytes) == 0, "copy3 selected");
     CHECK(memcmp(host_weights, got_weights, weights_bytes) == 0, "copy3 weights");
 
-    ds4_gpu_tensor_free_in_place(&norm_src);
-    ds4_gpu_tensor_free_in_place(&sel_src);
-    ds4_gpu_tensor_free_in_place(&w_src);
-    ds4_gpu_tensor_free_in_place(&norm_dst);
-    ds4_gpu_tensor_free_in_place(&sel_dst);
-    ds4_gpu_tensor_free_in_place(&w_dst);
+    ns4_gpu_tensor_free_in_place(&norm_src);
+    ns4_gpu_tensor_free_in_place(&sel_src);
+    ns4_gpu_tensor_free_in_place(&w_src);
+    ns4_gpu_tensor_free_in_place(&norm_dst);
+    ns4_gpu_tensor_free_in_place(&sel_dst);
+    ns4_gpu_tensor_free_in_place(&w_dst);
     free(host_norm);
     free(got_norm);
-    ds4_gpu_cleanup();
+    ns4_gpu_cleanup();
     fprintf(stderr, "  copy_xdev3 OK (n_gpus=%d, force_bounce=%d)\n",
             n_gpus_wanted, force_bounce);
     return 0;
@@ -171,10 +171,10 @@ static int run_top1(void) {
         return 0;
     }
 
-    ds4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
+    ns4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
     cfg.n_gpus = 1;
     cfg.device_indices[0] = 0;
-    CHECK(ds4_gpu_init_multi(&cfg), "top1 init_multi");
+    CHECK(ns4_gpu_init_multi(&cfg), "top1 init_multi");
 
     const uint32_t n_comp = 131073u;
     const uint32_t n_tokens = 3u;
@@ -194,25 +194,25 @@ static int run_top1(void) {
     }
     host_scores[(size_t)2u * n_comp + 1u] = NAN;
 
-    ds4_gpu_tensor scores; memset(&scores, 0, sizeof(scores));
-    ds4_gpu_tensor selected; memset(&selected, 0, sizeof(selected));
-    CHECK(ds4_gpu_tensor_alloc_on(&scores, 0, n_score * sizeof(float)) == 0,
+    ns4_gpu_tensor scores; memset(&scores, 0, sizeof(scores));
+    ns4_gpu_tensor selected; memset(&selected, 0, sizeof(selected));
+    CHECK(ns4_gpu_tensor_alloc_on(&scores, 0, n_score * sizeof(float)) == 0,
           "top1 alloc scores");
-    CHECK(ds4_gpu_tensor_alloc_on(&selected, 0, n_tokens * sizeof(uint32_t)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&selected, 0, n_tokens * sizeof(uint32_t)) == 0,
           "top1 alloc selected");
-    int ok = ds4_gpu_tensor_write(&scores, 0, host_scores, n_score * sizeof(float)) &&
-             ds4_gpu_indexer_topk_tensor(&selected, &scores, n_comp, n_tokens, 1) &&
-             ds4_gpu_tensor_read(&selected, 0, host_sel, n_tokens * sizeof(uint32_t));
+    int ok = ns4_gpu_tensor_write(&scores, 0, host_scores, n_score * sizeof(float)) &&
+             ns4_gpu_indexer_topk_tensor(&selected, &scores, n_comp, n_tokens, 1) &&
+             ns4_gpu_tensor_read(&selected, 0, host_sel, n_tokens * sizeof(uint32_t));
     CHECK(ok, "top1 compute");
     CHECK(host_sel[0] == 17u, "top1 row0");
     CHECK(host_sel[1] == 5u, "top1 row1");
     CHECK(host_sel[2] == 0u, "top1 row2");
 
-    ds4_gpu_tensor_free_in_place(&scores);
-    ds4_gpu_tensor_free_in_place(&selected);
+    ns4_gpu_tensor_free_in_place(&scores);
+    ns4_gpu_tensor_free_in_place(&selected);
     free(host_scores);
     free(host_sel);
-    ds4_gpu_cleanup();
+    ns4_gpu_cleanup();
     fprintf(stderr, "  top1 OK\n");
     return 0;
 }
@@ -235,10 +235,10 @@ static int run_topk2048(void) {
     (void)cudaGetDeviceCount(&dev_count);
     if (dev_count < 1) return 0;
 
-    ds4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
+    ns4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
     cfg.n_gpus = 1;
     cfg.device_indices[0] = 0;
-    CHECK(ds4_gpu_init_multi(&cfg), "topk2048 init_multi");
+    CHECK(ns4_gpu_init_multi(&cfg), "topk2048 init_multi");
 
     const uint32_t cases[] = {3355u, 5003u};
     const uint32_t n_tokens = 2u;
@@ -259,20 +259,20 @@ static int run_topk2048(void) {
             }
         }
 
-        ds4_gpu_tensor scores; memset(&scores, 0, sizeof(scores));
-        ds4_gpu_tensor selected; memset(&selected, 0, sizeof(selected));
-        CHECK(ds4_gpu_tensor_alloc_on(
+        ns4_gpu_tensor scores; memset(&scores, 0, sizeof(scores));
+        ns4_gpu_tensor selected; memset(&selected, 0, sizeof(selected));
+        CHECK(ns4_gpu_tensor_alloc_on(
                   &scores, 0, n_scores * sizeof(float)) == 0,
               "topk2048 alloc scores");
-        CHECK(ds4_gpu_tensor_alloc_on(
+        CHECK(ns4_gpu_tensor_alloc_on(
                   &selected, 0,
                   (uint64_t)n_tokens * top_k * sizeof(uint32_t)) == 0,
               "topk2048 alloc selected");
-        int ok = ds4_gpu_tensor_write(
+        int ok = ns4_gpu_tensor_write(
                      &scores, 0, host_scores, n_scores * sizeof(float)) &&
-                 ds4_gpu_indexer_topk_tensor(
+                 ns4_gpu_indexer_topk_tensor(
                      &selected, &scores, n_comp, n_tokens, top_k) &&
-                 ds4_gpu_tensor_read(
+                 ns4_gpu_tensor_read(
                      &selected, 0, host_selected,
                      (uint64_t)n_tokens * top_k * sizeof(uint32_t));
         CHECK(ok, "topk2048 compute");
@@ -294,13 +294,13 @@ static int run_topk2048(void) {
                 }
             }
         }
-        ds4_gpu_tensor_free_in_place(&scores);
-        ds4_gpu_tensor_free_in_place(&selected);
+        ns4_gpu_tensor_free_in_place(&scores);
+        ns4_gpu_tensor_free_in_place(&selected);
         free(host_scores);
         free(host_selected);
         free(ref);
     }
-    ds4_gpu_cleanup();
+    ns4_gpu_cleanup();
     fprintf(stderr, "  topk2048 OK\n");
     return 0;
 }
@@ -313,10 +313,10 @@ static int run_moe_handoff_pack(void) {
         return 0;
     }
 
-    ds4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
+    ns4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
     cfg.n_gpus = 1;
     cfg.device_indices[0] = 0;
-    CHECK(ds4_gpu_init_multi(&cfg), "moe_pack init_multi");
+    CHECK(ns4_gpu_init_multi(&cfg), "moe_pack init_multi");
 
     const uint32_t n_embd = 4096u;
     const uint32_t n_expert = 3u;
@@ -336,21 +336,21 @@ static int run_moe_handoff_pack(void) {
         host_weights[i] = 0.125f * (float)(i + 1);
     }
 
-    ds4_gpu_tensor norm; memset(&norm, 0, sizeof(norm));
-    ds4_gpu_tensor selected; memset(&selected, 0, sizeof(selected));
-    ds4_gpu_tensor weights; memset(&weights, 0, sizeof(weights));
-    ds4_gpu_tensor packed; memset(&packed, 0, sizeof(packed));
-    CHECK(ds4_gpu_tensor_alloc_on(&norm, 0, norm_bytes) == 0, "moe_pack alloc norm");
-    CHECK(ds4_gpu_tensor_alloc_on(&selected, 0, selected_bytes) == 0, "moe_pack alloc selected");
-    CHECK(ds4_gpu_tensor_alloc_on(&weights, 0, weights_bytes) == 0, "moe_pack alloc weights");
-    CHECK(ds4_gpu_tensor_alloc_on(&packed, 0, packed_bytes) == 0, "moe_pack alloc packed");
+    ns4_gpu_tensor norm; memset(&norm, 0, sizeof(norm));
+    ns4_gpu_tensor selected; memset(&selected, 0, sizeof(selected));
+    ns4_gpu_tensor weights; memset(&weights, 0, sizeof(weights));
+    ns4_gpu_tensor packed; memset(&packed, 0, sizeof(packed));
+    CHECK(ns4_gpu_tensor_alloc_on(&norm, 0, norm_bytes) == 0, "moe_pack alloc norm");
+    CHECK(ns4_gpu_tensor_alloc_on(&selected, 0, selected_bytes) == 0, "moe_pack alloc selected");
+    CHECK(ns4_gpu_tensor_alloc_on(&weights, 0, weights_bytes) == 0, "moe_pack alloc weights");
+    CHECK(ns4_gpu_tensor_alloc_on(&packed, 0, packed_bytes) == 0, "moe_pack alloc packed");
 
-    int ok = ds4_gpu_tensor_write(&norm, 0, host_norm, norm_bytes) &&
-             ds4_gpu_tensor_write(&selected, 0, host_selected, selected_bytes) &&
-             ds4_gpu_tensor_write(&weights, 0, host_weights, weights_bytes) &&
-             ds4_gpu_moe_handoff_pack_tensor(&packed, &norm, &selected, &weights,
+    int ok = ns4_gpu_tensor_write(&norm, 0, host_norm, norm_bytes) &&
+             ns4_gpu_tensor_write(&selected, 0, host_selected, selected_bytes) &&
+             ns4_gpu_tensor_write(&weights, 0, host_weights, weights_bytes) &&
+             ns4_gpu_moe_handoff_pack_tensor(&packed, &norm, &selected, &weights,
                                              n_embd, n_expert) &&
-             ds4_gpu_tensor_read(&packed, 0, host_packed, packed_bytes);
+             ns4_gpu_tensor_read(&packed, 0, host_packed, packed_bytes);
     CHECK(ok, "moe_pack compute");
     CHECK(memcmp(host_packed, host_norm, norm_bytes) == 0, "moe_pack norm");
     CHECK(memcmp(host_packed + norm_bytes, host_selected, selected_bytes) == 0,
@@ -358,15 +358,15 @@ static int run_moe_handoff_pack(void) {
     CHECK(memcmp(host_packed + norm_bytes + selected_bytes, host_weights, weights_bytes) == 0,
           "moe_pack weights");
 
-    ds4_gpu_tensor_free_in_place(&norm);
-    ds4_gpu_tensor_free_in_place(&selected);
-    ds4_gpu_tensor_free_in_place(&weights);
-    ds4_gpu_tensor_free_in_place(&packed);
+    ns4_gpu_tensor_free_in_place(&norm);
+    ns4_gpu_tensor_free_in_place(&selected);
+    ns4_gpu_tensor_free_in_place(&weights);
+    ns4_gpu_tensor_free_in_place(&packed);
     free(host_norm);
     free(host_selected);
     free(host_weights);
     free(host_packed);
-    ds4_gpu_cleanup();
+    ns4_gpu_cleanup();
     fprintf(stderr, "  moe_handoff_pack OK\n");
     return 0;
 }
@@ -382,12 +382,12 @@ static int run_stress(int force_bounce) {
         return 0;
     }
 
-    ds4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
+    ns4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
     cfg.n_gpus = 2;
     cfg.device_indices[0] = 0; cfg.device_indices[1] = 1;
-    if (force_bounce) setenv("DS4_FORCE_HOST_BOUNCE", "1", 1);
-    else              unsetenv("DS4_FORCE_HOST_BOUNCE");
-    CHECK(ds4_gpu_init_multi(&cfg), "stress init_multi");
+    if (force_bounce) setenv("NS4_FORCE_HOST_BOUNCE", "1", 1);
+    else              unsetenv("NS4_FORCE_HOST_BOUNCE");
+    CHECK(ns4_gpu_init_multi(&cfg), "stress init_multi");
 
     const size_t sizes[] = {
         256u * 1024u,
@@ -402,10 +402,10 @@ static int run_stress(int force_bounce) {
     unsigned char *host_dst = (unsigned char *)malloc(max_n);
     CHECK(host_src && host_dst, "stress host alloc");
 
-    ds4_gpu_tensor a; memset(&a, 0, sizeof(a));
-    ds4_gpu_tensor b; memset(&b, 0, sizeof(b));
-    CHECK(ds4_gpu_tensor_alloc_on(&a, 0, max_n) == 0, "stress alloc_on 0");
-    CHECK(ds4_gpu_tensor_alloc_on(&b, 1, max_n) == 0, "stress alloc_on 1");
+    ns4_gpu_tensor a; memset(&a, 0, sizeof(a));
+    ns4_gpu_tensor b; memset(&b, 0, sizeof(b));
+    CHECK(ns4_gpu_tensor_alloc_on(&a, 0, max_n) == 0, "stress alloc_on 0");
+    CHECK(ns4_gpu_tensor_alloc_on(&b, 1, max_n) == 0, "stress alloc_on 1");
 
     int total_ok = 1;
     for (int s = 0; s < n_sizes && total_ok; s++) {
@@ -417,9 +417,9 @@ static int run_stress(int force_bounce) {
                       (size_t)s * 53u + 11u) & 0xffu);
             }
             memset(host_dst, 0, n);
-            int io_ok = ds4_gpu_tensor_write(&a, 0, host_src, n) &&
-                        ds4_gpu_tensor_copy_xdev(&b, &a, n) &&
-                        ds4_gpu_tensor_read(&b, 0, host_dst, n);
+            int io_ok = ns4_gpu_tensor_write(&a, 0, host_src, n) &&
+                        ns4_gpu_tensor_copy_xdev(&b, &a, n) &&
+                        ns4_gpu_tensor_read(&b, 0, host_dst, n);
             if (!io_ok) {
                 fprintf(stderr,
                     "FAIL: stress IO error size=%zu iter=%d force_bounce=%d\n",
@@ -441,11 +441,11 @@ static int run_stress(int force_bounce) {
         }
     }
 
-    ds4_gpu_tensor_free_in_place(&a);
-    ds4_gpu_tensor_free_in_place(&b);
+    ns4_gpu_tensor_free_in_place(&a);
+    ns4_gpu_tensor_free_in_place(&b);
     free(host_src);
     free(host_dst);
-    ds4_gpu_cleanup();
+    ns4_gpu_cleanup();
     if (total_ok) {
         fprintf(stderr,
             "  stress OK (force_bounce=%d, %d iters x %d sizes, max %zu MiB)\n",
@@ -462,12 +462,12 @@ static int run_add_xdev(int force_bounce) {
         return 0;
     }
 
-    ds4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
+    ns4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
     cfg.n_gpus = 2;
     cfg.device_indices[0] = 0; cfg.device_indices[1] = 1;
-    if (force_bounce) setenv("DS4_FORCE_HOST_BOUNCE", "1", 1);
-    else              unsetenv("DS4_FORCE_HOST_BOUNCE");
-    CHECK(ds4_gpu_init_multi(&cfg), "add_xdev init_multi");
+    if (force_bounce) setenv("NS4_FORCE_HOST_BOUNCE", "1", 1);
+    else              unsetenv("NS4_FORCE_HOST_BOUNCE");
+    CHECK(ns4_gpu_init_multi(&cfg), "add_xdev init_multi");
 
     const size_t N = 512 * 1024;
     float *host_local = (float *)malloc(N * sizeof(float));
@@ -479,23 +479,23 @@ static int run_add_xdev(int force_bounce) {
         host_remote[i] = (float)((int)(i % 997) - 400) * 0.25f;
     }
 
-    ds4_gpu_tensor local; memset(&local, 0, sizeof(local));
-    ds4_gpu_tensor remote; memset(&remote, 0, sizeof(remote));
-    ds4_gpu_tensor staging; memset(&staging, 0, sizeof(staging));
-    ds4_gpu_tensor out; memset(&out, 0, sizeof(out));
-    CHECK(ds4_gpu_tensor_alloc_on(&local, 0, N * sizeof(float)) == 0,
+    ns4_gpu_tensor local; memset(&local, 0, sizeof(local));
+    ns4_gpu_tensor remote; memset(&remote, 0, sizeof(remote));
+    ns4_gpu_tensor staging; memset(&staging, 0, sizeof(staging));
+    ns4_gpu_tensor out; memset(&out, 0, sizeof(out));
+    CHECK(ns4_gpu_tensor_alloc_on(&local, 0, N * sizeof(float)) == 0,
           "add_xdev alloc local");
-    CHECK(ds4_gpu_tensor_alloc_on(&remote, 1, N * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&remote, 1, N * sizeof(float)) == 0,
           "add_xdev alloc remote");
-    CHECK(ds4_gpu_tensor_alloc_on(&staging, 0, N * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&staging, 0, N * sizeof(float)) == 0,
           "add_xdev alloc staging");
-    CHECK(ds4_gpu_tensor_alloc_on(&out, 0, N * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&out, 0, N * sizeof(float)) == 0,
           "add_xdev alloc out");
 
-    int ok = ds4_gpu_tensor_write(&local, 0, host_local, N * sizeof(float)) &&
-             ds4_gpu_tensor_write(&remote, 0, host_remote, N * sizeof(float)) &&
-             ds4_gpu_add_xdev_tensor(&out, &local, &remote, &staging, (uint32_t)N) &&
-             ds4_gpu_tensor_read(&out, 0, host_out, N * sizeof(float));
+    int ok = ns4_gpu_tensor_write(&local, 0, host_local, N * sizeof(float)) &&
+             ns4_gpu_tensor_write(&remote, 0, host_remote, N * sizeof(float)) &&
+             ns4_gpu_add_xdev_tensor(&out, &local, &remote, &staging, (uint32_t)N) &&
+             ns4_gpu_tensor_read(&out, 0, host_out, N * sizeof(float));
     CHECK(ok, "add_xdev IO");
     for (size_t i = 0; i < N; i++) {
         float want = host_local[i] + host_remote[i];
@@ -507,14 +507,14 @@ static int run_add_xdev(int force_bounce) {
         }
     }
 
-    ds4_gpu_tensor_free_in_place(&local);
-    ds4_gpu_tensor_free_in_place(&remote);
-    ds4_gpu_tensor_free_in_place(&staging);
-    ds4_gpu_tensor_free_in_place(&out);
+    ns4_gpu_tensor_free_in_place(&local);
+    ns4_gpu_tensor_free_in_place(&remote);
+    ns4_gpu_tensor_free_in_place(&staging);
+    ns4_gpu_tensor_free_in_place(&out);
     free(host_local);
     free(host_remote);
     free(host_out);
-    ds4_gpu_cleanup();
+    ns4_gpu_cleanup();
     fprintf(stderr, "  add_xdev OK (force_bounce=%d)\n", force_bounce);
     return 0;
 }
@@ -557,10 +557,10 @@ static int run_q8_kslice(void) {
         return 0;
     }
 
-    ds4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
+    ns4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
     cfg.n_gpus = 1;
     cfg.device_indices[0] = 0;
-    CHECK(ds4_gpu_init_multi(&cfg), "q8_kslice init_multi");
+    CHECK(ns4_gpu_init_multi(&cfg), "q8_kslice init_multi");
 
     const uint64_t in_dim = 128;
     const uint64_t out_dim = 96;
@@ -576,40 +576,40 @@ static int run_q8_kslice(void) {
     for (uint64_t i = 0; i < in_dim; i++) {
         host_x[i] = (float)((int)(i % 37u) - 18) * 0.03125f;
     }
-    CHECK(ds4_gpu_set_model_map(model, model_size), "q8_kslice set model map");
+    CHECK(ns4_gpu_set_model_map(model, model_size), "q8_kslice set model map");
 
-    ds4_gpu_tensor x; memset(&x, 0, sizeof(x));
-    ds4_gpu_tensor full; memset(&full, 0, sizeof(full));
-    ds4_gpu_tensor p0; memset(&p0, 0, sizeof(p0));
-    ds4_gpu_tensor p1; memset(&p1, 0, sizeof(p1));
-    ds4_gpu_tensor sum; memset(&sum, 0, sizeof(sum));
-    CHECK(ds4_gpu_tensor_alloc_on(&x, 0, in_dim * sizeof(float)) == 0,
+    ns4_gpu_tensor x; memset(&x, 0, sizeof(x));
+    ns4_gpu_tensor full; memset(&full, 0, sizeof(full));
+    ns4_gpu_tensor p0; memset(&p0, 0, sizeof(p0));
+    ns4_gpu_tensor p1; memset(&p1, 0, sizeof(p1));
+    ns4_gpu_tensor sum; memset(&sum, 0, sizeof(sum));
+    CHECK(ns4_gpu_tensor_alloc_on(&x, 0, in_dim * sizeof(float)) == 0,
           "q8_kslice alloc x");
-    CHECK(ds4_gpu_tensor_alloc_on(&full, 0, out_dim * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&full, 0, out_dim * sizeof(float)) == 0,
           "q8_kslice alloc full");
-    CHECK(ds4_gpu_tensor_alloc_on(&p0, 0, out_dim * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&p0, 0, out_dim * sizeof(float)) == 0,
           "q8_kslice alloc p0");
-    CHECK(ds4_gpu_tensor_alloc_on(&p1, 0, out_dim * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&p1, 0, out_dim * sizeof(float)) == 0,
           "q8_kslice alloc p1");
-    CHECK(ds4_gpu_tensor_alloc_on(&sum, 0, out_dim * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&sum, 0, out_dim * sizeof(float)) == 0,
           "q8_kslice alloc sum");
-    CHECK(ds4_gpu_tensor_write(&x, 0, host_x, in_dim * sizeof(float)),
+    CHECK(ns4_gpu_tensor_write(&x, 0, host_x, in_dim * sizeof(float)),
           "q8_kslice write x");
 
-    ds4_gpu_tensor *x0 = ds4_gpu_tensor_view(&x, 0, split * sizeof(float));
-    ds4_gpu_tensor *x1 = ds4_gpu_tensor_view(&x, split * sizeof(float),
+    ns4_gpu_tensor *x0 = ns4_gpu_tensor_view(&x, 0, split * sizeof(float));
+    ns4_gpu_tensor *x1 = ns4_gpu_tensor_view(&x, split * sizeof(float),
                                              (in_dim - split) * sizeof(float));
     CHECK(x0 && x1, "q8_kslice views");
-    int ok = ds4_gpu_matmul_q8_0_tensor(&full, model, model_size, 0,
+    int ok = ns4_gpu_matmul_q8_0_tensor(&full, model, model_size, 0,
                                         in_dim, out_dim, &x, 1) &&
-             ds4_gpu_matmul_q8_0_kslice_rows_tensor(&p0, model, model_size, 0,
+             ns4_gpu_matmul_q8_0_kslice_rows_tensor(&p0, model, model_size, 0,
                                                in_dim, out_dim, 0, split, x0, 1) &&
-             ds4_gpu_matmul_q8_0_kslice_rows_tensor(&p1, model, model_size, 0,
+             ns4_gpu_matmul_q8_0_kslice_rows_tensor(&p1, model, model_size, 0,
                                                in_dim, out_dim, split,
                                                in_dim - split, x1, 1) &&
-             ds4_gpu_add_tensor(&sum, &p0, &p1, (uint32_t)out_dim) &&
-             ds4_gpu_tensor_read(&full, 0, host_full, out_dim * sizeof(float)) &&
-             ds4_gpu_tensor_read(&sum, 0, host_sum, out_dim * sizeof(float));
+             ns4_gpu_add_tensor(&sum, &p0, &p1, (uint32_t)out_dim) &&
+             ns4_gpu_tensor_read(&full, 0, host_full, out_dim * sizeof(float)) &&
+             ns4_gpu_tensor_read(&sum, 0, host_sum, out_dim * sizeof(float));
     CHECK(ok, "q8_kslice compute");
     for (uint64_t i = 0; i < out_dim; i++) {
         float diff = fabsf(host_full[i] - host_sum[i]);
@@ -621,18 +621,18 @@ static int run_q8_kslice(void) {
         }
     }
 
-    ds4_gpu_tensor_free(x0);
-    ds4_gpu_tensor_free(x1);
-    ds4_gpu_tensor_free_in_place(&x);
-    ds4_gpu_tensor_free_in_place(&full);
-    ds4_gpu_tensor_free_in_place(&p0);
-    ds4_gpu_tensor_free_in_place(&p1);
-    ds4_gpu_tensor_free_in_place(&sum);
+    ns4_gpu_tensor_free(x0);
+    ns4_gpu_tensor_free(x1);
+    ns4_gpu_tensor_free_in_place(&x);
+    ns4_gpu_tensor_free_in_place(&full);
+    ns4_gpu_tensor_free_in_place(&p0);
+    ns4_gpu_tensor_free_in_place(&p1);
+    ns4_gpu_tensor_free_in_place(&sum);
     free(model);
     free(host_x);
     free(host_full);
     free(host_sum);
-    ds4_gpu_cleanup();
+    ns4_gpu_cleanup();
     fprintf(stderr, "  q8_kslice OK\n");
     return 0;
 }
@@ -645,10 +645,10 @@ static int run_q8_matmul_top1_fused(void) {
         return 0;
     }
 
-    ds4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
+    ns4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
     cfg.n_gpus = 1;
     cfg.device_indices[0] = 0;
-    CHECK(ds4_gpu_init_multi(&cfg), "q8_top1_fused init_multi");
+    CHECK(ns4_gpu_init_multi(&cfg), "q8_top1_fused init_multi");
 
     const uint64_t in_dim = 160;
     const uint64_t out_dim = 257;
@@ -664,41 +664,41 @@ static int run_q8_matmul_top1_fused(void) {
     for (uint64_t i = 0; i < in_dim; i++) {
         host_x[i] = (float)((int)(i % 43u) - 21) * 0.0234375f;
     }
-    CHECK(ds4_gpu_set_model_map(model, model_size), "q8_top1_fused set model map");
+    CHECK(ns4_gpu_set_model_map(model, model_size), "q8_top1_fused set model map");
 
-    ds4_gpu_tensor x; memset(&x, 0, sizeof(x));
-    ds4_gpu_tensor logits; memset(&logits, 0, sizeof(logits));
-    ds4_gpu_tensor ref_selected; memset(&ref_selected, 0, sizeof(ref_selected));
-    ds4_gpu_tensor ref_values; memset(&ref_values, 0, sizeof(ref_values));
-    ds4_gpu_tensor fused_selected; memset(&fused_selected, 0, sizeof(fused_selected));
-    ds4_gpu_tensor fused_values; memset(&fused_values, 0, sizeof(fused_values));
-    CHECK(ds4_gpu_tensor_alloc_on(&x, 0, in_dim * sizeof(float)) == 0,
+    ns4_gpu_tensor x; memset(&x, 0, sizeof(x));
+    ns4_gpu_tensor logits; memset(&logits, 0, sizeof(logits));
+    ns4_gpu_tensor ref_selected; memset(&ref_selected, 0, sizeof(ref_selected));
+    ns4_gpu_tensor ref_values; memset(&ref_values, 0, sizeof(ref_values));
+    ns4_gpu_tensor fused_selected; memset(&fused_selected, 0, sizeof(fused_selected));
+    ns4_gpu_tensor fused_values; memset(&fused_values, 0, sizeof(fused_values));
+    CHECK(ns4_gpu_tensor_alloc_on(&x, 0, in_dim * sizeof(float)) == 0,
           "q8_top1_fused alloc x");
-    CHECK(ds4_gpu_tensor_alloc_on(&logits, 0, out_dim * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&logits, 0, out_dim * sizeof(float)) == 0,
           "q8_top1_fused alloc logits");
-    CHECK(ds4_gpu_tensor_alloc_on(&ref_selected, 0, sizeof(uint32_t)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&ref_selected, 0, sizeof(uint32_t)) == 0,
           "q8_top1_fused alloc ref selected");
-    CHECK(ds4_gpu_tensor_alloc_on(&ref_values, 0, sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&ref_values, 0, sizeof(float)) == 0,
           "q8_top1_fused alloc ref values");
-    CHECK(ds4_gpu_tensor_alloc_on(&fused_selected, 0, sizeof(uint32_t)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&fused_selected, 0, sizeof(uint32_t)) == 0,
           "q8_top1_fused alloc fused selected");
-    CHECK(ds4_gpu_tensor_alloc_on(&fused_values, 0, sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&fused_values, 0, sizeof(float)) == 0,
           "q8_top1_fused alloc fused values");
-    CHECK(ds4_gpu_tensor_write(&x, 0, host_x, in_dim * sizeof(float)),
+    CHECK(ns4_gpu_tensor_write(&x, 0, host_x, in_dim * sizeof(float)),
           "q8_top1_fused write x");
 
-    int ok = ds4_gpu_matmul_q8_0_tensor(&logits, model, model_size, 0,
+    int ok = ns4_gpu_matmul_q8_0_tensor(&logits, model, model_size, 0,
                                         in_dim, out_dim, &x, 1) &&
-             ds4_gpu_indexer_top1_value_tensor(&ref_selected, &ref_values,
+             ns4_gpu_indexer_top1_value_tensor(&ref_selected, &ref_values,
                                                &logits, (uint32_t)out_dim, 1,
                                                index_offset) &&
-             ds4_gpu_matmul_q8_0_top1_tensor(&fused_selected, &fused_values,
+             ns4_gpu_matmul_q8_0_top1_tensor(&fused_selected, &fused_values,
                                              model, model_size, 0, in_dim,
                                              out_dim, &x, index_offset) &&
-             ds4_gpu_tensor_read(&ref_selected, 0, &ref_id, sizeof(ref_id)) &&
-             ds4_gpu_tensor_read(&fused_selected, 0, &fused_id, sizeof(fused_id)) &&
-             ds4_gpu_tensor_read(&ref_values, 0, &ref_value, sizeof(ref_value)) &&
-             ds4_gpu_tensor_read(&fused_values, 0, &fused_value, sizeof(fused_value));
+             ns4_gpu_tensor_read(&ref_selected, 0, &ref_id, sizeof(ref_id)) &&
+             ns4_gpu_tensor_read(&fused_selected, 0, &fused_id, sizeof(fused_id)) &&
+             ns4_gpu_tensor_read(&ref_values, 0, &ref_value, sizeof(ref_value)) &&
+             ns4_gpu_tensor_read(&fused_values, 0, &fused_value, sizeof(fused_value));
     CHECK(ok, "q8_top1_fused compute");
     CHECK(ref_id == fused_id, "q8_top1_fused selected");
     if (fabsf(ref_value - fused_value) > 1.0e-6f) {
@@ -708,15 +708,15 @@ static int run_q8_matmul_top1_fused(void) {
         return 1;
     }
 
-    ds4_gpu_tensor_free_in_place(&x);
-    ds4_gpu_tensor_free_in_place(&logits);
-    ds4_gpu_tensor_free_in_place(&ref_selected);
-    ds4_gpu_tensor_free_in_place(&ref_values);
-    ds4_gpu_tensor_free_in_place(&fused_selected);
-    ds4_gpu_tensor_free_in_place(&fused_values);
+    ns4_gpu_tensor_free_in_place(&x);
+    ns4_gpu_tensor_free_in_place(&logits);
+    ns4_gpu_tensor_free_in_place(&ref_selected);
+    ns4_gpu_tensor_free_in_place(&ref_values);
+    ns4_gpu_tensor_free_in_place(&fused_selected);
+    ns4_gpu_tensor_free_in_place(&fused_values);
     free(model);
     free(host_x);
-    ds4_gpu_cleanup();
+    ns4_gpu_cleanup();
     fprintf(stderr, "  q8_matmul_top1_fused OK\n");
     return 0;
 }
@@ -729,13 +729,13 @@ static int run_f16_small_out(void) {
         return 0;
     }
 
-    setenv("DS4_CUDA_F16_SMALL_OUT", "1", 1);
-    unsetenv("DS4_CUDA_NO_F16_SMALL_OUT");
+    setenv("NS4_CUDA_F16_SMALL_OUT", "1", 1);
+    unsetenv("NS4_CUDA_NO_F16_SMALL_OUT");
 
-    ds4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
+    ns4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
     cfg.n_gpus = 1;
     cfg.device_indices[0] = 0;
-    CHECK(ds4_gpu_init_multi(&cfg), "f16_small_out init_multi");
+    CHECK(ns4_gpu_init_multi(&cfg), "f16_small_out init_multi");
 
     const uint64_t in_dim = 32768;
     const uint64_t out_dim = 16;
@@ -756,19 +756,19 @@ static int run_f16_small_out(void) {
         }
         host_ref[r] = sum;
     }
-    CHECK(ds4_gpu_set_model_map(model, model_size), "f16_small_out set model map");
+    CHECK(ns4_gpu_set_model_map(model, model_size), "f16_small_out set model map");
 
-    ds4_gpu_tensor x; memset(&x, 0, sizeof(x));
-    ds4_gpu_tensor out; memset(&out, 0, sizeof(out));
-    CHECK(ds4_gpu_tensor_alloc_on(&x, 0, in_dim * sizeof(float)) == 0,
+    ns4_gpu_tensor x; memset(&x, 0, sizeof(x));
+    ns4_gpu_tensor out; memset(&out, 0, sizeof(out));
+    CHECK(ns4_gpu_tensor_alloc_on(&x, 0, in_dim * sizeof(float)) == 0,
           "f16_small_out alloc x");
-    CHECK(ds4_gpu_tensor_alloc_on(&out, 0, out_dim * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&out, 0, out_dim * sizeof(float)) == 0,
           "f16_small_out alloc out");
-    CHECK(ds4_gpu_tensor_write(&x, 0, host_x, in_dim * sizeof(float)),
+    CHECK(ns4_gpu_tensor_write(&x, 0, host_x, in_dim * sizeof(float)),
           "f16_small_out write x");
-    int ok = ds4_gpu_matmul_f16_tensor(&out, model, model_size, 0,
+    int ok = ns4_gpu_matmul_f16_tensor(&out, model, model_size, 0,
                                        in_dim, out_dim, &x, 1) &&
-             ds4_gpu_tensor_read(&out, 0, host_out, out_dim * sizeof(float));
+             ns4_gpu_tensor_read(&out, 0, host_out, out_dim * sizeof(float));
     CHECK(ok, "f16_small_out compute");
     for (uint64_t r = 0; r < out_dim; r++) {
         float diff = fabsf(host_out[r] - host_ref[r]);
@@ -780,13 +780,13 @@ static int run_f16_small_out(void) {
         }
     }
 
-    ds4_gpu_tensor_free_in_place(&x);
-    ds4_gpu_tensor_free_in_place(&out);
+    ns4_gpu_tensor_free_in_place(&x);
+    ns4_gpu_tensor_free_in_place(&out);
     free(model);
     free(host_x);
     free(host_out);
     free(host_ref);
-    ds4_gpu_cleanup();
+    ns4_gpu_cleanup();
     fprintf(stderr, "  f16_small_out OK\n");
     return 0;
 }
@@ -799,14 +799,14 @@ static int run_f16_small_batch(void) {
         return 0;
     }
 
-    setenv("DS4_CUDA_F16_SMALL_BATCH", "1", 1);
-    unsetenv("DS4_CUDA_NO_F16_SMALL_BATCH");
-    unsetenv("DS4_CUDA_NO_F16_CUBLAS_BATCH");
+    setenv("NS4_CUDA_F16_SMALL_BATCH", "1", 1);
+    unsetenv("NS4_CUDA_NO_F16_SMALL_BATCH");
+    unsetenv("NS4_CUDA_NO_F16_CUBLAS_BATCH");
 
-    ds4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
+    ns4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
     cfg.n_gpus = 1;
     cfg.device_indices[0] = 0;
-    CHECK(ds4_gpu_init_multi(&cfg), "f16_small_batch init_multi");
+    CHECK(ns4_gpu_init_multi(&cfg), "f16_small_batch init_multi");
 
     const uint64_t in_dim = 8192;
     const uint64_t out_dim = 24;
@@ -829,28 +829,28 @@ static int run_f16_small_batch(void) {
             host_x[t * in_dim + i] = (float)((int)((t * 19u + i * 7u) % 53u) - 26) * 0.015625f;
         }
     }
-    CHECK(ds4_gpu_set_model_map(model, model_size), "f16_small_batch set model map");
+    CHECK(ns4_gpu_set_model_map(model, model_size), "f16_small_batch set model map");
 
-    ds4_gpu_tensor x; memset(&x, 0, sizeof(x));
-    ds4_gpu_tensor fast; memset(&fast, 0, sizeof(fast));
-    ds4_gpu_tensor ref; memset(&ref, 0, sizeof(ref));
-    CHECK(ds4_gpu_tensor_alloc_on(&x, 0, n_tok * in_dim * sizeof(float)) == 0,
+    ns4_gpu_tensor x; memset(&x, 0, sizeof(x));
+    ns4_gpu_tensor fast; memset(&fast, 0, sizeof(fast));
+    ns4_gpu_tensor ref; memset(&ref, 0, sizeof(ref));
+    CHECK(ns4_gpu_tensor_alloc_on(&x, 0, n_tok * in_dim * sizeof(float)) == 0,
           "f16_small_batch alloc x");
-    CHECK(ds4_gpu_tensor_alloc_on(&fast, 0, n_tok * out_dim * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&fast, 0, n_tok * out_dim * sizeof(float)) == 0,
           "f16_small_batch alloc fast");
-    CHECK(ds4_gpu_tensor_alloc_on(&ref, 0, n_tok * out_dim * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&ref, 0, n_tok * out_dim * sizeof(float)) == 0,
           "f16_small_batch alloc ref");
-    CHECK(ds4_gpu_tensor_write(&x, 0, host_x, n_tok * in_dim * sizeof(float)),
+    CHECK(ns4_gpu_tensor_write(&x, 0, host_x, n_tok * in_dim * sizeof(float)),
           "f16_small_batch write x");
 
-    int ok = ds4_gpu_matmul_f16_tensor(&fast, model, model_size, 0,
+    int ok = ns4_gpu_matmul_f16_tensor(&fast, model, model_size, 0,
                                        in_dim, out_dim, &x, n_tok);
-    setenv("DS4_CUDA_NO_F16_SMALL_BATCH", "1", 1);
-    setenv("DS4_CUDA_NO_F16_CUBLAS_BATCH", "1", 1);
-    ok = ok && ds4_gpu_matmul_f16_tensor(&ref, model, model_size, 0,
+    setenv("NS4_CUDA_NO_F16_SMALL_BATCH", "1", 1);
+    setenv("NS4_CUDA_NO_F16_CUBLAS_BATCH", "1", 1);
+    ok = ok && ns4_gpu_matmul_f16_tensor(&ref, model, model_size, 0,
                                          in_dim, out_dim, &x, n_tok) &&
-         ds4_gpu_tensor_read(&fast, 0, host_fast, n_tok * out_dim * sizeof(float)) &&
-         ds4_gpu_tensor_read(&ref, 0, host_ref, n_tok * out_dim * sizeof(float));
+         ns4_gpu_tensor_read(&fast, 0, host_fast, n_tok * out_dim * sizeof(float)) &&
+         ns4_gpu_tensor_read(&ref, 0, host_ref, n_tok * out_dim * sizeof(float));
     CHECK(ok, "f16_small_batch compute");
     for (uint64_t i = 0; i < n_tok * out_dim; i++) {
         if (memcmp(&host_fast[i], &host_ref[i], sizeof(float)) != 0) {
@@ -864,14 +864,14 @@ static int run_f16_small_batch(void) {
         }
     }
 
-    ds4_gpu_tensor_free_in_place(&x);
-    ds4_gpu_tensor_free_in_place(&fast);
-    ds4_gpu_tensor_free_in_place(&ref);
+    ns4_gpu_tensor_free_in_place(&x);
+    ns4_gpu_tensor_free_in_place(&fast);
+    ns4_gpu_tensor_free_in_place(&ref);
     free(model);
     free(host_x);
     free(host_fast);
     free(host_ref);
-    ds4_gpu_cleanup();
+    ns4_gpu_cleanup();
     fprintf(stderr, "  f16_small_batch OK\n");
     return 0;
 }
@@ -884,15 +884,15 @@ static int run_f16_pair_batch(void) {
         return 0;
     }
 
-    unsetenv("DS4_CUDA_NO_F16_PAIR_MATMUL");
-    unsetenv("DS4_CUDA_NO_F16_CUBLAS_BATCH");
-    unsetenv("DS4_CUDA_F16_SMALL_BATCH");
-    unsetenv("DS4_CUDA_NO_F16_SMALL_BATCH");
+    unsetenv("NS4_CUDA_NO_F16_PAIR_MATMUL");
+    unsetenv("NS4_CUDA_NO_F16_CUBLAS_BATCH");
+    unsetenv("NS4_CUDA_F16_SMALL_BATCH");
+    unsetenv("NS4_CUDA_NO_F16_SMALL_BATCH");
 
-    ds4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
+    ns4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
     cfg.n_gpus = 1;
     cfg.device_indices[0] = 0;
-    CHECK(ds4_gpu_init_multi(&cfg), "f16_pair_batch init_multi");
+    CHECK(ns4_gpu_init_multi(&cfg), "f16_pair_batch init_multi");
 
     const uint64_t in_dim = 512;
     const uint64_t out_dim = 80;
@@ -921,27 +921,27 @@ static int run_f16_pair_batch(void) {
                 (float)((int)((t * 23u + i * 17u) % 71u) - 35) * 0.0078125f;
         }
     }
-    CHECK(ds4_gpu_set_model_map(model, model_size), "f16_pair_batch set model map");
+    CHECK(ns4_gpu_set_model_map(model, model_size), "f16_pair_batch set model map");
 
-    ds4_gpu_tensor x; memset(&x, 0, sizeof(x));
-    ds4_gpu_tensor out_fast0; memset(&out_fast0, 0, sizeof(out_fast0));
-    ds4_gpu_tensor out_fast1; memset(&out_fast1, 0, sizeof(out_fast1));
-    ds4_gpu_tensor out_ref0; memset(&out_ref0, 0, sizeof(out_ref0));
-    ds4_gpu_tensor out_ref1; memset(&out_ref1, 0, sizeof(out_ref1));
-    CHECK(ds4_gpu_tensor_alloc_on(&x, 0, n_tok * in_dim * sizeof(float)) == 0,
+    ns4_gpu_tensor x; memset(&x, 0, sizeof(x));
+    ns4_gpu_tensor out_fast0; memset(&out_fast0, 0, sizeof(out_fast0));
+    ns4_gpu_tensor out_fast1; memset(&out_fast1, 0, sizeof(out_fast1));
+    ns4_gpu_tensor out_ref0; memset(&out_ref0, 0, sizeof(out_ref0));
+    ns4_gpu_tensor out_ref1; memset(&out_ref1, 0, sizeof(out_ref1));
+    CHECK(ns4_gpu_tensor_alloc_on(&x, 0, n_tok * in_dim * sizeof(float)) == 0,
           "f16_pair_batch alloc x");
-    CHECK(ds4_gpu_tensor_alloc_on(&out_fast0, 0, n_tok * out_dim * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&out_fast0, 0, n_tok * out_dim * sizeof(float)) == 0,
           "f16_pair_batch alloc fast0");
-    CHECK(ds4_gpu_tensor_alloc_on(&out_fast1, 0, n_tok * out_dim * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&out_fast1, 0, n_tok * out_dim * sizeof(float)) == 0,
           "f16_pair_batch alloc fast1");
-    CHECK(ds4_gpu_tensor_alloc_on(&out_ref0, 0, n_tok * out_dim * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&out_ref0, 0, n_tok * out_dim * sizeof(float)) == 0,
           "f16_pair_batch alloc ref0");
-    CHECK(ds4_gpu_tensor_alloc_on(&out_ref1, 0, n_tok * out_dim * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&out_ref1, 0, n_tok * out_dim * sizeof(float)) == 0,
           "f16_pair_batch alloc ref1");
-    CHECK(ds4_gpu_tensor_write(&x, 0, host_x, n_tok * in_dim * sizeof(float)),
+    CHECK(ns4_gpu_tensor_write(&x, 0, host_x, n_tok * in_dim * sizeof(float)),
           "f16_pair_batch write x");
 
-    int ok = ds4_gpu_matmul_f16_pair_tensor(&out_fast0,
+    int ok = ns4_gpu_matmul_f16_pair_tensor(&out_fast0,
                                             &out_fast1,
                                             model,
                                             model_size,
@@ -951,8 +951,8 @@ static int run_f16_pair_batch(void) {
                                             out_dim,
                                             &x,
                                             n_tok);
-    setenv("DS4_CUDA_NO_F16_PAIR_MATMUL", "1", 1);
-    ok = ok && ds4_gpu_matmul_f16_pair_tensor(&out_ref0,
+    setenv("NS4_CUDA_NO_F16_PAIR_MATMUL", "1", 1);
+    ok = ok && ns4_gpu_matmul_f16_pair_tensor(&out_ref0,
                                                &out_ref1,
                                                model,
                                                model_size,
@@ -962,10 +962,10 @@ static int run_f16_pair_batch(void) {
                                                out_dim,
                                                &x,
                                                n_tok) &&
-         ds4_gpu_tensor_read(&out_fast0, 0, fast0, n_tok * out_dim * sizeof(float)) &&
-         ds4_gpu_tensor_read(&out_fast1, 0, fast1, n_tok * out_dim * sizeof(float)) &&
-         ds4_gpu_tensor_read(&out_ref0, 0, ref0, n_tok * out_dim * sizeof(float)) &&
-         ds4_gpu_tensor_read(&out_ref1, 0, ref1, n_tok * out_dim * sizeof(float));
+         ns4_gpu_tensor_read(&out_fast0, 0, fast0, n_tok * out_dim * sizeof(float)) &&
+         ns4_gpu_tensor_read(&out_fast1, 0, fast1, n_tok * out_dim * sizeof(float)) &&
+         ns4_gpu_tensor_read(&out_ref0, 0, ref0, n_tok * out_dim * sizeof(float)) &&
+         ns4_gpu_tensor_read(&out_ref1, 0, ref1, n_tok * out_dim * sizeof(float));
     CHECK(ok, "f16_pair_batch compute");
     for (uint64_t i = 0; i < n_tok * out_dim; i++) {
         if (memcmp(&fast0[i], &ref0[i], sizeof(float)) != 0 ||
@@ -977,18 +977,18 @@ static int run_f16_pair_batch(void) {
         }
     }
 
-    ds4_gpu_tensor_free_in_place(&x);
-    ds4_gpu_tensor_free_in_place(&out_fast0);
-    ds4_gpu_tensor_free_in_place(&out_fast1);
-    ds4_gpu_tensor_free_in_place(&out_ref0);
-    ds4_gpu_tensor_free_in_place(&out_ref1);
+    ns4_gpu_tensor_free_in_place(&x);
+    ns4_gpu_tensor_free_in_place(&out_fast0);
+    ns4_gpu_tensor_free_in_place(&out_fast1);
+    ns4_gpu_tensor_free_in_place(&out_ref0);
+    ns4_gpu_tensor_free_in_place(&out_ref1);
     free(model);
     free(host_x);
     free(fast0);
     free(fast1);
     free(ref0);
     free(ref1);
-    ds4_gpu_cleanup();
+    ns4_gpu_cleanup();
     fprintf(stderr, "  f16_pair_batch OK\n");
     return 0;
 }
@@ -1001,10 +1001,10 @@ static int run_q8_rowsplit(void) {
         return 0;
     }
 
-    ds4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
+    ns4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
     cfg.n_gpus = 1;
     cfg.device_indices[0] = 0;
-    CHECK(ds4_gpu_init_multi(&cfg), "q8_rowsplit init_multi");
+    CHECK(ns4_gpu_init_multi(&cfg), "q8_rowsplit init_multi");
 
     const uint64_t in_dim = 96;
     const uint64_t out_dim = 97;
@@ -1021,35 +1021,35 @@ static int run_q8_rowsplit(void) {
     for (uint64_t i = 0; i < in_dim; i++) {
         host_x[i] = (float)((int)(i % 43u) - 21) * 0.015625f;
     }
-    CHECK(ds4_gpu_set_model_map(model, model_size), "q8_rowsplit set model map");
+    CHECK(ns4_gpu_set_model_map(model, model_size), "q8_rowsplit set model map");
 
-    ds4_gpu_tensor x; memset(&x, 0, sizeof(x));
-    ds4_gpu_tensor full; memset(&full, 0, sizeof(full));
-    ds4_gpu_tensor split_out; memset(&split_out, 0, sizeof(split_out));
-    CHECK(ds4_gpu_tensor_alloc_on(&x, 0, in_dim * sizeof(float)) == 0,
+    ns4_gpu_tensor x; memset(&x, 0, sizeof(x));
+    ns4_gpu_tensor full; memset(&full, 0, sizeof(full));
+    ns4_gpu_tensor split_out; memset(&split_out, 0, sizeof(split_out));
+    CHECK(ns4_gpu_tensor_alloc_on(&x, 0, in_dim * sizeof(float)) == 0,
           "q8_rowsplit alloc x");
-    CHECK(ds4_gpu_tensor_alloc_on(&full, 0, out_dim * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&full, 0, out_dim * sizeof(float)) == 0,
           "q8_rowsplit alloc full");
-    CHECK(ds4_gpu_tensor_alloc_on(&split_out, 0, out_dim * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&split_out, 0, out_dim * sizeof(float)) == 0,
           "q8_rowsplit alloc split");
-    CHECK(ds4_gpu_tensor_write(&x, 0, host_x, in_dim * sizeof(float)),
+    CHECK(ns4_gpu_tensor_write(&x, 0, host_x, in_dim * sizeof(float)),
           "q8_rowsplit write x");
 
-    ds4_gpu_tensor *split0 = ds4_gpu_tensor_view(&split_out, 0,
+    ns4_gpu_tensor *split0 = ns4_gpu_tensor_view(&split_out, 0,
                                                  split * sizeof(float));
-    ds4_gpu_tensor *split1 = ds4_gpu_tensor_view(&split_out,
+    ns4_gpu_tensor *split1 = ns4_gpu_tensor_view(&split_out,
                                                  split * sizeof(float),
                                                  (out_dim - split) * sizeof(float));
     CHECK(split0 && split1, "q8_rowsplit views");
-    int ok = ds4_gpu_matmul_q8_0_tensor(&full, model, model_size, 0,
+    int ok = ns4_gpu_matmul_q8_0_tensor(&full, model, model_size, 0,
                                         in_dim, out_dim, &x, 1) &&
-             ds4_gpu_matmul_q8_0_tensor(split0, model, model_size, 0,
+             ns4_gpu_matmul_q8_0_tensor(split0, model, model_size, 0,
                                         in_dim, split, &x, 1) &&
-             ds4_gpu_matmul_q8_0_tensor(split1, model, model_size,
+             ns4_gpu_matmul_q8_0_tensor(split1, model, model_size,
                                         split * row_bytes,
                                         in_dim, out_dim - split, &x, 1) &&
-             ds4_gpu_tensor_read(&full, 0, host_full, out_dim * sizeof(float)) &&
-             ds4_gpu_tensor_read(&split_out, 0, host_split, out_dim * sizeof(float));
+             ns4_gpu_tensor_read(&full, 0, host_full, out_dim * sizeof(float)) &&
+             ns4_gpu_tensor_read(&split_out, 0, host_split, out_dim * sizeof(float));
     CHECK(ok, "q8_rowsplit compute");
     for (uint64_t i = 0; i < out_dim; i++) {
         float diff = fabsf(host_full[i] - host_split[i]);
@@ -1061,16 +1061,16 @@ static int run_q8_rowsplit(void) {
         }
     }
 
-    ds4_gpu_tensor_free(split0);
-    ds4_gpu_tensor_free(split1);
-    ds4_gpu_tensor_free_in_place(&x);
-    ds4_gpu_tensor_free_in_place(&full);
-    ds4_gpu_tensor_free_in_place(&split_out);
+    ns4_gpu_tensor_free(split0);
+    ns4_gpu_tensor_free(split1);
+    ns4_gpu_tensor_free_in_place(&x);
+    ns4_gpu_tensor_free_in_place(&full);
+    ns4_gpu_tensor_free_in_place(&split_out);
     free(model);
     free(host_x);
     free(host_full);
     free(host_split);
-    ds4_gpu_cleanup();
+    ns4_gpu_cleanup();
     fprintf(stderr, "  q8_rowsplit OK\n");
     return 0;
 }
@@ -1083,12 +1083,12 @@ static int run_q8_pair_batch(void) {
         return 0;
     }
 
-    setenv("DS4_CUDA_Q8_PAIR_BATCH", "1", 1);
+    setenv("NS4_CUDA_Q8_PAIR_BATCH", "1", 1);
 
-    ds4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
+    ns4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
     cfg.n_gpus = 1;
     cfg.device_indices[0] = 0;
-    CHECK(ds4_gpu_init_multi(&cfg), "q8_pair_batch init_multi");
+    CHECK(ns4_gpu_init_multi(&cfg), "q8_pair_batch init_multi");
 
     const uint64_t in_dim = 96;
     const uint64_t out0_dim = 40;
@@ -1111,40 +1111,40 @@ static int run_q8_pair_batch(void) {
     for (uint64_t i = 0; i < n_tok * in_dim; i++) {
         host_x[i] = (float)((int)(i % 47u) - 23) * 0.03125f;
     }
-    CHECK(ds4_gpu_set_model_map(model, model_size), "q8_pair_batch set model map");
+    CHECK(ns4_gpu_set_model_map(model, model_size), "q8_pair_batch set model map");
 
-    ds4_gpu_tensor x; memset(&x, 0, sizeof(x));
-    ds4_gpu_tensor sep0; memset(&sep0, 0, sizeof(sep0));
-    ds4_gpu_tensor sep1; memset(&sep1, 0, sizeof(sep1));
-    ds4_gpu_tensor pair0; memset(&pair0, 0, sizeof(pair0));
-    ds4_gpu_tensor pair1; memset(&pair1, 0, sizeof(pair1));
-    CHECK(ds4_gpu_tensor_alloc_on(&x, 0, n_tok * in_dim * sizeof(float)) == 0,
+    ns4_gpu_tensor x; memset(&x, 0, sizeof(x));
+    ns4_gpu_tensor sep0; memset(&sep0, 0, sizeof(sep0));
+    ns4_gpu_tensor sep1; memset(&sep1, 0, sizeof(sep1));
+    ns4_gpu_tensor pair0; memset(&pair0, 0, sizeof(pair0));
+    ns4_gpu_tensor pair1; memset(&pair1, 0, sizeof(pair1));
+    CHECK(ns4_gpu_tensor_alloc_on(&x, 0, n_tok * in_dim * sizeof(float)) == 0,
           "q8_pair_batch alloc x");
-    CHECK(ds4_gpu_tensor_alloc_on(&sep0, 0, n_tok * out0_dim * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&sep0, 0, n_tok * out0_dim * sizeof(float)) == 0,
           "q8_pair_batch alloc sep0");
-    CHECK(ds4_gpu_tensor_alloc_on(&sep1, 0, n_tok * out1_dim * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&sep1, 0, n_tok * out1_dim * sizeof(float)) == 0,
           "q8_pair_batch alloc sep1");
-    CHECK(ds4_gpu_tensor_alloc_on(&pair0, 0, n_tok * out0_dim * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&pair0, 0, n_tok * out0_dim * sizeof(float)) == 0,
           "q8_pair_batch alloc pair0");
-    CHECK(ds4_gpu_tensor_alloc_on(&pair1, 0, n_tok * out1_dim * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&pair1, 0, n_tok * out1_dim * sizeof(float)) == 0,
           "q8_pair_batch alloc pair1");
-    CHECK(ds4_gpu_tensor_write(&x, 0, host_x, n_tok * in_dim * sizeof(float)),
+    CHECK(ns4_gpu_tensor_write(&x, 0, host_x, n_tok * in_dim * sizeof(float)),
           "q8_pair_batch write x");
 
-    int ok = ds4_gpu_matmul_q8_0_tensor(&sep0, model, model_size, 0,
+    int ok = ns4_gpu_matmul_q8_0_tensor(&sep0, model, model_size, 0,
                                         in_dim, out0_dim, &x, n_tok) &&
-             ds4_gpu_matmul_q8_0_tensor(&sep1, model, model_size, off1,
+             ns4_gpu_matmul_q8_0_tensor(&sep1, model, model_size, off1,
                                         in_dim, out1_dim, &x, n_tok) &&
-             ds4_gpu_matmul_q8_0_pair_tensor(&pair0, &pair1, model, model_size,
+             ns4_gpu_matmul_q8_0_pair_tensor(&pair0, &pair1, model, model_size,
                                              0, off1, in_dim, out0_dim, out1_dim,
                                              &x, n_tok) &&
-             ds4_gpu_tensor_read(&sep0, 0, host_sep0,
+             ns4_gpu_tensor_read(&sep0, 0, host_sep0,
                                  n_tok * out0_dim * sizeof(float)) &&
-             ds4_gpu_tensor_read(&sep1, 0, host_sep1,
+             ns4_gpu_tensor_read(&sep1, 0, host_sep1,
                                  n_tok * out1_dim * sizeof(float)) &&
-             ds4_gpu_tensor_read(&pair0, 0, host_pair0,
+             ns4_gpu_tensor_read(&pair0, 0, host_pair0,
                                  n_tok * out0_dim * sizeof(float)) &&
-             ds4_gpu_tensor_read(&pair1, 0, host_pair1,
+             ns4_gpu_tensor_read(&pair1, 0, host_pair1,
                                  n_tok * out1_dim * sizeof(float));
     CHECK(ok, "q8_pair_batch compute");
     CHECK(memcmp(host_sep0, host_pair0,
@@ -1154,19 +1154,19 @@ static int run_q8_pair_batch(void) {
                  (size_t)(n_tok * out1_dim) * sizeof(float)) == 0,
           "q8_pair_batch out1");
 
-    ds4_gpu_tensor_free_in_place(&x);
-    ds4_gpu_tensor_free_in_place(&sep0);
-    ds4_gpu_tensor_free_in_place(&sep1);
-    ds4_gpu_tensor_free_in_place(&pair0);
-    ds4_gpu_tensor_free_in_place(&pair1);
+    ns4_gpu_tensor_free_in_place(&x);
+    ns4_gpu_tensor_free_in_place(&sep0);
+    ns4_gpu_tensor_free_in_place(&sep1);
+    ns4_gpu_tensor_free_in_place(&pair0);
+    ns4_gpu_tensor_free_in_place(&pair1);
     free(model);
     free(host_x);
     free(host_sep0);
     free(host_sep1);
     free(host_pair0);
     free(host_pair1);
-    ds4_gpu_cleanup();
-    unsetenv("DS4_CUDA_Q8_PAIR_BATCH");
+    ns4_gpu_cleanup();
+    unsetenv("NS4_CUDA_Q8_PAIR_BATCH");
     fprintf(stderr, "  q8_pair_batch OK\n");
     return 0;
 }
@@ -1179,10 +1179,10 @@ static int run_attention_output_tp(void) {
         return 0;
     }
 
-    ds4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
+    ns4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
     cfg.n_gpus = 1;
     cfg.device_indices[0] = 0;
-    CHECK(ds4_gpu_init_multi(&cfg), "attention_tp init_multi");
+    CHECK(ns4_gpu_init_multi(&cfg), "attention_tp init_multi");
 
     const uint64_t group_dim = 64;
     const uint64_t rank = 64;
@@ -1206,57 +1206,57 @@ static int run_attention_output_tp(void) {
     for (uint64_t i = 0; i < (uint64_t)n_groups * group_dim; i++) {
         host_heads[i] = (float)((int)(i % 29u) - 14) * 0.0625f;
     }
-    CHECK(ds4_gpu_set_model_map(model, model_size), "attention_tp set model map");
+    CHECK(ns4_gpu_set_model_map(model, model_size), "attention_tp set model map");
 
-    ds4_gpu_tensor heads; memset(&heads, 0, sizeof(heads));
-    ds4_gpu_tensor low; memset(&low, 0, sizeof(low));
-    ds4_gpu_tensor low0; memset(&low0, 0, sizeof(low0));
-    ds4_gpu_tensor low1; memset(&low1, 0, sizeof(low1));
-    ds4_gpu_tensor full; memset(&full, 0, sizeof(full));
-    ds4_gpu_tensor p0; memset(&p0, 0, sizeof(p0));
-    ds4_gpu_tensor p1; memset(&p1, 0, sizeof(p1));
-    ds4_gpu_tensor sum; memset(&sum, 0, sizeof(sum));
-    CHECK(ds4_gpu_tensor_alloc_on(&heads, 0, (uint64_t)n_groups * group_dim * sizeof(float)) == 0,
+    ns4_gpu_tensor heads; memset(&heads, 0, sizeof(heads));
+    ns4_gpu_tensor low; memset(&low, 0, sizeof(low));
+    ns4_gpu_tensor low0; memset(&low0, 0, sizeof(low0));
+    ns4_gpu_tensor low1; memset(&low1, 0, sizeof(low1));
+    ns4_gpu_tensor full; memset(&full, 0, sizeof(full));
+    ns4_gpu_tensor p0; memset(&p0, 0, sizeof(p0));
+    ns4_gpu_tensor p1; memset(&p1, 0, sizeof(p1));
+    ns4_gpu_tensor sum; memset(&sum, 0, sizeof(sum));
+    CHECK(ns4_gpu_tensor_alloc_on(&heads, 0, (uint64_t)n_groups * group_dim * sizeof(float)) == 0,
           "attention_tp alloc heads");
-    CHECK(ds4_gpu_tensor_alloc_on(&low, 0, low_dim * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&low, 0, low_dim * sizeof(float)) == 0,
           "attention_tp alloc low");
-    CHECK(ds4_gpu_tensor_alloc_on(&low0, 0, (uint64_t)group_cnt * rank * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&low0, 0, (uint64_t)group_cnt * rank * sizeof(float)) == 0,
           "attention_tp alloc low0");
-    CHECK(ds4_gpu_tensor_alloc_on(&low1, 0, (uint64_t)group_cnt * rank * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&low1, 0, (uint64_t)group_cnt * rank * sizeof(float)) == 0,
           "attention_tp alloc low1");
-    CHECK(ds4_gpu_tensor_alloc_on(&full, 0, out_dim * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&full, 0, out_dim * sizeof(float)) == 0,
           "attention_tp alloc full");
-    CHECK(ds4_gpu_tensor_alloc_on(&p0, 0, out_dim * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&p0, 0, out_dim * sizeof(float)) == 0,
           "attention_tp alloc p0");
-    CHECK(ds4_gpu_tensor_alloc_on(&p1, 0, out_dim * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&p1, 0, out_dim * sizeof(float)) == 0,
           "attention_tp alloc p1");
-    CHECK(ds4_gpu_tensor_alloc_on(&sum, 0, out_dim * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&sum, 0, out_dim * sizeof(float)) == 0,
           "attention_tp alloc sum");
-    CHECK(ds4_gpu_tensor_write(&heads, 0, host_heads,
+    CHECK(ns4_gpu_tensor_write(&heads, 0, host_heads,
                                (uint64_t)n_groups * group_dim * sizeof(float)),
           "attention_tp write heads");
 
-    int ok = ds4_gpu_attention_output_q8_batch_tensor(&full, &low, NULL, NULL,
+    int ok = ns4_gpu_attention_output_q8_batch_tensor(&full, &low, NULL, NULL,
                                                       model, model_size,
                                                       0, b_off,
                                                       group_dim, rank,
                                                       n_groups, out_dim,
                                                       &heads, 1) &&
-             ds4_gpu_attention_output_q8_tp_tensor(&p0, &low0,
+             ns4_gpu_attention_output_q8_tp_tensor(&p0, &low0,
                                                    model, model_size,
                                                    0, b_off,
                                                    group_dim, rank,
                                                    n_groups, 0, group_cnt,
                                                    out_dim, &heads) &&
-             ds4_gpu_attention_output_q8_tp_tensor(&p1, &low1,
+             ns4_gpu_attention_output_q8_tp_tensor(&p1, &low1,
                                                    model, model_size,
                                                    0, b_off,
                                                    group_dim, rank,
                                                    n_groups, group_cnt, group_cnt,
                                                    out_dim, &heads) &&
-             ds4_gpu_add_tensor(&sum, &p0, &p1, (uint32_t)out_dim) &&
-             ds4_gpu_tensor_read(&full, 0, host_full, out_dim * sizeof(float)) &&
-             ds4_gpu_tensor_read(&sum, 0, host_sum, out_dim * sizeof(float));
+             ns4_gpu_add_tensor(&sum, &p0, &p1, (uint32_t)out_dim) &&
+             ns4_gpu_tensor_read(&full, 0, host_full, out_dim * sizeof(float)) &&
+             ns4_gpu_tensor_read(&sum, 0, host_sum, out_dim * sizeof(float));
     CHECK(ok, "attention_tp compute");
     for (uint64_t i = 0; i < out_dim; i++) {
         float diff = fabsf(host_full[i] - host_sum[i]);
@@ -1268,19 +1268,19 @@ static int run_attention_output_tp(void) {
         }
     }
 
-    ds4_gpu_tensor_free_in_place(&heads);
-    ds4_gpu_tensor_free_in_place(&low);
-    ds4_gpu_tensor_free_in_place(&low0);
-    ds4_gpu_tensor_free_in_place(&low1);
-    ds4_gpu_tensor_free_in_place(&full);
-    ds4_gpu_tensor_free_in_place(&p0);
-    ds4_gpu_tensor_free_in_place(&p1);
-    ds4_gpu_tensor_free_in_place(&sum);
+    ns4_gpu_tensor_free_in_place(&heads);
+    ns4_gpu_tensor_free_in_place(&low);
+    ns4_gpu_tensor_free_in_place(&low0);
+    ns4_gpu_tensor_free_in_place(&low1);
+    ns4_gpu_tensor_free_in_place(&full);
+    ns4_gpu_tensor_free_in_place(&p0);
+    ns4_gpu_tensor_free_in_place(&p1);
+    ns4_gpu_tensor_free_in_place(&sum);
     free(model);
     free(host_heads);
     free(host_full);
     free(host_sum);
-    ds4_gpu_cleanup();
+    ns4_gpu_cleanup();
     fprintf(stderr, "  attention_output_tp OK\n");
     return 0;
 }
@@ -1293,15 +1293,15 @@ static int run_attention_output_tp_peer_read(void) {
         return 0;
     }
 
-    unsetenv("DS4_FORCE_HOST_BOUNCE");
+    unsetenv("NS4_FORCE_HOST_BOUNCE");
 
-    ds4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
+    ns4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
     cfg.n_gpus = 2;
     cfg.device_indices[0] = 0;
     cfg.device_indices[1] = 1;
-    CHECK(ds4_gpu_init_multi(&cfg), "attention_peer init_multi");
+    CHECK(ns4_gpu_init_multi(&cfg), "attention_peer init_multi");
     if (!g_gpu_peer_ok[1][0]) {
-        ds4_gpu_cleanup();
+        ns4_gpu_cleanup();
         fprintf(stderr, "  skipping attention_output_tp_peer_read (no peer access 1<-0)\n");
         return 0;
     }
@@ -1328,70 +1328,70 @@ static int run_attention_output_tp_peer_read(void) {
     for (uint64_t i = 0; i < (uint64_t)n_groups * group_dim; i++) {
         host_heads[i] = (float)((int)(i % 31u) - 15) * 0.046875f;
     }
-    CHECK(ds4_gpu_set_model_map(model, model_size), "attention_peer set model map");
-    ds4_tensor_range r0 = { 0, model_size, 0 };
-    ds4_tensor_range r1 = { 0, model_size, 1 };
-    CHECK(ds4_gpu_device_cache_tensors(0, &r0, 1) == 0,
+    CHECK(ns4_gpu_set_model_map(model, model_size), "attention_peer set model map");
+    ns4_tensor_range r0 = { 0, model_size, 0 };
+    ns4_tensor_range r1 = { 0, model_size, 1 };
+    CHECK(ns4_gpu_device_cache_tensors(0, &r0, 1) == 0,
           "attention_peer cache model dev0");
-    CHECK(ds4_gpu_device_cache_tensors(1, &r1, 1) == 0,
+    CHECK(ns4_gpu_device_cache_tensors(1, &r1, 1) == 0,
           "attention_peer cache model dev1");
-    CHECK(ds4_gpu_set_current_device(0) == 0, "attention_peer current dev0");
+    CHECK(ns4_gpu_set_current_device(0) == 0, "attention_peer current dev0");
 
-    ds4_gpu_tensor heads; memset(&heads, 0, sizeof(heads));
-    ds4_gpu_tensor low; memset(&low, 0, sizeof(low));
-    ds4_gpu_tensor low0; memset(&low0, 0, sizeof(low0));
-    ds4_gpu_tensor low1; memset(&low1, 0, sizeof(low1));
-    ds4_gpu_tensor full; memset(&full, 0, sizeof(full));
-    ds4_gpu_tensor p0; memset(&p0, 0, sizeof(p0));
-    ds4_gpu_tensor p1; memset(&p1, 0, sizeof(p1));
-    ds4_gpu_tensor staging; memset(&staging, 0, sizeof(staging));
-    ds4_gpu_tensor sum; memset(&sum, 0, sizeof(sum));
-    CHECK(ds4_gpu_tensor_alloc_on(&heads, 0, (uint64_t)n_groups * group_dim * sizeof(float)) == 0,
+    ns4_gpu_tensor heads; memset(&heads, 0, sizeof(heads));
+    ns4_gpu_tensor low; memset(&low, 0, sizeof(low));
+    ns4_gpu_tensor low0; memset(&low0, 0, sizeof(low0));
+    ns4_gpu_tensor low1; memset(&low1, 0, sizeof(low1));
+    ns4_gpu_tensor full; memset(&full, 0, sizeof(full));
+    ns4_gpu_tensor p0; memset(&p0, 0, sizeof(p0));
+    ns4_gpu_tensor p1; memset(&p1, 0, sizeof(p1));
+    ns4_gpu_tensor staging; memset(&staging, 0, sizeof(staging));
+    ns4_gpu_tensor sum; memset(&sum, 0, sizeof(sum));
+    CHECK(ns4_gpu_tensor_alloc_on(&heads, 0, (uint64_t)n_groups * group_dim * sizeof(float)) == 0,
           "attention_peer alloc heads");
-    CHECK(ds4_gpu_tensor_alloc_on(&low, 0, low_dim * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&low, 0, low_dim * sizeof(float)) == 0,
           "attention_peer alloc low");
-    CHECK(ds4_gpu_tensor_alloc_on(&low0, 0, (uint64_t)group_cnt * rank * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&low0, 0, (uint64_t)group_cnt * rank * sizeof(float)) == 0,
           "attention_peer alloc low0");
-    CHECK(ds4_gpu_tensor_alloc_on(&low1, 1, (uint64_t)group_cnt * rank * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&low1, 1, (uint64_t)group_cnt * rank * sizeof(float)) == 0,
           "attention_peer alloc low1");
-    CHECK(ds4_gpu_tensor_alloc_on(&full, 0, out_dim * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&full, 0, out_dim * sizeof(float)) == 0,
           "attention_peer alloc full");
-    CHECK(ds4_gpu_tensor_alloc_on(&p0, 0, out_dim * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&p0, 0, out_dim * sizeof(float)) == 0,
           "attention_peer alloc p0");
-    CHECK(ds4_gpu_tensor_alloc_on(&p1, 1, out_dim * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&p1, 1, out_dim * sizeof(float)) == 0,
           "attention_peer alloc p1");
-    CHECK(ds4_gpu_tensor_alloc_on(&staging, 0, out_dim * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&staging, 0, out_dim * sizeof(float)) == 0,
           "attention_peer alloc staging");
-    CHECK(ds4_gpu_tensor_alloc_on(&sum, 0, out_dim * sizeof(float)) == 0,
+    CHECK(ns4_gpu_tensor_alloc_on(&sum, 0, out_dim * sizeof(float)) == 0,
           "attention_peer alloc sum");
-    CHECK(ds4_gpu_tensor_write(&heads, 0, host_heads,
+    CHECK(ns4_gpu_tensor_write(&heads, 0, host_heads,
                                (uint64_t)n_groups * group_dim * sizeof(float)),
           "attention_peer write heads");
 
-    int ok = ds4_gpu_attention_output_q8_batch_tensor(&full, &low, NULL, NULL,
+    int ok = ns4_gpu_attention_output_q8_batch_tensor(&full, &low, NULL, NULL,
                                                       model, model_size,
                                                       0, b_off,
                                                       group_dim, rank,
                                                       n_groups, out_dim,
                                                       &heads, 1) &&
-             ds4_gpu_attention_output_q8_tp_tensor(&p0, &low0,
+             ns4_gpu_attention_output_q8_tp_tensor(&p0, &low0,
                                                    model, model_size,
                                                    0, b_off,
                                                    group_dim, rank,
                                                    n_groups, 0, group_cnt,
                                                    out_dim, &heads) &&
-             ds4_gpu_tensor_wait_xdev(&heads, 1) &&
-             ds4_gpu_set_current_device(1) == 0 &&
-             ds4_gpu_attention_output_q8_tp_tensor(&p1, &low1,
+             ns4_gpu_tensor_wait_xdev(&heads, 1) &&
+             ns4_gpu_set_current_device(1) == 0 &&
+             ns4_gpu_attention_output_q8_tp_tensor(&p1, &low1,
                                                    model, model_size,
                                                    0, b_off,
                                                    group_dim, rank,
                                                    n_groups, group_cnt, group_cnt,
                                                    out_dim, &heads) &&
-             ds4_gpu_set_current_device(0) == 0 &&
-             ds4_gpu_add_xdev_tensor(&sum, &p0, &p1, &staging, (uint32_t)out_dim) &&
-             ds4_gpu_tensor_read(&full, 0, host_full, out_dim * sizeof(float)) &&
-             ds4_gpu_tensor_read(&sum, 0, host_sum, out_dim * sizeof(float));
+             ns4_gpu_set_current_device(0) == 0 &&
+             ns4_gpu_add_xdev_tensor(&sum, &p0, &p1, &staging, (uint32_t)out_dim) &&
+             ns4_gpu_tensor_read(&full, 0, host_full, out_dim * sizeof(float)) &&
+             ns4_gpu_tensor_read(&sum, 0, host_sum, out_dim * sizeof(float));
     CHECK(ok, "attention_peer compute");
     for (uint64_t i = 0; i < out_dim; i++) {
         float diff = fabsf(host_full[i] - host_sum[i]);
@@ -1403,20 +1403,20 @@ static int run_attention_output_tp_peer_read(void) {
         }
     }
 
-    ds4_gpu_tensor_free_in_place(&heads);
-    ds4_gpu_tensor_free_in_place(&low);
-    ds4_gpu_tensor_free_in_place(&low0);
-    ds4_gpu_tensor_free_in_place(&low1);
-    ds4_gpu_tensor_free_in_place(&full);
-    ds4_gpu_tensor_free_in_place(&p0);
-    ds4_gpu_tensor_free_in_place(&p1);
-    ds4_gpu_tensor_free_in_place(&staging);
-    ds4_gpu_tensor_free_in_place(&sum);
+    ns4_gpu_tensor_free_in_place(&heads);
+    ns4_gpu_tensor_free_in_place(&low);
+    ns4_gpu_tensor_free_in_place(&low0);
+    ns4_gpu_tensor_free_in_place(&low1);
+    ns4_gpu_tensor_free_in_place(&full);
+    ns4_gpu_tensor_free_in_place(&p0);
+    ns4_gpu_tensor_free_in_place(&p1);
+    ns4_gpu_tensor_free_in_place(&staging);
+    ns4_gpu_tensor_free_in_place(&sum);
     free(model);
     free(host_heads);
     free(host_full);
     free(host_sum);
-    ds4_gpu_cleanup();
+    ns4_gpu_cleanup();
     fprintf(stderr, "  attention_output_tp_peer_read OK\n");
     return 0;
 }

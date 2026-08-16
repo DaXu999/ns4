@@ -18,11 +18,11 @@
  *   ./topk_bench --dist=narrow   # scores inside one binade: worst case for
  *                                # a radix select's first pass
  *
- * The baseline kernels are #included verbatim from ds4_cuda.cu so the
+ * The baseline kernels are #included verbatim from ns4_cuda.cu so the
  * comparison cannot drift:
  *
- *   { sed -n '14052,14054p' ../../ds4_cuda.cu; echo;
- *     sed -n '14495,14686p' ../../ds4_cuda.cu; } > topk_baseline.inc
+ *   { sed -n '14052,14054p' ../../ns4_cuda.cu; echo;
+ *     sed -n '14495,14686p' ../../ns4_cuda.cu; } > topk_baseline.inc
  *
  * (line numbers as of the radix-select commit's parent; re-extract if they
  * move). Each row is timed graph-amortised -- reps captured as one graph, so
@@ -42,7 +42,7 @@
     fprintf(stderr, "%s:%d %s -> %s\n", __FILE__, __LINE__, #x, cudaGetErrorString(e_)); \
     exit(1); } } while (0)
 
-enum { DS4_CUDA_TOPK_MERGE_GROUP = 8u };
+enum { NS4_CUDA_TOPK_MERGE_GROUP = 8u };
 
 #include "topk_baseline.inc"
 
@@ -317,8 +317,8 @@ int main(int argc, char **argv) {
     const uint32_t cand_stride = n_chunks * top_k;
     uint32_t n_sets = n_chunks;
     uint64_t scratch_per_token = cand_stride;
-    while (n_sets > DS4_CUDA_TOPK_MERGE_GROUP) {
-        n_sets = (n_sets + DS4_CUDA_TOPK_MERGE_GROUP - 1u) / DS4_CUDA_TOPK_MERGE_GROUP;
+    while (n_sets > NS4_CUDA_TOPK_MERGE_GROUP) {
+        n_sets = (n_sets + NS4_CUDA_TOPK_MERGE_GROUP - 1u) / NS4_CUDA_TOPK_MERGE_GROUP;
         scratch_per_token += (uint64_t)n_sets * top_k;
     }
     uint32_t *d_scratch;
@@ -333,15 +333,15 @@ int main(int argc, char **argv) {
         dim3 gc(n_tokens, n_chunks, 1);
         indexer_topk_chunk_pow2_kernel<4096><<<gc, 1024, 0, st>>>(
                 cur, d_scores, n_comp, n_tokens, top_k, cand_stride);
-        while (sets > DS4_CUDA_TOPK_MERGE_GROUP) {
+        while (sets > NS4_CUDA_TOPK_MERGE_GROUP) {
             const uint32_t next_sets =
-                (sets + DS4_CUDA_TOPK_MERGE_GROUP - 1u) / DS4_CUDA_TOPK_MERGE_GROUP;
+                (sets + NS4_CUDA_TOPK_MERGE_GROUP - 1u) / NS4_CUDA_TOPK_MERGE_GROUP;
             const uint32_t next_stride = next_sets * top_k;
             uint32_t *next = cur + (uint64_t)n_tokens * cur_stride;
             dim3 gm(n_tokens, next_sets, 1);
             indexer_topk_tree_merge_pow2_kernel<4096><<<gm, 1024, 0, st>>>(
                     next, cur, d_scores, n_comp, n_tokens, top_k, sets,
-                    DS4_CUDA_TOPK_MERGE_GROUP, cur_stride, next_stride);
+                    NS4_CUDA_TOPK_MERGE_GROUP, cur_stride, next_stride);
             cur = next; sets = next_sets; cur_stride = next_stride;
         }
         indexer_topk_merge_pow2_kernel<4096><<<n_tokens, 1024, 0, st>>>(

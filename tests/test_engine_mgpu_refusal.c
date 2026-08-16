@@ -15,10 +15,10 @@
  *   - emits stderr containing "mgpu-graph-session-cpu-spill" (proves
  *     the CPU-spill branch fired with the new wording).
  *
- * Requires DS4_TEST_MODEL to be set to a valid GGUF path. */
+ * Requires NS4_TEST_MODEL to be set to a valid GGUF path. */
 
-#include "ds4.h"
-#include "ds4_gpu_mgpu.h"
+#include "ns4.h"
+#include "ns4_gpu_mgpu.h"
 
 #include <cuda_runtime.h>
 #include <stdio.h>
@@ -60,15 +60,15 @@ int main(void) {
         return 0;
     }
 
-    const char *model_path = getenv("DS4_TEST_MODEL");
+    const char *model_path = getenv("NS4_TEST_MODEL");
     if (!model_path || !model_path[0]) {
-        fprintf(stderr, "FAIL: DS4_TEST_MODEL not set\n");
+        fprintf(stderr, "FAIL: NS4_TEST_MODEL not set\n");
         return 1;
     }
 
     /* Capture stderr to a temp file. We use a known path so failures are
      * easy to inspect; the file is removed at the end on success. */
-    const char *cap_path = "/tmp/ds4_mgpu_refusal_stderr.log";
+    const char *cap_path = "/tmp/ns4_mgpu_refusal_stderr.log";
     (void)unlink(cap_path);
     fflush(stderr);
     int saved_stderr = dup(fileno(stderr));
@@ -77,7 +77,7 @@ int main(void) {
     CHECK(redir != NULL, "freopen stderr");
 
     /* Build a 2-GPU config. */
-    ds4_gpu_config cfg;
+    ns4_gpu_config cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.n_gpus = 2;
     cfg.device_indices[0] = 0;
@@ -97,16 +97,16 @@ int main(void) {
     cfg.vram_bytes[1] = (size_t)8ull * 1024u * 1024u * 1024u;   /* 8 GiB */
     cfg.safety_margin_bytes = 0;
 
-    ds4_engine_options opt;
+    ns4_engine_options opt;
     memset(&opt, 0, sizeof(opt));
     opt.model_path = model_path;
-    opt.backend = DS4_BACKEND_CUDA;
+    opt.backend = NS4_BACKEND_CUDA;
     opt.n_threads = 1;
     opt.warm_weights = false;
     opt.quality = false;
 
-    ds4_engine *engine = NULL;
-    int rc = ds4_engine_create_with_gpu_config(&engine, &opt, &cfg);
+    ns4_engine *engine = NULL;
+    int rc = ns4_engine_create_with_gpu_config(&engine, &opt, &cfg);
 
     /* Restore stderr so subsequent prints reach the terminal. */
     fflush(stderr);

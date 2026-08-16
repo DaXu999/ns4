@@ -1,6 +1,6 @@
-/* Generated from ds4 expert hotlist profiles; sorted by hits/weight. */
+/* Generated from ns4 expert hotlist profiles; sorted by hits/weight. */
 /* DeepSeek V4 Pro default streaming expert hotlist. */
-static const uint16_t ds4_default_streaming_hotlist_pro[][2] = {
+static const uint16_t ns4_default_streaming_hotlist_pro[][2] = {
     {44, 213},
     {25, 315},
     {56, 253},
@@ -6886,12 +6886,12 @@ static const uint16_t ds4_default_streaming_hotlist_pro[][2] = {
     {48, 101},
     {41, 223},
 };
-static const uint32_t ds4_default_streaming_hotlist_pro_count =
-    (uint32_t)(sizeof(ds4_default_streaming_hotlist_pro) /
-               sizeof(ds4_default_streaming_hotlist_pro[0]));
+static const uint32_t ns4_default_streaming_hotlist_pro_count =
+    (uint32_t)(sizeof(ns4_default_streaming_hotlist_pro) /
+               sizeof(ns4_default_streaming_hotlist_pro[0]));
 
 /* DeepSeek V4 Flash default streaming expert hotlist. */
-static const uint16_t ds4_default_streaming_hotlist_flash[][2] = {
+static const uint16_t ns4_default_streaming_hotlist_flash[][2] = {
     {25, 53},
     {22, 66},
     {38, 63},
@@ -13329,6 +13329,6 @@ static const uint16_t ds4_default_streaming_hotlist_flash[][2] = {
     {42, 251},
     {42, 254},
 };
-static const uint32_t ds4_default_streaming_hotlist_flash_count =
-    (uint32_t)(sizeof(ds4_default_streaming_hotlist_flash) /
-               sizeof(ds4_default_streaming_hotlist_flash[0]));
+static const uint32_t ns4_default_streaming_hotlist_flash_count =
+    (uint32_t)(sizeof(ns4_default_streaming_hotlist_flash) /
+               sizeof(ns4_default_streaming_hotlist_flash[0]));

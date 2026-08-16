@@ -4,7 +4,7 @@ active-weight byte budget of one decode token."""
 import struct, sys, collections
 
 F = sys.argv[1] if len(sys.argv) > 1 else \
-    "/workspace/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
+    "/workspace/ns4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
 
 # ggml type -> (block size in elements, bytes per block)
 TYPES = {

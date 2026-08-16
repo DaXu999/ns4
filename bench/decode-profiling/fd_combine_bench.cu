@@ -1,6 +1,6 @@
 /* Standalone microbenchmark for the flash-decode *combine* kernel.
  *
- * End-to-end ds4-bench cannot resolve this kernel: it is ~1 of 37 kernels per
+ * End-to-end ns4-bench cannot resolve this kernel: it is ~1 of 37 kernels per
  * layer, and against +/-5% run-to-run drift the rewrite showed +2.1% mean with
  * 1 of 3 replicates favouring the old shape -- i.e. nothing.  This times the
  * kernel alone, both as decode issues it (eager, on the ~6 us WDDM submission
@@ -13,15 +13,15 @@
  * because it is free and bit-identical, not because it moves the benchmark.
  *
  * The production kernel comes from fd_combine.inc, extracted verbatim from
- * ds4_cuda.cu so the comparison stays honest:
+ * ns4_cuda.cu so the comparison stays honest:
  *
- *     sed -n '9811,9816p'   ds4_cuda.cu  > fd_combine.inc  # kFD* constants
- *     sed -n '10031,10032p' ds4_cuda.cu >> fd_combine.inc  # kFDCombDims
- *     sed -n '10034,10119p' ds4_cuda.cu >> fd_combine.inc  # the kernel
+ *     sed -n '9811,9816p'   ns4_cuda.cu  > fd_combine.inc  # kFD* constants
+ *     sed -n '10031,10032p' ns4_cuda.cu >> fd_combine.inc  # kFDCombDims
+ *     sed -n '10034,10119p' ns4_cuda.cu >> fd_combine.inc  # the kernel
  *
  * (line numbers as of acf4a5e + the uncommitted combine rewrite; re-extract if
  * the kernel moves).  The control is frozen in this file instead -- it is no
- * longer in ds4_cuda.cu to extract.
+ * longer in ns4_cuda.cu to extract.
  *
  *     nvcc -O3 -arch=sm_120 -o fd_combine_bench fd_combine_bench.cu
  *     ./fd_combine_bench                 # L2-warm, as in real decode

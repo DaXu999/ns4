@@ -1,18 +1,18 @@
-#define DS4_SERVER_TEST
-#define DS4_SERVER_TEST_NO_MAIN
-#include "ds4_server.c"
-#ifndef DS4_NO_GPU
-#include "ds4_gpu.h"
+#define NS4_SERVER_TEST
+#define NS4_SERVER_TEST_NO_MAIN
+#include "ns4_server.c"
+#ifndef NS4_NO_GPU
+#include "ns4_gpu.h"
 #include <math.h>
 
-bool ds4_test_dspark_cache_window_crop(void);
+bool ns4_test_dspark_cache_window_crop(void);
 
-static ds4_engine *test_engine_fast;
-static ds4_engine *test_engine_quality;
+static ns4_engine *test_engine_fast;
+static ns4_engine *test_engine_quality;
 
 static const char *test_model_path(void) {
-    const char *model_path = getenv("DS4_TEST_MODEL");
-    return (model_path && model_path[0]) ? model_path : "ds4flash.gguf";
+    const char *model_path = getenv("NS4_TEST_MODEL");
+    return (model_path && model_path[0]) ? model_path : "ns4flash.gguf";
 }
 
 static bool test_env_bool(const char *name) {
@@ -68,51 +68,51 @@ typedef struct {
 static test_streaming_prefill_env test_force_canonical_streaming_prefill(void) {
     test_streaming_prefill_env saved = {
         .cold_decode =
-            test_save_env("DS4_CUDA_DISABLE_STREAMING_COLD_DECODE_PREFILL"),
+            test_save_env("NS4_CUDA_DISABLE_STREAMING_COLD_DECODE_PREFILL"),
         .batch_selected_addr =
-            test_save_env("DS4_CUDA_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR"),
+            test_save_env("NS4_CUDA_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR"),
     };
-    if (test_env_bool("DS4_TEST_SSD_STREAMING")) {
-        setenv("DS4_CUDA_DISABLE_STREAMING_COLD_DECODE_PREFILL", "1", 1);
-        setenv("DS4_CUDA_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR", "1", 1);
+    if (test_env_bool("NS4_TEST_SSD_STREAMING")) {
+        setenv("NS4_CUDA_DISABLE_STREAMING_COLD_DECODE_PREFILL", "1", 1);
+        setenv("NS4_CUDA_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR", "1", 1);
     }
     return saved;
 }
 
 static void test_restore_canonical_streaming_prefill(
         test_streaming_prefill_env saved) {
-    test_restore_env("DS4_CUDA_DISABLE_STREAMING_COLD_DECODE_PREFILL",
+    test_restore_env("NS4_CUDA_DISABLE_STREAMING_COLD_DECODE_PREFILL",
                      saved.cold_decode);
-    test_restore_env("DS4_CUDA_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR",
+    test_restore_env("NS4_CUDA_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR",
                      saved.batch_selected_addr);
 }
 
-static ds4_engine *test_open_engine(bool quality) {
-    ds4_engine *engine = NULL;
-    /* DS4_TEST_MTP loads the MTP head on the fast engine so the speculative
+static ns4_engine *test_open_engine(bool quality) {
+    ns4_engine *engine = NULL;
+    /* NS4_TEST_MTP loads the MTP head on the fast engine so the speculative
      * verify regression can reuse it; draft=4 hits the multi-row verify path. */
-    const char *mtp = getenv("DS4_TEST_MTP");
-    ds4_engine_options opt = {
+    const char *mtp = getenv("NS4_TEST_MTP");
+    ns4_engine_options opt = {
         .model_path = test_model_path(),
-        .backend = DS4_BACKEND_CUDA,
+        .backend = NS4_BACKEND_CUDA,
         .quality = quality,
-        .ssd_streaming = test_env_bool("DS4_TEST_SSD_STREAMING"),
-        .ssd_streaming_cold = test_env_bool("DS4_TEST_SSD_STREAMING_COLD"),
+        .ssd_streaming = test_env_bool("NS4_TEST_SSD_STREAMING"),
+        .ssd_streaming_cold = test_env_bool("NS4_TEST_SSD_STREAMING_COLD"),
         .ssd_streaming_cache_experts =
-            test_env_u32("DS4_TEST_SSD_STREAMING_CACHE_EXPERTS"),
+            test_env_u32("NS4_TEST_SSD_STREAMING_CACHE_EXPERTS"),
         .ssd_streaming_cache_bytes =
-            test_env_gib("DS4_TEST_SSD_STREAMING_CACHE_GB"),
+            test_env_gib("NS4_TEST_SSD_STREAMING_CACHE_GB"),
         .ssd_streaming_preload_experts =
-            test_env_u32("DS4_TEST_SSD_STREAMING_PRELOAD_EXPERTS"),
+            test_env_u32("NS4_TEST_SSD_STREAMING_PRELOAD_EXPERTS"),
         .mtp_path = (mtp && mtp[0] && !quality) ? mtp : NULL,
         .mtp_draft_tokens = (mtp && mtp[0] && !quality) ? 4 : 0,
     };
-    TEST_ASSERT(ds4_engine_open(&engine, &opt) == 0);
+    TEST_ASSERT(ns4_engine_open(&engine, &opt) == 0);
     return engine;
 }
 
-static ds4_engine *test_get_engine(bool quality) {
-    ds4_engine **slot = quality ? &test_engine_quality : &test_engine_fast;
+static ns4_engine *test_get_engine(bool quality) {
+    ns4_engine **slot = quality ? &test_engine_quality : &test_engine_fast;
     if (*slot) return *slot;
 
     *slot = test_open_engine(quality);
@@ -120,15 +120,15 @@ static ds4_engine *test_get_engine(bool quality) {
 }
 
 static void test_close_engines(void) {
-    ds4_engine_close(test_engine_fast);
-    ds4_engine_close(test_engine_quality);
+    ns4_engine_close(test_engine_fast);
+    ns4_engine_close(test_engine_quality);
     test_engine_fast = NULL;
     test_engine_quality = NULL;
 }
 
 static void test_close_engine(bool quality) {
-    ds4_engine **slot = quality ? &test_engine_quality : &test_engine_fast;
-    ds4_engine_close(*slot);
+    ns4_engine **slot = quality ? &test_engine_quality : &test_engine_fast;
+    ns4_engine_close(*slot);
     *slot = NULL;
 }
 
@@ -262,7 +262,7 @@ static void test_fill_q8_0_weights(uint8_t *weights,
 static void test_gpu_f16_matvec_fast_nr0_4(void) {
     /*
      * This is the short regression for the long-context repetition failure.
-     * Decode uses one-token F16 matvecs for several DS4 projections; the fast
+     * Decode uses one-token F16 matvecs for several NS4 projections; the fast
      * nr0=4 variant must be numerically equivalent to the plain kernel.
      */
     const uint32_t in_dim = 4096;
@@ -283,13 +283,13 @@ static void test_gpu_f16_matvec_fast_nr0_4(void) {
         }
     }
 
-    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)in_dim * sizeof(float));
-    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)out_dim * sizeof(float));
+    ns4_gpu_tensor *x = ns4_gpu_tensor_alloc((uint64_t)in_dim * sizeof(float));
+    ns4_gpu_tensor *out = ns4_gpu_tensor_alloc((uint64_t)out_dim * sizeof(float));
     TEST_ASSERT(x != NULL);
     TEST_ASSERT(out != NULL);
     if (!x || !out) {
-        ds4_gpu_tensor_free(x);
-        ds4_gpu_tensor_free(out);
+        ns4_gpu_tensor_free(x);
+        ns4_gpu_tensor_free(out);
         free(weights_raw);
         return;
     }
@@ -301,8 +301,8 @@ static void test_gpu_f16_matvec_fast_nr0_4(void) {
     if (!x_host || !out_host) {
         free(x_host);
         free(out_host);
-        ds4_gpu_tensor_free(x);
-        ds4_gpu_tensor_free(out);
+        ns4_gpu_tensor_free(x);
+        ns4_gpu_tensor_free(out);
         free(weights_raw);
         return;
     }
@@ -311,12 +311,12 @@ static void test_gpu_f16_matvec_fast_nr0_4(void) {
         x_host[i] = (float)((int)(i % 31u) - 15) / 32.0f;
     }
 
-    TEST_ASSERT(ds4_gpu_tensor_write(x, 0, x_host, (uint64_t)in_dim * sizeof(float)) != 0);
-    TEST_ASSERT(ds4_gpu_set_model_map(weights_raw, weight_alloc) != 0);
-    ds4_gpu_set_quality(false);
-    TEST_ASSERT(ds4_gpu_matmul_f16_tensor(out, weights_raw, weight_alloc, 0,
+    TEST_ASSERT(ns4_gpu_tensor_write(x, 0, x_host, (uint64_t)in_dim * sizeof(float)) != 0);
+    TEST_ASSERT(ns4_gpu_set_model_map(weights_raw, weight_alloc) != 0);
+    ns4_gpu_set_quality(false);
+    TEST_ASSERT(ns4_gpu_matmul_f16_tensor(out, weights_raw, weight_alloc, 0,
                                             in_dim, out_dim, x, 1) != 0);
-    TEST_ASSERT(ds4_gpu_tensor_read(out, 0, out_host, (uint64_t)out_dim * sizeof(float)) != 0);
+    TEST_ASSERT(ns4_gpu_tensor_read(out, 0, out_host, (uint64_t)out_dim * sizeof(float)) != 0);
 
     float max_abs = 0.0f;
     for (uint32_t o = 0; o < out_dim; o++) {
@@ -332,8 +332,8 @@ static void test_gpu_f16_matvec_fast_nr0_4(void) {
 
     free(x_host);
     free(out_host);
-    ds4_gpu_tensor_free(x);
-    ds4_gpu_tensor_free(out);
+    ns4_gpu_tensor_free(x);
+    ns4_gpu_tensor_free(out);
     free(weights_raw);
 }
 
@@ -359,13 +359,13 @@ static void test_gpu_f16_prefill_matmul(void) {
         }
     }
 
-    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(x_bytes);
-    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(out_bytes);
+    ns4_gpu_tensor *x = ns4_gpu_tensor_alloc(x_bytes);
+    ns4_gpu_tensor *out = ns4_gpu_tensor_alloc(out_bytes);
     TEST_ASSERT(x != NULL);
     TEST_ASSERT(out != NULL);
     if (!x || !out) {
-        ds4_gpu_tensor_free(x);
-        ds4_gpu_tensor_free(out);
+        ns4_gpu_tensor_free(x);
+        ns4_gpu_tensor_free(out);
         free(weights_raw);
         return;
     }
@@ -377,8 +377,8 @@ static void test_gpu_f16_prefill_matmul(void) {
     if (!x_host || !out_host) {
         free(x_host);
         free(out_host);
-        ds4_gpu_tensor_free(x);
-        ds4_gpu_tensor_free(out);
+        ns4_gpu_tensor_free(x);
+        ns4_gpu_tensor_free(out);
         free(weights_raw);
         return;
     }
@@ -393,13 +393,13 @@ static void test_gpu_f16_prefill_matmul(void) {
         out_host[i] = 12345.0f;
     }
 
-    TEST_ASSERT(ds4_gpu_tensor_write(x, 0, x_host, x_bytes) != 0);
-    TEST_ASSERT(ds4_gpu_tensor_write(out, 0, out_host, out_bytes) != 0);
-    TEST_ASSERT(ds4_gpu_set_model_map(weights_raw, weight_alloc) != 0);
-    ds4_gpu_set_quality(false);
-    TEST_ASSERT(ds4_gpu_matmul_f16_tensor(out, weights_raw, weight_alloc, 0,
+    TEST_ASSERT(ns4_gpu_tensor_write(x, 0, x_host, x_bytes) != 0);
+    TEST_ASSERT(ns4_gpu_tensor_write(out, 0, out_host, out_bytes) != 0);
+    TEST_ASSERT(ns4_gpu_set_model_map(weights_raw, weight_alloc) != 0);
+    ns4_gpu_set_quality(false);
+    TEST_ASSERT(ns4_gpu_matmul_f16_tensor(out, weights_raw, weight_alloc, 0,
                                           in_dim, out_dim, x, n_tok) != 0);
-    TEST_ASSERT(ds4_gpu_tensor_read(out, 0, out_host, out_bytes) != 0);
+    TEST_ASSERT(ns4_gpu_tensor_read(out, 0, out_host, out_bytes) != 0);
 
     float max_abs = 0.0f;
     float rms = 0.0f;
@@ -423,19 +423,19 @@ static void test_gpu_f16_prefill_matmul(void) {
 
     free(x_host);
     free(out_host);
-    ds4_gpu_tensor_free(x);
-    ds4_gpu_tensor_free(out);
+    ns4_gpu_tensor_free(x);
+    ns4_gpu_tensor_free(out);
     free(weights_raw);
 }
 
 static void test_gpu_q8_0_prefill_matmul(void) {
-    /* Not yet portable off Metal: the case feeds ds4_gpu_set_model_map() a
+    /* Not yet portable off Metal: the case feeds ns4_gpu_set_model_map() a
      * plain malloc'd buffer, which Metal could address directly through
      * unified memory.  CUDA registers nothing for it ("registered 0.00 GiB")
      * and the quantize launch then fails with invalid argument.  Porting it
      * needs the weights staged into a device-visible mapping first; see
      * METAL_FEATURES_PORTING_NOTES.md. */
-    fprintf(stderr, "ds4-test: q8_0 prefill matmul skipped, "
+    fprintf(stderr, "ns4-test: q8_0 prefill matmul skipped, "
                     "host-pointer model map is Metal-only (not yet ported)\n");
     if (1) return;
     const uint32_t in_dim = 128;
@@ -455,13 +455,13 @@ static void test_gpu_q8_0_prefill_matmul(void) {
     memset(weights, 0, (size_t)weight_alloc);
     test_fill_q8_0_weights(weights, in_dim, out_dim, 0);
 
-    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(x_bytes);
-    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(out_bytes);
+    ns4_gpu_tensor *x = ns4_gpu_tensor_alloc(x_bytes);
+    ns4_gpu_tensor *out = ns4_gpu_tensor_alloc(out_bytes);
     TEST_ASSERT(x != NULL);
     TEST_ASSERT(out != NULL);
     if (!x || !out) {
-        ds4_gpu_tensor_free(x);
-        ds4_gpu_tensor_free(out);
+        ns4_gpu_tensor_free(x);
+        ns4_gpu_tensor_free(out);
         free(weights_raw);
         return;
     }
@@ -473,8 +473,8 @@ static void test_gpu_q8_0_prefill_matmul(void) {
     if (!x_host || !out_host) {
         free(x_host);
         free(out_host);
-        ds4_gpu_tensor_free(x);
-        ds4_gpu_tensor_free(out);
+        ns4_gpu_tensor_free(x);
+        ns4_gpu_tensor_free(out);
         free(weights_raw);
         return;
     }
@@ -489,13 +489,13 @@ static void test_gpu_q8_0_prefill_matmul(void) {
         out_host[i] = 12345.0f;
     }
 
-    TEST_ASSERT(ds4_gpu_tensor_write(x, 0, x_host, x_bytes) != 0);
-    TEST_ASSERT(ds4_gpu_tensor_write(out, 0, out_host, out_bytes) != 0);
-    TEST_ASSERT(ds4_gpu_set_model_map(weights_raw, weight_alloc) != 0);
-    ds4_gpu_set_quality(false);
-    TEST_ASSERT(ds4_gpu_matmul_q8_0_tensor(out, weights_raw, weight_alloc, 0,
+    TEST_ASSERT(ns4_gpu_tensor_write(x, 0, x_host, x_bytes) != 0);
+    TEST_ASSERT(ns4_gpu_tensor_write(out, 0, out_host, out_bytes) != 0);
+    TEST_ASSERT(ns4_gpu_set_model_map(weights_raw, weight_alloc) != 0);
+    ns4_gpu_set_quality(false);
+    TEST_ASSERT(ns4_gpu_matmul_q8_0_tensor(out, weights_raw, weight_alloc, 0,
                                            in_dim, out_dim, x, n_tok) != 0);
-    TEST_ASSERT(ds4_gpu_tensor_read(out, 0, out_host, out_bytes) != 0);
+    TEST_ASSERT(ns4_gpu_tensor_read(out, 0, out_host, out_bytes) != 0);
 
     float max_abs = 0.0f;
     float rms = 0.0f;
@@ -526,8 +526,8 @@ static void test_gpu_q8_0_prefill_matmul(void) {
 
     free(x_host);
     free(out_host);
-    ds4_gpu_tensor_free(x);
-    ds4_gpu_tensor_free(out);
+    ns4_gpu_tensor_free(x);
+    ns4_gpu_tensor_free(out);
     free(weights_raw);
 }
 
@@ -541,13 +541,13 @@ static void test_gpu_pack_slot_rows_f32(void) {
     const uint64_t slot_bytes = slot_count * sizeof(float);
     const uint64_t out_bytes = out_count * sizeof(float);
 
-    ds4_gpu_tensor *slots = ds4_gpu_tensor_alloc(slot_bytes);
-    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(out_bytes);
+    ns4_gpu_tensor *slots = ns4_gpu_tensor_alloc(slot_bytes);
+    ns4_gpu_tensor *out = ns4_gpu_tensor_alloc(out_bytes);
     TEST_ASSERT(slots != NULL);
     TEST_ASSERT(out != NULL);
     if (!slots || !out) {
-        ds4_gpu_tensor_free(slots);
-        ds4_gpu_tensor_free(out);
+        ns4_gpu_tensor_free(slots);
+        ns4_gpu_tensor_free(out);
         return;
     }
 
@@ -558,8 +558,8 @@ static void test_gpu_pack_slot_rows_f32(void) {
     if (!slot_host || !out_host) {
         free(slot_host);
         free(out_host);
-        ds4_gpu_tensor_free(slots);
-        ds4_gpu_tensor_free(out);
+        ns4_gpu_tensor_free(slots);
+        ns4_gpu_tensor_free(out);
         return;
     }
 
@@ -573,15 +573,15 @@ static void test_gpu_pack_slot_rows_f32(void) {
     }
     for (uint64_t i = 0; i < out_count; i++) out_host[i] = -1.0f;
 
-    TEST_ASSERT(ds4_gpu_tensor_write(slots, 0, slot_host, slot_bytes) != 0);
-    TEST_ASSERT(ds4_gpu_tensor_write(out, 0, out_host, out_bytes) != 0);
-    TEST_ASSERT(ds4_gpu_pack_slot_rows_f32_tensor(out,
+    TEST_ASSERT(ns4_gpu_tensor_write(slots, 0, slot_host, slot_bytes) != 0);
+    TEST_ASSERT(ns4_gpu_tensor_write(out, 0, out_host, out_bytes) != 0);
+    TEST_ASSERT(ns4_gpu_pack_slot_rows_f32_tensor(out,
                                                   slots,
                                                   n_rows,
                                                   width,
                                                   n_slots,
                                                   slot_cap) != 0);
-    TEST_ASSERT(ds4_gpu_tensor_read(out, 0, out_host, out_bytes) != 0);
+    TEST_ASSERT(ns4_gpu_tensor_read(out, 0, out_host, out_bytes) != 0);
 
     for (uint32_t row = 0; row < n_rows; row++) {
         for (uint32_t slot = 0; slot < n_slots; slot++) {
@@ -597,8 +597,8 @@ static void test_gpu_pack_slot_rows_f32(void) {
 
     free(slot_host);
     free(out_host);
-    ds4_gpu_tensor_free(slots);
-    ds4_gpu_tensor_free(out);
+    ns4_gpu_tensor_free(slots);
+    ns4_gpu_tensor_free(out);
 }
 
 static void test_gpu_store_raw_kv_batch_wrap(void) {
@@ -611,13 +611,13 @@ static void test_gpu_store_raw_kv_batch_wrap(void) {
     const uint64_t kv_bytes = kv_count * sizeof(float);
     const uint64_t raw_bytes = raw_count * sizeof(float);
 
-    ds4_gpu_tensor *kv = ds4_gpu_tensor_alloc(kv_bytes);
-    ds4_gpu_tensor *raw = ds4_gpu_tensor_alloc(raw_bytes);
+    ns4_gpu_tensor *kv = ns4_gpu_tensor_alloc(kv_bytes);
+    ns4_gpu_tensor *raw = ns4_gpu_tensor_alloc(raw_bytes);
     TEST_ASSERT(kv != NULL);
     TEST_ASSERT(raw != NULL);
     if (!kv || !raw) {
-        ds4_gpu_tensor_free(kv);
-        ds4_gpu_tensor_free(raw);
+        ns4_gpu_tensor_free(kv);
+        ns4_gpu_tensor_free(raw);
         return;
     }
 
@@ -630,15 +630,15 @@ static void test_gpu_store_raw_kv_batch_wrap(void) {
     }
     for (uint64_t i = 0; i < raw_count; i++) raw_host[i] = -1.0f;
 
-    TEST_ASSERT(ds4_gpu_tensor_write(kv, 0, kv_host, kv_bytes) != 0);
-    TEST_ASSERT(ds4_gpu_tensor_write(raw, 0, raw_host, raw_bytes) != 0);
-    TEST_ASSERT(ds4_gpu_store_raw_kv_batch_tensor(raw,
+    TEST_ASSERT(ns4_gpu_tensor_write(kv, 0, kv_host, kv_bytes) != 0);
+    TEST_ASSERT(ns4_gpu_tensor_write(raw, 0, raw_host, raw_bytes) != 0);
+    TEST_ASSERT(ns4_gpu_store_raw_kv_batch_tensor(raw,
                                                   kv,
                                                   raw_cap,
                                                   pos0,
                                                   n_tokens,
                                                   head_dim) != 0);
-    TEST_ASSERT(ds4_gpu_tensor_read(raw, 0, raw_host, raw_bytes) != 0);
+    TEST_ASSERT(ns4_gpu_tensor_read(raw, 0, raw_host, raw_bytes) != 0);
 
     for (uint32_t t = 0; t < n_tokens; t++) {
         const uint32_t row = (pos0 + t) % raw_cap;
@@ -652,12 +652,12 @@ static void test_gpu_store_raw_kv_batch_wrap(void) {
         TEST_ASSERT(raw_host[(uint64_t)2u * head_dim + d] == -1.0f);
     }
 
-    ds4_gpu_tensor_free(kv);
-    ds4_gpu_tensor_free(raw);
+    ns4_gpu_tensor_free(kv);
+    ns4_gpu_tensor_free(raw);
 }
 
 static void test_dspark_cache_window_crop(void) {
-    TEST_ASSERT(ds4_test_dspark_cache_window_crop());
+    TEST_ASSERT(ns4_test_dspark_cache_window_crop());
 }
 
 static void test_gpu_q8_0_decode_pair_exact_case(
@@ -688,22 +688,22 @@ static void test_gpu_q8_0_decode_pair_exact_case(
     const uint64_t x_bytes = (uint64_t)in_dim * sizeof(float);
     const uint64_t out0_bytes = (uint64_t)out0_dim * sizeof(float);
     const uint64_t out1_bytes = (uint64_t)out1_dim * sizeof(float);
-    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(x_bytes);
-    ds4_gpu_tensor *ref0 = ds4_gpu_tensor_alloc(out0_bytes);
-    ds4_gpu_tensor *ref1 = ds4_gpu_tensor_alloc(out1_bytes);
-    ds4_gpu_tensor *pair0 = ds4_gpu_tensor_alloc(out0_bytes);
-    ds4_gpu_tensor *pair1 = ds4_gpu_tensor_alloc(out1_bytes);
+    ns4_gpu_tensor *x = ns4_gpu_tensor_alloc(x_bytes);
+    ns4_gpu_tensor *ref0 = ns4_gpu_tensor_alloc(out0_bytes);
+    ns4_gpu_tensor *ref1 = ns4_gpu_tensor_alloc(out1_bytes);
+    ns4_gpu_tensor *pair0 = ns4_gpu_tensor_alloc(out0_bytes);
+    ns4_gpu_tensor *pair1 = ns4_gpu_tensor_alloc(out1_bytes);
     TEST_ASSERT(x != NULL);
     TEST_ASSERT(ref0 != NULL);
     TEST_ASSERT(ref1 != NULL);
     TEST_ASSERT(pair0 != NULL);
     TEST_ASSERT(pair1 != NULL);
     if (!x || !ref0 || !ref1 || !pair0 || !pair1) {
-        ds4_gpu_tensor_free(x);
-        ds4_gpu_tensor_free(ref0);
-        ds4_gpu_tensor_free(ref1);
-        ds4_gpu_tensor_free(pair0);
-        ds4_gpu_tensor_free(pair1);
+        ns4_gpu_tensor_free(x);
+        ns4_gpu_tensor_free(ref0);
+        ns4_gpu_tensor_free(ref1);
+        ns4_gpu_tensor_free(pair0);
+        ns4_gpu_tensor_free(pair1);
         free(weights_raw);
         return;
     }
@@ -724,11 +724,11 @@ static void test_gpu_q8_0_decode_pair_exact_case(
         free(ref1_host);
         free(pair0_host);
         free(pair1_host);
-        ds4_gpu_tensor_free(x);
-        ds4_gpu_tensor_free(ref0);
-        ds4_gpu_tensor_free(ref1);
-        ds4_gpu_tensor_free(pair0);
-        ds4_gpu_tensor_free(pair1);
+        ns4_gpu_tensor_free(x);
+        ns4_gpu_tensor_free(ref0);
+        ns4_gpu_tensor_free(ref1);
+        ns4_gpu_tensor_free(pair0);
+        ns4_gpu_tensor_free(pair1);
         free(weights_raw);
         return;
     }
@@ -738,23 +738,23 @@ static void test_gpu_q8_0_decode_pair_exact_case(
         x_host[i] = (float)v / 72.0f;
     }
 
-    TEST_ASSERT(ds4_gpu_tensor_write(x, 0, x_host, x_bytes) != 0);
-    TEST_ASSERT(ds4_gpu_set_model_map(weights_raw, weight_alloc) != 0);
-    ds4_gpu_set_quality(false);
-    TEST_ASSERT(ds4_gpu_matmul_q8_0_tensor(ref0, weights_raw, weight_alloc, 0,
+    TEST_ASSERT(ns4_gpu_tensor_write(x, 0, x_host, x_bytes) != 0);
+    TEST_ASSERT(ns4_gpu_set_model_map(weights_raw, weight_alloc) != 0);
+    ns4_gpu_set_quality(false);
+    TEST_ASSERT(ns4_gpu_matmul_q8_0_tensor(ref0, weights_raw, weight_alloc, 0,
                                            in_dim, out0_dim, x, 1) != 0);
-    TEST_ASSERT(ds4_gpu_matmul_q8_0_tensor(ref1, weights_raw, weight_alloc,
+    TEST_ASSERT(ns4_gpu_matmul_q8_0_tensor(ref1, weights_raw, weight_alloc,
                                            weight1_offset,
                                            in_dim, out1_dim, x, 1) != 0);
-    TEST_ASSERT(ds4_gpu_matmul_q8_0_pair_tensor(pair0, pair1,
+    TEST_ASSERT(ns4_gpu_matmul_q8_0_pair_tensor(pair0, pair1,
                                                 weights_raw, weight_alloc,
                                                 0, weight1_offset,
                                                 in_dim, out0_dim, out1_dim,
                                                 x, 1) != 0);
-    TEST_ASSERT(ds4_gpu_tensor_read(ref0, 0, ref0_host, out0_bytes) != 0);
-    TEST_ASSERT(ds4_gpu_tensor_read(ref1, 0, ref1_host, out1_bytes) != 0);
-    TEST_ASSERT(ds4_gpu_tensor_read(pair0, 0, pair0_host, out0_bytes) != 0);
-    TEST_ASSERT(ds4_gpu_tensor_read(pair1, 0, pair1_host, out1_bytes) != 0);
+    TEST_ASSERT(ns4_gpu_tensor_read(ref0, 0, ref0_host, out0_bytes) != 0);
+    TEST_ASSERT(ns4_gpu_tensor_read(ref1, 0, ref1_host, out1_bytes) != 0);
+    TEST_ASSERT(ns4_gpu_tensor_read(pair0, 0, pair0_host, out0_bytes) != 0);
+    TEST_ASSERT(ns4_gpu_tensor_read(pair1, 0, pair1_host, out1_bytes) != 0);
 
     uint32_t mismatch0 = 0;
     uint32_t mismatch1 = 0;
@@ -772,7 +772,7 @@ static void test_gpu_q8_0_decode_pair_exact_case(
     }
     if (mismatch0 != 0 || mismatch1 != 0) {
         fprintf(stderr,
-                "ds4-test: paired Q8_0 exactness mismatches=%u/%u max_abs=%g, %u/%u max_abs=%g\n",
+                "ns4-test: paired Q8_0 exactness mismatches=%u/%u max_abs=%g, %u/%u max_abs=%g\n",
                 mismatch0, out0_dim, max_abs0,
                 mismatch1, out1_dim, max_abs1);
     }
@@ -784,11 +784,11 @@ static void test_gpu_q8_0_decode_pair_exact_case(
     free(ref1_host);
     free(pair0_host);
     free(pair1_host);
-    ds4_gpu_tensor_free(x);
-    ds4_gpu_tensor_free(ref0);
-    ds4_gpu_tensor_free(ref1);
-    ds4_gpu_tensor_free(pair0);
-    ds4_gpu_tensor_free(pair1);
+    ns4_gpu_tensor_free(x);
+    ns4_gpu_tensor_free(ref0);
+    ns4_gpu_tensor_free(ref1);
+    ns4_gpu_tensor_free(pair0);
+    ns4_gpu_tensor_free(pair1);
     free(weights_raw);
 }
 
@@ -806,9 +806,9 @@ static void test_gpu_kernel_group(void) {
     /* These allocate device tensors directly instead of going through
      * test_get_engine(), so the backend has to be brought up explicitly.
      * Metal allocated lazily and did not need this; CUDA returns NULL from
-     * ds4_gpu_tensor_alloc() until the device is initialized. */
-    if (ds4_gpu_init() == 0) {
-        fprintf(stderr, "ds4-test: kernel group skipped, GPU backend unavailable\n");
+     * ns4_gpu_tensor_alloc() until the device is initialized. */
+    if (ns4_gpu_init() == 0) {
+        fprintf(stderr, "ns4-test: kernel group skipped, GPU backend unavailable\n");
         return;
     }
     test_gpu_f16_matvec_fast_nr0_4();
@@ -821,13 +821,13 @@ static void test_gpu_kernel_group(void) {
 }
 
 static void test_gpu_short_prefill_ratio4(void) {
-    ds4_engine *engine = test_get_engine(false);
+    ns4_engine *engine = test_get_engine(false);
     if (!engine) return;
 
     const int tokens[] = {
-        ds4_token_user(engine),
-        ds4_token_assistant(engine),
-        ds4_token_eos(engine),
+        ns4_token_user(engine),
+        ns4_token_assistant(engine),
+        ns4_token_eos(engine),
     };
     for (size_t i = 0; i < sizeof(tokens) / sizeof(tokens[0]); i++) {
         TEST_ASSERT(tokens[i] >= 0);
@@ -835,29 +835,29 @@ static void test_gpu_short_prefill_ratio4(void) {
     }
 
     for (size_t n = 1; n <= 3; n++) {
-        ds4_tokens prompt = {0};
+        ns4_tokens prompt = {0};
         for (size_t i = 0; i < n; i++) {
-            ds4_tokens_push(&prompt, tokens[i]);
+            ns4_tokens_push(&prompt, tokens[i]);
         }
         TEST_ASSERT(prompt.len == (int)n);
 
-        ds4_session *session = NULL;
-        TEST_ASSERT(ds4_session_create(&session, engine, 2048) == 0);
+        ns4_session *session = NULL;
+        TEST_ASSERT(ns4_session_create(&session, engine, 2048) == 0);
         if (!session) {
-            ds4_tokens_free(&prompt);
+            ns4_tokens_free(&prompt);
             return;
         }
 
         char err[160] = {0};
-        const int rc = ds4_session_sync(session, &prompt, err, sizeof(err));
+        const int rc = ns4_session_sync(session, &prompt, err, sizeof(err));
         if (rc != 0) {
-            fprintf(stderr, "ds4-test: short prefill failed for %zu token(s): %s\n",
+            fprintf(stderr, "ns4-test: short prefill failed for %zu token(s): %s\n",
                     n, err);
         }
         TEST_ASSERT(rc == 0);
 
-        ds4_session_free(session);
-        ds4_tokens_free(&prompt);
+        ns4_session_free(session);
+        ns4_tokens_free(&prompt);
     }
 }
 
@@ -959,11 +959,11 @@ static bool test_output_has_fact(const char *text, const test_long_fact *fact) {
 
     if (saw_wrong_assignment) {
         fprintf(stderr,
-                "ds4-test: long-context wrong assignment for %s: got %d expected %d\n",
+                "ns4-test: long-context wrong assignment for %s: got %d expected %d\n",
                 fact->name, wrong_value, fact->number);
     } else {
         fprintf(stderr,
-                "ds4-test: long-context missing assignment for %s=%d\n",
+                "ns4-test: long-context missing assignment for %s=%d\n",
                 fact->name, fact->number);
     }
     return false;
@@ -989,10 +989,10 @@ static bool test_hex_to_bytes(const char *hex, unsigned char *out, int cap, int 
     return true;
 }
 
-static bool test_token_bytes_equal(ds4_engine *engine, int token,
+static bool test_token_bytes_equal(ns4_engine *engine, int token,
                                    const unsigned char *want, int want_len) {
     size_t got_len = 0;
-    char *got = ds4_token_text(engine, token, &got_len);
+    char *got = ns4_token_text(engine, token, &got_len);
     bool eq = got && got_len == (size_t)want_len &&
               memcmp(got, want, (size_t)want_len) == 0;
     free(got);
@@ -1003,12 +1003,12 @@ static void test_long_prefill_progress(void *ud, const char *event, int current,
     (void)ud;
     if (strcmp(event, "prefill_chunk")) return;
     if (current == 0 || current == total || current % 8192 == 0) {
-        fprintf(stderr, "ds4-test: long-context prefill %d/%d\n", current, total);
+        fprintf(stderr, "ns4-test: long-context prefill %d/%d\n", current, total);
     }
 }
 
 static void test_long_story_fact_recall(void) {
-    const char *prompt_path = getenv("DS4_TEST_LONG_PROMPT");
+    const char *prompt_path = getenv("NS4_TEST_LONG_PROMPT");
     if (!prompt_path || !prompt_path[0]) {
         prompt_path = "tests/long_context_story_prompt.txt";
     }
@@ -1016,43 +1016,43 @@ static void test_long_story_fact_recall(void) {
     TEST_ASSERT(prompt_text != NULL);
     if (!prompt_text) return;
 
-    ds4_engine *engine = test_get_engine(false);
+    ns4_engine *engine = test_get_engine(false);
     if (!engine) {
         free(prompt_text);
         return;
     }
 
-    ds4_tokens prompt = {0};
-    ds4_tokenize_rendered_chat(engine, prompt_text, &prompt);
+    ns4_tokens prompt = {0};
+    ns4_tokenize_rendered_chat(engine, prompt_text, &prompt);
     TEST_ASSERT(prompt.len > 30000);
 
-    ds4_session *session = NULL;
-    TEST_ASSERT(ds4_session_create(&session, engine, 100000) == 0);
+    ns4_session *session = NULL;
+    TEST_ASSERT(ns4_session_create(&session, engine, 100000) == 0);
     if (!session) {
-        ds4_tokens_free(&prompt);
+        ns4_tokens_free(&prompt);
         free(prompt_text);
         return;
     }
 
     char err[160];
-    ds4_session_set_progress(session, test_long_prefill_progress, NULL);
-    TEST_ASSERT(ds4_session_sync(session, &prompt, err, sizeof(err)) == 0);
-    ds4_session_set_progress(session, NULL, NULL);
+    ns4_session_set_progress(session, test_long_prefill_progress, NULL);
+    TEST_ASSERT(ns4_session_sync(session, &prompt, err, sizeof(err)) == 0);
+    ns4_session_set_progress(session, NULL, NULL);
 
     buf out = {0};
     uint64_t rng = 12345;
     int generated = 0;
     bool decode_ok = true;
     for (; generated < 350; generated++) {
-        int token = ds4_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng);
-        if (token == ds4_token_eos(engine)) break;
+        int token = ns4_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng);
+        if (token == ns4_token_eos(engine)) break;
 
         size_t piece_len = 0;
-        char *piece = ds4_token_text(engine, token, &piece_len);
+        char *piece = ns4_token_text(engine, token, &piece_len);
         buf_append(&out, piece, piece_len);
         free(piece);
 
-        if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+        if (ns4_session_eval(session, token, err, sizeof(err)) != 0) {
             decode_ok = false;
             break;
         }
@@ -1066,8 +1066,8 @@ static void test_long_story_fact_recall(void) {
     }
 
     buf_free(&out);
-    ds4_session_free(session);
-    ds4_tokens_free(&prompt);
+    ns4_session_free(session);
+    ns4_tokens_free(&prompt);
     free(prompt_text);
 }
 
@@ -1171,38 +1171,38 @@ static bool test_fill_vector_case(FILE *fp, test_vec_case *vc) {
     return false;
 }
 
-static void test_logprob_vector_case(ds4_engine *engine, const test_vec_case *vc) {
+static void test_logprob_vector_case(ns4_engine *engine, const test_vec_case *vc) {
     char *prompt_text = test_read_file(vc->prompt_path);
     TEST_ASSERT(prompt_text != NULL);
     if (!prompt_text) return;
 
-    ds4_tokens prompt = {0};
-    ds4_encode_chat_prompt(engine, "", prompt_text, DS4_THINK_NONE, &prompt);
+    ns4_tokens prompt = {0};
+    ns4_encode_chat_prompt(engine, "", prompt_text, NS4_THINK_NONE, &prompt);
     free(prompt_text);
 
-    ds4_session *session = NULL;
-    TEST_ASSERT(ds4_session_create(&session, engine, vc->ctx) == 0);
+    ns4_session *session = NULL;
+    TEST_ASSERT(ns4_session_create(&session, engine, vc->ctx) == 0);
     if (!session) {
-        ds4_tokens_free(&prompt);
+        ns4_tokens_free(&prompt);
         return;
     }
 
     char err[160];
-    if (ds4_session_sync(session, &prompt, err, sizeof(err)) != 0) {
-        fprintf(stderr, "ds4-test: vector %s prefill failed: %s\n", vc->id, err);
+    if (ns4_session_sync(session, &prompt, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ns4-test: vector %s prefill failed: %s\n", vc->id, err);
         TEST_ASSERT(false);
-        ds4_session_free(session);
-        ds4_tokens_free(&prompt);
+        ns4_session_free(session);
+        ns4_tokens_free(&prompt);
         return;
     }
 
-    ds4_token_score scores[20];
+    ns4_token_score scores[20];
     for (int i = 0; i < vc->nsteps; i++) {
         const test_vec_step *step = &vc->steps[i];
-        int nscore = ds4_session_top_logprobs(session, scores, 20);
-        int token = ds4_session_argmax(session);
+        int nscore = ns4_session_top_logprobs(session, scores, 20);
+        int token = ns4_session_argmax(session);
         if (!test_token_bytes_equal(engine, token, step->selected, step->selected_len)) {
-            fprintf(stderr, "ds4-test: vector %s step %d selected token mismatch\n",
+            fprintf(stderr, "ns4-test: vector %s step %d selected token mismatch\n",
                     vc->id, i);
             TEST_ASSERT(false);
         }
@@ -1221,20 +1221,20 @@ static void test_logprob_vector_case(ds4_engine *engine, const test_vec_case *vc
                 }
             }
             if (!found) {
-                fprintf(stderr, "ds4-test: vector %s step %d official top token missing locally\n",
+                fprintf(stderr, "ns4-test: vector %s step %d official top token missing locally\n",
                         vc->id, i);
                 TEST_ASSERT(false);
             } else if (fabsf(local_lp - step->top[t].logprob) > 4.0f) {
                 fprintf(stderr,
-                        "ds4-test: vector %s step %d logprob delta too high: local=%g official=%g\n",
+                        "ns4-test: vector %s step %d logprob delta too high: local=%g official=%g\n",
                         vc->id, i, local_lp, step->top[t].logprob);
                 TEST_ASSERT(false);
             }
         }
 
         if (i + 1 < vc->nsteps) {
-            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
-                fprintf(stderr, "ds4-test: vector %s step %d eval failed: %s\n",
+            if (ns4_session_eval(session, token, err, sizeof(err)) != 0) {
+                fprintf(stderr, "ns4-test: vector %s step %d eval failed: %s\n",
                         vc->id, i, err);
                 TEST_ASSERT(false);
                 break;
@@ -1242,8 +1242,8 @@ static void test_logprob_vector_case(ds4_engine *engine, const test_vec_case *vc
         }
     }
 
-    ds4_session_free(session);
-    ds4_tokens_free(&prompt);
+    ns4_session_free(session);
+    ns4_tokens_free(&prompt);
 }
 
 static bool test_logprob_vector_case_disabled(const char *path,
@@ -1252,7 +1252,7 @@ static bool test_logprob_vector_case_disabled(const char *path,
      * This one long-context vector currently matches the public DeepSeek API less
      * after adding the official Hadamard+FP4 indexer path.  The public official
      * implementation and the API appear to disagree here; the official graph has
-     * slightly lower local perplexity on the A/B check we ran, so DS4 keeps that
+     * slightly lower local perplexity on the A/B check we ran, so NS4 keeps that
      * implementation and only excludes this brittle API fixture for now.
      */
     return !strcmp(path, "tests/test-vectors/flash-pre-0731/official.vec") &&
@@ -1260,7 +1260,7 @@ static bool test_logprob_vector_case_disabled(const char *path,
 }
 
 static void test_official_logprob_vectors_run(const char *case_filter) {
-    const char *path = getenv("DS4_TEST_VECTOR_FILE");
+    const char *path = getenv("NS4_TEST_VECTOR_FILE");
     if (!path || !path[0]) {
         path = "tests/test-vectors/flash-0731/official.vec";
     }
@@ -1268,21 +1268,21 @@ static void test_official_logprob_vectors_run(const char *case_filter) {
     TEST_ASSERT(fp != NULL);
     if (!fp) return;
 
-    char *saved_prefill_chunk = test_save_env("DS4_CUDA_PREFILL_CHUNK");
-    char *saved_disable_metal4 = test_save_env("DS4_CUDA_DISABLE_METAL4");
+    char *saved_prefill_chunk = test_save_env("NS4_CUDA_PREFILL_CHUNK");
+    char *saved_disable_metal4 = test_save_env("NS4_CUDA_DISABLE_METAL4");
     test_streaming_prefill_env saved_canonical_streaming_prefill =
         test_force_canonical_streaming_prefill();
-    setenv("DS4_CUDA_PREFILL_CHUNK", "2048", 1);
-    if (getenv("DS4_TEST_LOGPROB_AUTO_METAL") == NULL) {
-        setenv("DS4_CUDA_DISABLE_METAL4", "1", 1);
+    setenv("NS4_CUDA_PREFILL_CHUNK", "2048", 1);
+    if (getenv("NS4_TEST_LOGPROB_AUTO_METAL") == NULL) {
+        setenv("NS4_CUDA_DISABLE_METAL4", "1", 1);
     } else {
-        unsetenv("DS4_CUDA_DISABLE_METAL4");
+        unsetenv("NS4_CUDA_DISABLE_METAL4");
     }
-    ds4_engine *engine = test_open_engine(false);
+    ns4_engine *engine = test_open_engine(false);
     if (!engine) {
         test_restore_canonical_streaming_prefill(saved_canonical_streaming_prefill);
-        test_restore_env("DS4_CUDA_DISABLE_METAL4", saved_disable_metal4);
-        test_restore_env("DS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
+        test_restore_env("NS4_CUDA_DISABLE_METAL4", saved_disable_metal4);
+        test_restore_env("NS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
         fclose(fp);
         return;
     }
@@ -1295,19 +1295,19 @@ static void test_official_logprob_vectors_run(const char *case_filter) {
             continue;
         }
         if (test_logprob_vector_case_disabled(path, &vc)) {
-            fprintf(stderr, "ds4-test: vector %s skipped (API/official graph mismatch)\n",
+            fprintf(stderr, "ns4-test: vector %s skipped (API/official graph mismatch)\n",
                     vc.id);
             continue;
         }
-        fprintf(stderr, "ds4-test: vector %s\n", vc.id);
+        fprintf(stderr, "ns4-test: vector %s\n", vc.id);
         test_logprob_vector_case(engine, &vc);
         ran++;
     }
     TEST_ASSERT(!case_filter || !case_filter[0] || ran == 1);
-    ds4_engine_close(engine);
+    ns4_engine_close(engine);
     test_restore_canonical_streaming_prefill(saved_canonical_streaming_prefill);
-    test_restore_env("DS4_CUDA_DISABLE_METAL4", saved_disable_metal4);
-    test_restore_env("DS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
+    test_restore_env("NS4_CUDA_DISABLE_METAL4", saved_disable_metal4);
+    test_restore_env("NS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
     fclose(fp);
 }
 
@@ -1317,7 +1317,7 @@ static void test_official_logprob_vectors(void) {
 
 static void test_gpu_ssd_streaming_cache_pressure(void) {
     fprintf(stderr,
-            "ds4-test: SSD streaming cache-pressure repro skipped "
+            "ns4-test: SSD streaming cache-pressure repro skipped "
             "(Metal-only)\n");
 }
 
@@ -1414,50 +1414,50 @@ static float test_local_golden_max_abs(const test_local_golden_case *tc,
     return max_abs;
 }
 
-static void test_local_golden_case_run(ds4_engine *engine,
+static void test_local_golden_case_run(ns4_engine *engine,
                                        const test_local_golden_case *tc) {
     char *prompt_text = test_read_file(tc->prompt_path);
     TEST_ASSERT(prompt_text != NULL);
     if (!prompt_text) return;
 
-    ds4_tokens prompt = {0};
+    ns4_tokens prompt = {0};
     if (!strcmp(tc->mode, "text")) {
-        ds4_tokenize_text(engine, prompt_text, &prompt);
+        ns4_tokenize_text(engine, prompt_text, &prompt);
     } else if (!strcmp(tc->mode, "rendered")) {
-        ds4_tokenize_rendered_chat(engine, prompt_text, &prompt);
+        ns4_tokenize_rendered_chat(engine, prompt_text, &prompt);
     } else if (!strcmp(tc->mode, "chat")) {
-        ds4_encode_chat_prompt(engine, "", prompt_text, DS4_THINK_NONE, &prompt);
+        ns4_encode_chat_prompt(engine, "", prompt_text, NS4_THINK_NONE, &prompt);
     } else {
         TEST_ASSERT(!"unknown local golden prompt mode");
     }
     free(prompt_text);
     TEST_ASSERT(prompt.len >= tc->frontier);
     if (prompt.len < tc->frontier) {
-        ds4_tokens_free(&prompt);
+        ns4_tokens_free(&prompt);
         return;
     }
 
-    ds4_tokens prefix = {
+    ns4_tokens prefix = {
         .v = prompt.v,
         .len = tc->frontier,
         .cap = tc->frontier,
     };
 
-    ds4_session *session = NULL;
-    TEST_ASSERT(ds4_session_create(&session, engine, tc->ctx) == 0);
+    ns4_session *session = NULL;
+    TEST_ASSERT(ns4_session_create(&session, engine, tc->ctx) == 0);
     if (!session) {
-        ds4_tokens_free(&prompt);
+        ns4_tokens_free(&prompt);
         return;
     }
 
     char err[160];
-    TEST_ASSERT(ds4_session_sync(session, &prefix, err, sizeof(err)) == 0);
+    TEST_ASSERT(ns4_session_sync(session, &prefix, err, sizeof(err)) == 0);
 
-    const int vocab = ds4_engine_vocab_size(engine);
+    const int vocab = ns4_engine_vocab_size(engine);
     float *cand_logits = malloc((size_t)vocab * sizeof(cand_logits[0]));
     TEST_ASSERT(cand_logits != NULL);
     if (cand_logits &&
-        ds4_session_copy_logits(session, cand_logits, vocab) == vocab) {
+        ns4_session_copy_logits(session, cand_logits, vocab) == vocab) {
         int cand_top[TEST_LOCAL_GOLDEN_MAX_TOP];
         const int ntop = tc->ntop < TEST_LOCAL_GOLDEN_MAX_TOP ?
                          tc->ntop : TEST_LOCAL_GOLDEN_MAX_TOP;
@@ -1470,7 +1470,7 @@ static void test_local_golden_case_run(ds4_engine *engine,
             test_local_golden_max_abs(tc, cand_logits, 20);
 
         fprintf(stderr,
-                "ds4-test: local golden %s top1 ref=%d cand=%d "
+                "ns4-test: local golden %s top1 ref=%d cand=%d "
                 "top5_overlap=%d/5 top20_overlap=%d/20 top64_overlap=%d/64 "
                 "top20_max_abs=%g\n",
                 tc->id, tc->top[0].id, cand_top[0],
@@ -1491,12 +1491,12 @@ static void test_local_golden_case_run(ds4_engine *engine,
     }
 
     free(cand_logits);
-    ds4_session_free(session);
-    ds4_tokens_free(&prompt);
+    ns4_session_free(session);
+    ns4_tokens_free(&prompt);
 }
 
 static void test_local_golden_vectors(void) {
-    const char *path = getenv("DS4_TEST_LOCAL_GOLDEN_FILE");
+    const char *path = getenv("NS4_TEST_LOCAL_GOLDEN_FILE");
     if (!path || !path[0]) {
         path = "tests/test-vectors/flash-0731/local-golden.vec";
     }
@@ -1504,21 +1504,21 @@ static void test_local_golden_vectors(void) {
     TEST_ASSERT(fp != NULL);
     if (!fp) return;
 
-    char *saved_prefill_chunk = test_save_env("DS4_CUDA_PREFILL_CHUNK");
-    char *saved_disable_metal4 = test_save_env("DS4_CUDA_DISABLE_METAL4");
-    char *saved_moe_tile_max = test_save_env("DS4_CUDA_MOE_TILE_MAX");
+    char *saved_prefill_chunk = test_save_env("NS4_CUDA_PREFILL_CHUNK");
+    char *saved_disable_metal4 = test_save_env("NS4_CUDA_DISABLE_METAL4");
+    char *saved_moe_tile_max = test_save_env("NS4_CUDA_MOE_TILE_MAX");
     test_streaming_prefill_env saved_canonical_streaming_prefill =
         test_force_canonical_streaming_prefill();
-    setenv("DS4_CUDA_PREFILL_CHUNK", "4096", 1);
-    setenv("DS4_CUDA_DISABLE_METAL4", "1", 1);
-    unsetenv("DS4_CUDA_MOE_TILE_MAX");
+    setenv("NS4_CUDA_PREFILL_CHUNK", "4096", 1);
+    setenv("NS4_CUDA_DISABLE_METAL4", "1", 1);
+    unsetenv("NS4_CUDA_MOE_TILE_MAX");
 
-    ds4_engine *engine = test_open_engine(false);
+    ns4_engine *engine = test_open_engine(false);
     if (!engine) {
         test_restore_canonical_streaming_prefill(saved_canonical_streaming_prefill);
-        test_restore_env("DS4_CUDA_MOE_TILE_MAX", saved_moe_tile_max);
-        test_restore_env("DS4_CUDA_DISABLE_METAL4", saved_disable_metal4);
-        test_restore_env("DS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
+        test_restore_env("NS4_CUDA_MOE_TILE_MAX", saved_moe_tile_max);
+        test_restore_env("NS4_CUDA_DISABLE_METAL4", saved_disable_metal4);
+        test_restore_env("NS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
         fclose(fp);
         return;
     }
@@ -1529,11 +1529,11 @@ static void test_local_golden_vectors(void) {
         test_local_golden_case_run(engine, &tc);
     }
 
-    ds4_engine_close(engine);
+    ns4_engine_close(engine);
     test_restore_canonical_streaming_prefill(saved_canonical_streaming_prefill);
-    test_restore_env("DS4_CUDA_MOE_TILE_MAX", saved_moe_tile_max);
-    test_restore_env("DS4_CUDA_DISABLE_METAL4", saved_disable_metal4);
-    test_restore_env("DS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
+    test_restore_env("NS4_CUDA_MOE_TILE_MAX", saved_moe_tile_max);
+    test_restore_env("NS4_CUDA_DISABLE_METAL4", saved_disable_metal4);
+    test_restore_env("NS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
     fclose(fp);
 }
 
@@ -1547,7 +1547,7 @@ typedef struct {
     int ctx;
     int vocab_size;
     int gen_steps;
-    ds4_tokens prompt;
+    ns4_tokens prompt;
     float *ref_logits;
     int ref_gen[TEST_VEC_MAX_STEPS];
     int ref_gen_len;
@@ -1584,7 +1584,7 @@ typedef struct {
 
 static void test_mpp_eq_case_free(test_mpp_eq_case *tc) {
     if (!tc) return;
-    ds4_tokens_free(&tc->prompt);
+    ns4_tokens_free(&tc->prompt);
     free(tc->ref_logits);
     memset(tc, 0, sizeof(*tc));
 }
@@ -1732,12 +1732,12 @@ static test_mpp_eq_result test_compare_mpp_logits(const test_mpp_eq_case *tc,
     };
 
     fprintf(stderr,
-            "ds4-test: Tensor equivalence %s top1 ref=%d cand=%d top5_overlap=%d/%d overlap=%d/%d max_rank_delta=%d rms=%g max_abs=%g top20_max_abs=%g\n",
+            "ns4-test: Tensor equivalence %s top1 ref=%d cand=%d top5_overlap=%d/%d overlap=%d/%d max_rank_delta=%d rms=%g max_abs=%g top20_max_abs=%g\n",
             tc->id, ref_top[0], cand_top[0],
             top5_overlap, TEST_MPP_EQ_TOP5,
             overlap, TEST_MPP_EQ_TOPK,
             max_rank_delta, rms, max_abs, top_abs);
-    fprintf(stderr, "ds4-test: Tensor equivalence %s largest deltas:", tc->id);
+    fprintf(stderr, "ns4-test: Tensor equivalence %s largest deltas:", tc->id);
     for (int i = 0; i < TEST_MPP_EQ_DELTAS && delta_ids[i] >= 0; i++) {
         fprintf(stderr, " id=%d ref=%g cand=%g abs=%g",
                 delta_ids[i], delta_ref[i], delta_cand[i], delta_abs[i]);
@@ -1751,56 +1751,56 @@ static test_mpp_eq_result test_compare_mpp_logits(const test_mpp_eq_case *tc,
     return result;
 }
 
-static bool test_mpp_capture(ds4_engine *engine, const test_mpp_eq_case *tc,
+static bool test_mpp_capture(ns4_engine *engine, const test_mpp_eq_case *tc,
                              float *logits, int *gen, int *gen_len) {
-    ds4_session *session = NULL;
-    TEST_ASSERT(ds4_session_create(&session, engine, tc->ctx) == 0);
+    ns4_session *session = NULL;
+    TEST_ASSERT(ns4_session_create(&session, engine, tc->ctx) == 0);
     if (!session) return false;
 
     char err[160];
-    bool ok = ds4_session_sync(session, &tc->prompt, err, sizeof(err)) == 0;
+    bool ok = ns4_session_sync(session, &tc->prompt, err, sizeof(err)) == 0;
     TEST_ASSERT(ok);
     if (ok) {
-        ok = ds4_session_copy_logits(session, logits, tc->vocab_size) == tc->vocab_size;
+        ok = ns4_session_copy_logits(session, logits, tc->vocab_size) == tc->vocab_size;
         TEST_ASSERT(ok);
     }
 
     int n = 0;
     while (ok && n < tc->gen_steps) {
-        const int token = ds4_session_argmax(session);
+        const int token = ns4_session_argmax(session);
         gen[n++] = token;
-        if (n < tc->gen_steps && ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+        if (n < tc->gen_steps && ns4_session_eval(session, token, err, sizeof(err)) != 0) {
             ok = false;
             TEST_ASSERT(false);
         }
     }
     *gen_len = n;
 
-    ds4_session_free(session);
+    ns4_session_free(session);
     return ok;
 }
 
-static bool test_mpp_capture_logits_only(ds4_engine *engine,
+static bool test_mpp_capture_logits_only(ns4_engine *engine,
                                          const test_mpp_eq_case *tc,
                                          float *logits) {
-    ds4_session *session = NULL;
-    TEST_ASSERT(ds4_session_create(&session, engine, tc->ctx) == 0);
+    ns4_session *session = NULL;
+    TEST_ASSERT(ns4_session_create(&session, engine, tc->ctx) == 0);
     if (!session) return false;
 
     char err[160];
-    bool ok = ds4_session_sync(session, &tc->prompt, err, sizeof(err)) == 0;
+    bool ok = ns4_session_sync(session, &tc->prompt, err, sizeof(err)) == 0;
     TEST_ASSERT(ok);
     if (ok) {
-        ok = ds4_session_copy_logits(session, logits, tc->vocab_size) == tc->vocab_size;
+        ok = ns4_session_copy_logits(session, logits, tc->vocab_size) == tc->vocab_size;
         TEST_ASSERT(ok);
     }
 
-    ds4_session_free(session);
+    ns4_session_free(session);
     return ok;
 }
 
 static bool test_mpp_eq_case_selected(const char *id) {
-    const char *filter = getenv("DS4_TEST_MPP_EQ_CASE");
+    const char *filter = getenv("NS4_TEST_MPP_EQ_CASE");
     if (!filter || !filter[0]) return true;
 
     char buf[256];
@@ -1812,8 +1812,8 @@ static bool test_mpp_eq_case_selected(const char *id) {
     return false;
 }
 
-static int test_load_mpp_cases(ds4_engine *engine, test_mpp_eq_case *cases, int cap) {
-    const char *path = getenv("DS4_TEST_VECTOR_FILE");
+static int test_load_mpp_cases(ns4_engine *engine, test_mpp_eq_case *cases, int cap) {
+    const char *path = getenv("NS4_TEST_VECTOR_FILE");
     if (!path || !path[0]) {
         path = "tests/test-vectors/flash-0731/official.vec";
     }
@@ -1833,9 +1833,9 @@ static int test_load_mpp_cases(ds4_engine *engine, test_mpp_eq_case *cases, int 
         test_mpp_eq_case *tc = &cases[ncase++];
         snprintf(tc->id, sizeof(tc->id), "%s", vc.id);
         tc->ctx = vc.ctx;
-        tc->vocab_size = ds4_engine_vocab_size(engine);
+        tc->vocab_size = ns4_engine_vocab_size(engine);
         tc->gen_steps = vc.nsteps < TEST_VEC_MAX_STEPS ? vc.nsteps : TEST_VEC_MAX_STEPS;
-        ds4_encode_chat_prompt(engine, "", prompt_text, DS4_THINK_NONE, &tc->prompt);
+        ns4_encode_chat_prompt(engine, "", prompt_text, NS4_THINK_NONE, &tc->prompt);
         free(prompt_text);
         TEST_ASSERT(tc->prompt.len > 0);
     }
@@ -1870,7 +1870,7 @@ static void test_mpp_summary_note_logits(test_mpp_eq_summary *summary,
 
 static void test_mpp_summary_print(const test_mpp_eq_summary *summary) {
     fprintf(stderr,
-            "ds4-test: Tensor summary route=%s cases=%d capture_fail=%d logits_fail=%d greedy_fail=%d top1_mismatch=%d min_top5_overlap=%d/%d min_overlap=%d/%d worst_rank_delta=%d worst_rms=%g worst_max_abs=%g worst_top20_max_abs=%g\n",
+            "ns4-test: Tensor summary route=%s cases=%d capture_fail=%d logits_fail=%d greedy_fail=%d top1_mismatch=%d min_top5_overlap=%d/%d min_overlap=%d/%d worst_rank_delta=%d worst_rms=%g worst_max_abs=%g worst_top20_max_abs=%g\n",
             summary->label,
             summary->cases,
             summary->capture_failures,
@@ -1890,10 +1890,10 @@ static void test_mpp_summary_print(const test_mpp_eq_summary *summary) {
 static void test_run_mpp_candidate(const char *label,
                                    test_mpp_eq_case *cases,
                                    int ncase) {
-    fprintf(stderr, "ds4-test: Tensor equivalence candidate route=%s\n", label);
+    fprintf(stderr, "ns4-test: Tensor equivalence candidate route=%s\n", label);
     test_mpp_eq_summary summary;
     test_mpp_summary_init(&summary, label);
-    ds4_engine *cand_engine = test_open_engine(false);
+    ns4_engine *cand_engine = test_open_engine(false);
     if (cand_engine) {
         const int vocab_size = ncase > 0 ? cases[0].vocab_size : 0;
         float *cand_logits = malloc((size_t)vocab_size * sizeof(cand_logits[0]));
@@ -1916,7 +1916,7 @@ static void test_run_mpp_candidate(const char *label,
                 for (int j = 0; j < tc->ref_gen_len && j < cand_gen_len; j++) {
                     if (cand_gen[j] != tc->ref_gen[j]) {
                         fprintf(stderr,
-                                "ds4-test: Tensor equivalence %s greedy token mismatch step=%d ref=%d cand=%d\n",
+                                "ns4-test: Tensor equivalence %s greedy token mismatch step=%d ref=%d cand=%d\n",
                                 tc->id, j, tc->ref_gen[j], cand_gen[j]);
                         summary.greedy_failures++;
                     }
@@ -1925,7 +1925,7 @@ static void test_run_mpp_candidate(const char *label,
             }
             free(cand_logits);
         }
-        ds4_engine_close(cand_engine);
+        ns4_engine_close(cand_engine);
     }
     test_mpp_summary_print(&summary);
 }
@@ -1936,11 +1936,11 @@ static void test_gpu_mpp_equivalence(void) {
     test_mpp_eq_case cases[TEST_MPP_EQ_MAX_CASES];
     memset(cases, 0, sizeof(cases));
 
-    char *saved_disable_metal4 = test_save_env("DS4_CUDA_DISABLE_METAL4");
-    setenv("DS4_CUDA_DISABLE_METAL4", "1", 1);
-    ds4_engine *ref_engine = test_open_engine(false);
+    char *saved_disable_metal4 = test_save_env("NS4_CUDA_DISABLE_METAL4");
+    setenv("NS4_CUDA_DISABLE_METAL4", "1", 1);
+    ns4_engine *ref_engine = test_open_engine(false);
     if (!ref_engine) {
-        test_restore_env("DS4_CUDA_DISABLE_METAL4", saved_disable_metal4);
+        test_restore_env("NS4_CUDA_DISABLE_METAL4", saved_disable_metal4);
         return;
     }
 
@@ -1956,8 +1956,8 @@ static void test_gpu_mpp_equivalence(void) {
                                      tc->ref_gen,
                                      &tc->ref_gen_len));
     }
-    ds4_engine_close(ref_engine);
-    test_restore_env("DS4_CUDA_DISABLE_METAL4", saved_disable_metal4);
+    ns4_engine_close(ref_engine);
+    test_restore_env("NS4_CUDA_DISABLE_METAL4", saved_disable_metal4);
 
     test_run_mpp_candidate("auto", cases, ncase);
 
@@ -1966,10 +1966,10 @@ static void test_gpu_mpp_equivalence(void) {
 
 static void test_streaming_decode_prefill_correctness(void) {
     test_close_engines();
-    if (!test_env_bool("DS4_TEST_SSD_STREAMING")) {
+    if (!test_env_bool("NS4_TEST_SSD_STREAMING")) {
         fprintf(stderr,
-                "ds4-test: streaming decode-prefill correctness skipped "
-                "(set DS4_TEST_SSD_STREAMING=1 to enable)\n");
+                "ns4-test: streaming decode-prefill correctness skipped "
+                "(set NS4_TEST_SSD_STREAMING=1 to enable)\n");
         return;
     }
 
@@ -1979,7 +1979,7 @@ static void test_streaming_decode_prefill_correctness(void) {
     test_streaming_prefill_env saved_canonical_streaming_prefill =
         test_force_canonical_streaming_prefill();
 
-    ds4_engine *ref_engine = test_open_engine(false);
+    ns4_engine *ref_engine = test_open_engine(false);
     if (!ref_engine) {
         test_restore_canonical_streaming_prefill(saved_canonical_streaming_prefill);
         return;
@@ -1997,12 +1997,12 @@ static void test_streaming_decode_prefill_correctness(void) {
                                      tc->ref_gen,
                                      &tc->ref_gen_len));
     }
-    ds4_engine_close(ref_engine);
+    ns4_engine_close(ref_engine);
 
-    unsetenv("DS4_CUDA_DISABLE_STREAMING_COLD_DECODE_PREFILL");
-    unsetenv("DS4_CUDA_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR");
+    unsetenv("NS4_CUDA_DISABLE_STREAMING_COLD_DECODE_PREFILL");
+    unsetenv("NS4_CUDA_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR");
 
-    ds4_engine *cand_engine = test_open_engine(false);
+    ns4_engine *cand_engine = test_open_engine(false);
     if (cand_engine) {
         for (int i = 0; i < ncase; i++) {
             test_mpp_eq_case *tc = &cases[i];
@@ -2057,7 +2057,7 @@ static void test_streaming_decode_prefill_correctness(void) {
             TEST_ASSERT(cold_warm_neq == 0);
             TEST_ASSERT(warm_repeat_neq == 0);
             fprintf(stderr,
-                    "ds4-test: streaming decode-prefill %s cold_warm_neq=%d "
+                    "ns4-test: streaming decode-prefill %s cold_warm_neq=%d "
                     "cold_warm_max_abs=%g warm_repeat_neq=%d "
                     "warm_repeat_max_abs=%g top1 canonical=%d decode=%d\n",
                     tc->id,
@@ -2072,7 +2072,7 @@ static void test_streaming_decode_prefill_correctness(void) {
             free(cand_warm_a);
             free(cand_warm_b);
         }
-        ds4_engine_close(cand_engine);
+        ns4_engine_close(cand_engine);
     }
 
     test_restore_canonical_streaming_prefill(saved_canonical_streaming_prefill);
@@ -2105,11 +2105,11 @@ static const char *test_tool_call_request_json(void) {
 static void test_think_tool_recovery(void) {
     const char *generated =
         "The user wants a directory listing.\n\n"
-        DS4_TOOL_CALLS_START "\n"
-        DS4_INVOKE_START " name=\"list_files\">\n"
-        DS4_PARAM_START " name=\"path\" string=\"true\">." DS4_PARAM_END "\n"
-        DS4_INVOKE_END "\n"
-        DS4_TOOL_CALLS_END;
+        NS4_TOOL_CALLS_START "\n"
+        NS4_INVOKE_START " name=\"list_files\">\n"
+        NS4_PARAM_START " name=\"path\" string=\"true\">." NS4_PARAM_END "\n"
+        NS4_INVOKE_END "\n"
+        NS4_TOOL_CALLS_END;
 
     buf text = {0};
     size_t scan_from = 0;
@@ -2134,7 +2134,7 @@ static void test_think_tool_recovery(void) {
     TEST_ASSERT(reasoning && !strcmp(reasoning, "The user wants a directory listing."));
 
     fprintf(stderr,
-            "ds4-test: think-tool-recovery complete=%d calls=%d name=%s\n",
+            "ns4-test: think-tool-recovery complete=%d calls=%d name=%s\n",
             complete ? 1 : 0, calls.len, calls.len ? calls.v[0].name : "-");
 
     free(content);
@@ -2144,7 +2144,7 @@ static void test_think_tool_recovery(void) {
 }
 
 static void test_tool_call_quality_one(bool quality) {
-    ds4_engine *engine = test_get_engine(quality);
+    ns4_engine *engine = test_get_engine(quality);
     if (!engine) return;
 
     request r;
@@ -2152,13 +2152,13 @@ static void test_tool_call_quality_one(bool quality) {
     TEST_ASSERT(parse_chat_request(engine, NULL, test_tool_call_request_json(),
                                    512, 32768, &r, err, sizeof(err)));
 
-    ds4_session *session = NULL;
-    TEST_ASSERT(ds4_session_create(&session, engine, 32768) == 0);
+    ns4_session *session = NULL;
+    TEST_ASSERT(ns4_session_create(&session, engine, 32768) == 0);
     if (!session) {
         request_free(&r);
         return;
     }
-    TEST_ASSERT(ds4_session_sync(session, &r.prompt, err, sizeof(err)) == 0);
+    TEST_ASSERT(ns4_session_sync(session, &r.prompt, err, sizeof(err)) == 0);
 
     buf text = {0};
     uint64_t rng = 123;
@@ -2166,15 +2166,15 @@ static void test_tool_call_quality_one(bool quality) {
     bool saw_tool_start = false;
     bool saw_tool_end = false;
     for (int i = 0; i < r.max_tokens; i++) {
-        int token = ds4_session_sample(session, r.temperature, r.top_k,
+        int token = ns4_session_sample(session, r.temperature, r.top_k,
                                        r.top_p, r.min_p, &rng);
         size_t piece_len = 0;
-        char *piece = ds4_token_text(engine, token, &piece_len);
+        char *piece = ns4_token_text(engine, token, &piece_len);
         buf_append(&text, piece, piece_len);
         free(piece);
         observe_tool_markers(text.ptr ? text.ptr : "", &saw_tool_start, &saw_tool_end, NULL);
         if (saw_tool_end) break;
-        if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+        if (ns4_session_eval(session, token, err, sizeof(err)) != 0) {
             decode_ok = false;
             break;
         }
@@ -2194,43 +2194,43 @@ static void test_tool_call_quality_one(bool quality) {
     free(reasoning);
     tool_calls_free(&calls);
     buf_free(&text);
-    ds4_session_free(session);
+    ns4_session_free(session);
     request_free(&r);
 }
 
 static void test_tool_call_quality(void) {
-    fprintf(stderr, "ds4-test: tool-call quality fast path\n");
+    fprintf(stderr, "ns4-test: tool-call quality fast path\n");
     test_tool_call_quality_one(false);
     test_close_engine(false);
-    fprintf(stderr, "ds4-test: tool-call quality exact path\n");
+    fprintf(stderr, "ns4-test: tool-call quality exact path\n");
     test_tool_call_quality_one(true);
     test_close_engine(true);
 }
 
 /* Greedy speculative decode: capture committed tokens and the largest accepted
  * chunk, so the caller can confirm the multi-row verify path actually ran. */
-static bool test_mtp_capture_speculative(ds4_engine *engine, const ds4_tokens *prompt,
+static bool test_mtp_capture_speculative(ns4_engine *engine, const ns4_tokens *prompt,
                                          int max_tokens, int *out, int *out_len,
                                          int *max_chunk) {
     *out_len = 0;
     *max_chunk = 0;
-    ds4_session *session = NULL;
-    TEST_ASSERT(ds4_session_create(&session, engine, 32768) == 0);
+    ns4_session *session = NULL;
+    TEST_ASSERT(ns4_session_create(&session, engine, 32768) == 0);
     if (!session) return false;
 
     char err[160];
-    bool ok = ds4_session_sync(session, prompt, err, sizeof(err)) == 0;
+    bool ok = ns4_session_sync(session, prompt, err, sizeof(err)) == 0;
     TEST_ASSERT(ok);
 
-    const int eos = ds4_token_eos(engine);
+    const int eos = ns4_token_eos(engine);
     int n = 0;
     bool stop = false;
     while (ok && !stop && n < max_tokens) {
-        const int token = ds4_session_argmax(session);
+        const int token = ns4_session_argmax(session);
         if (token == eos) break;
 
         int toks[17]; /* base token + draft depth, which the engine clamps to 16 */
-        const int ntok = ds4_session_eval_speculative_argmax(
+        const int ntok = ns4_session_eval_speculative_argmax(
             session, token, max_tokens - n, eos, toks,
             (int)(sizeof(toks) / sizeof(toks[0])), err, sizeof(err));
         if (ntok < 0) { ok = false; TEST_ASSERT(false); break; }
@@ -2244,39 +2244,39 @@ static bool test_mtp_capture_speculative(ds4_engine *engine, const ds4_tokens *p
     }
 
     *out_len = n;
-    ds4_session_free(session);
+    ns4_session_free(session);
     return ok;
 }
 
 /* Replay toks[] through plain decode and return the largest gap between a
  * position's argmax logit and the committed token's logit.  Correct speculation
  * commits (near-)argmax tokens (gap ~0); a mis-committed token gives a big gap. */
-static bool test_mtp_worst_argmax_gap(ds4_engine *engine, const ds4_tokens *prompt,
+static bool test_mtp_worst_argmax_gap(ns4_engine *engine, const ns4_tokens *prompt,
                                       const int *toks, int n,
                                       float *worst_gap, int *worst_at) {
     *worst_gap = 0.0f;
     *worst_at = -1;
-    ds4_session *session = NULL;
-    TEST_ASSERT(ds4_session_create(&session, engine, 32768) == 0);
+    ns4_session *session = NULL;
+    TEST_ASSERT(ns4_session_create(&session, engine, 32768) == 0);
     if (!session) return false;
 
     char err[160];
-    bool ok = ds4_session_sync(session, prompt, err, sizeof(err)) == 0;
+    bool ok = ns4_session_sync(session, prompt, err, sizeof(err)) == 0;
     TEST_ASSERT(ok);
 
     for (int i = 0; ok && i < n; i++) {
-        ds4_token_score best, cur;
-        ok = ds4_session_top_logprobs(session, &best, 1) >= 1 &&
-             ds4_session_token_logprob(session, toks[i], &cur) == 1;
+        ns4_token_score best, cur;
+        ok = ns4_session_top_logprobs(session, &best, 1) >= 1 &&
+             ns4_session_token_logprob(session, toks[i], &cur) == 1;
         TEST_ASSERT(ok);
         if (!ok) break;
 
         const float gap = best.logit - cur.logit;
         if (gap > *worst_gap) { *worst_gap = gap; *worst_at = i; }
-        if (ds4_session_eval(session, toks[i], err, sizeof(err)) != 0) { ok = false; TEST_ASSERT(false); break; }
+        if (ns4_session_eval(session, toks[i], err, sizeof(err)) != 0) { ok = false; TEST_ASSERT(false); break; }
     }
 
-    ds4_session_free(session);
+    ns4_session_free(session);
     return ok;
 }
 
@@ -2313,27 +2313,27 @@ static const char *test_mtp_copy_prompt(void) {
 #define TEST_MTP_MAXGEN 256
 #define TEST_DSPARK_MAXGEN 128
 
-static ds4_engine *test_open_dspark_engine(const char *support_path) {
-    ds4_engine *engine = NULL;
-    ds4_engine_options opt = {
+static ns4_engine *test_open_dspark_engine(const char *support_path) {
+    ns4_engine *engine = NULL;
+    ns4_engine_options opt = {
         .model_path = test_model_path(),
-        .backend = DS4_BACKEND_CUDA,
+        .backend = NS4_BACKEND_CUDA,
         .quality = false,
-        .ssd_streaming = test_env_bool("DS4_TEST_SSD_STREAMING"),
-        .ssd_streaming_cold = test_env_bool("DS4_TEST_SSD_STREAMING_COLD"),
+        .ssd_streaming = test_env_bool("NS4_TEST_SSD_STREAMING"),
+        .ssd_streaming_cold = test_env_bool("NS4_TEST_SSD_STREAMING_COLD"),
         .ssd_streaming_cache_experts =
-            test_env_u32("DS4_TEST_SSD_STREAMING_CACHE_EXPERTS"),
+            test_env_u32("NS4_TEST_SSD_STREAMING_CACHE_EXPERTS"),
         .ssd_streaming_cache_bytes =
-            test_env_gib("DS4_TEST_SSD_STREAMING_CACHE_GB"),
+            test_env_gib("NS4_TEST_SSD_STREAMING_CACHE_GB"),
         .ssd_streaming_preload_experts =
-            test_env_u32("DS4_TEST_SSD_STREAMING_PRELOAD_EXPERTS"),
+            test_env_u32("NS4_TEST_SSD_STREAMING_PRELOAD_EXPERTS"),
         .mtp_path = support_path,
         .mtp_draft_tokens = 0,
         .dspark = true,
         .dspark_confidence_threshold = 0.9f,
         .dspark_confidence_threshold_set = true,
     };
-    const int rc = ds4_engine_open(&engine, &opt);
+    const int rc = ns4_engine_open(&engine, &opt);
     TEST_ASSERT(rc == 0);
     return rc == 0 ? engine : NULL;
 }
@@ -2342,19 +2342,19 @@ static ds4_engine *test_open_dspark_engine(const char *support_path) {
  * at draft depth > 2.  Replays the committed speculative tokens through plain
  * decode and requires each to be a (near-)argmax: that is the verify invariant,
  * and unlike comparing token streams it tolerates the near-greedy tie
- * divergences.  Needs an MTP head, so it self-skips without DS4_TEST_MTP. */
+ * divergences.  Needs an MTP head, so it self-skips without NS4_TEST_MTP. */
 static void test_mtp_verify_depth(void) {
-    ds4_engine *engine = test_get_engine(false);
-    if (!engine || !ds4_engine_has_mtp(engine)) {
-        fprintf(stderr, "ds4-test: mtp-verify-depth skipped (set DS4_TEST_MTP to an MTP GGUF)\n");
+    ns4_engine *engine = test_get_engine(false);
+    if (!engine || !ns4_engine_has_mtp(engine)) {
+        fprintf(stderr, "ns4-test: mtp-verify-depth skipped (set NS4_TEST_MTP to an MTP GGUF)\n");
         return;
     }
-    TEST_ASSERT(ds4_engine_mtp_draft_tokens(engine) > 2);
+    TEST_ASSERT(ns4_engine_mtp_draft_tokens(engine) > 2);
 
-    ds4_tokens prompt = {0};
-    ds4_chat_begin(engine, &prompt);
-    ds4_chat_append_message(engine, &prompt, "user", test_mtp_copy_prompt());
-    ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
+    ns4_tokens prompt = {0};
+    ns4_chat_begin(engine, &prompt);
+    ns4_chat_append_message(engine, &prompt, "user", test_mtp_copy_prompt());
+    ns4_chat_append_assistant_prefix(engine, &prompt, NS4_THINK_NONE);
     TEST_ASSERT(prompt.len > 0);
 
     int *spec = malloc((size_t)TEST_MTP_MAXGEN * sizeof(*spec));
@@ -2372,13 +2372,13 @@ static void test_mtp_verify_depth(void) {
         const bool ok_check = test_mtp_worst_argmax_gap(engine, &prompt, spec, nspec,
                                                         &worst_gap, &worst_at);
         TEST_ASSERT(ok_check);
-        fprintf(stderr, "ds4-test: mtp-verify-depth nspec=%d max_chunk=%d worst_argmax_gap=%.3f at=%d\n",
+        fprintf(stderr, "ns4-test: mtp-verify-depth nspec=%d max_chunk=%d worst_argmax_gap=%.3f at=%d\n",
                 nspec, max_chunk, worst_gap, worst_at);
         TEST_ASSERT(worst_gap <= 2.0f);  /* correct: ~0; bug: ~21 on the reference model */
     }
 
     free(spec);
-    ds4_tokens_free(&prompt);
+    ns4_tokens_free(&prompt);
 }
 
 /* Same invariant as the MTP depth smoke, but for the DSpark support model.  This
@@ -2386,26 +2386,26 @@ static void test_mtp_verify_depth(void) {
  * through normal decode and directly checks that DSpark never commits a token
  * that was not near the target argmax. */
 static void test_dspark_verify_depth(void) {
-    const char *support = getenv("DS4_TEST_DSPARK");
+    const char *support = getenv("NS4_TEST_DSPARK");
     if (!support || !support[0]) {
-        fprintf(stderr, "ds4-test: dspark-verify-depth skipped (set DS4_TEST_DSPARK to a DSpark support GGUF)\n");
+        fprintf(stderr, "ns4-test: dspark-verify-depth skipped (set NS4_TEST_DSPARK to a DSpark support GGUF)\n");
         return;
     }
 
-    char *saved_scheduler = test_save_env("DS4_DSPARK_SCHEDULER");
-    setenv("DS4_DSPARK_SCHEDULER", "0", 1);
+    char *saved_scheduler = test_save_env("NS4_DSPARK_SCHEDULER");
+    setenv("NS4_DSPARK_SCHEDULER", "0", 1);
 
-    ds4_engine *engine = test_open_dspark_engine(support);
-    ds4_tokens prompt = {0};
+    ns4_engine *engine = test_open_dspark_engine(support);
+    ns4_tokens prompt = {0};
     int *spec = NULL;
 
     if (engine) {
-        const int draft_depth = ds4_engine_mtp_draft_tokens(engine);
+        const int draft_depth = ns4_engine_mtp_draft_tokens(engine);
         TEST_ASSERT(draft_depth > 2);
 
-        ds4_chat_begin(engine, &prompt);
-        ds4_chat_append_message(engine, &prompt, "user", test_mtp_copy_prompt());
-        ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
+        ns4_chat_begin(engine, &prompt);
+        ns4_chat_append_message(engine, &prompt, "user", test_mtp_copy_prompt());
+        ns4_chat_append_assistant_prefix(engine, &prompt, NS4_THINK_NONE);
         TEST_ASSERT(prompt.len > 0);
 
         spec = malloc((size_t)TEST_DSPARK_MAXGEN * sizeof(*spec));
@@ -2428,21 +2428,21 @@ static void test_dspark_verify_depth(void) {
                                                             &worst_at);
             TEST_ASSERT(ok_check);
             fprintf(stderr,
-                    "ds4-test: dspark-verify-depth nspec=%d max_chunk=%d draft_depth=%d worst_argmax_gap=%.3f at=%d\n",
+                    "ns4-test: dspark-verify-depth nspec=%d max_chunk=%d draft_depth=%d worst_argmax_gap=%.3f at=%d\n",
                     nspec, max_chunk, draft_depth, worst_gap, worst_at);
             TEST_ASSERT(worst_gap <= 2.0f);
         }
     }
 
     free(spec);
-    ds4_tokens_free(&prompt);
-    ds4_engine_close(engine);
-    test_restore_env("DS4_DSPARK_SCHEDULER", saved_scheduler);
+    ns4_tokens_free(&prompt);
+    ns4_engine_close(engine);
+    test_restore_env("NS4_DSPARK_SCHEDULER", saved_scheduler);
 }
 #endif
 
 static void test_server_unit_group(void) {
-    ds4_server_unit_tests_run();
+    ns4_server_unit_tests_run();
 }
 
 typedef void (*test_fn)(void);
@@ -2452,10 +2452,10 @@ typedef struct {
     const char *name;
     const char *desc;
     test_fn fn;
-} ds4_test_entry;
+} ns4_test_entry;
 
-static const ds4_test_entry test_entries[] = {
-#ifndef DS4_NO_GPU
+static const ns4_test_entry test_entries[] = {
+#ifndef NS4_NO_GPU
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
     {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
     {"--think-tool-recovery", "think-tool-recovery", "recover a complete tool call emitted inside unclosed reasoning", test_think_tool_recovery},
@@ -2482,29 +2482,29 @@ static void test_print_help(const char *prog) {
     }
     puts("  --list");
     puts("      Print test names only.");
-#ifndef DS4_NO_GPU
+#ifndef NS4_NO_GPU
     puts("      Compatibility alias for --metal-tensor-equivalence.");
 #endif
     puts("  -h, --help");
     puts("      Show this help.");
     puts("\nEnvironment:");
-    puts("  DS4_TEST_MODEL=FILE        Model path. Default: ds4flash.gguf");
-    puts("  DS4_TEST_SSD_STREAMING=1   Run model tests through SSD streaming.");
-    puts("  DS4_TEST_SSD_STREAMING_CACHE_GB=N  Streaming routed expert cache in GiB.");
-    puts("  DS4_TEST_SSD_STREAMING_CACHE_EXPERTS=N  Streaming routed expert cache count.");
-    puts("  DS4_TEST_SSD_STREAMING_COLD=1  Skip streaming hot expert preload.");
-    puts("  DS4_CUDA_DISABLE_STREAMING_COLD_DECODE_PREFILL=1  Force canonical streamed cold prefill.");
-    puts("  DS4_TEST_LONG_PROMPT=FILE  Rendered long-context story fact prompt.");
-    puts("  DS4_TEST_VECTOR_FILE=FILE  Official fixture. Default: flash-0731/official.vec.");
-    puts("  DS4_TEST_LOCAL_GOLDEN_FILE=FILE  Local fixture. Default: flash-0731/local-golden.vec.");
-    puts("  DS4_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");
-    puts("  DS4_TEST_ALLOW_Q8_F16_CACHE=1  Keep the q8->f16 weight cache on (disabled by default here).");
-    puts("  DS4_TEST_MTP=FILE         Legacy MTP support GGUF for --mtp-verify-depth.");
-    puts("  DS4_TEST_DSPARK=FILE      DSpark support GGUF for --dspark-verify-depth.");
+    puts("  NS4_TEST_MODEL=FILE        Model path. Default: ns4flash.gguf");
+    puts("  NS4_TEST_SSD_STREAMING=1   Run model tests through SSD streaming.");
+    puts("  NS4_TEST_SSD_STREAMING_CACHE_GB=N  Streaming routed expert cache in GiB.");
+    puts("  NS4_TEST_SSD_STREAMING_CACHE_EXPERTS=N  Streaming routed expert cache count.");
+    puts("  NS4_TEST_SSD_STREAMING_COLD=1  Skip streaming hot expert preload.");
+    puts("  NS4_CUDA_DISABLE_STREAMING_COLD_DECODE_PREFILL=1  Force canonical streamed cold prefill.");
+    puts("  NS4_TEST_LONG_PROMPT=FILE  Rendered long-context story fact prompt.");
+    puts("  NS4_TEST_VECTOR_FILE=FILE  Official fixture. Default: flash-0731/official.vec.");
+    puts("  NS4_TEST_LOCAL_GOLDEN_FILE=FILE  Local fixture. Default: flash-0731/local-golden.vec.");
+    puts("  NS4_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");
+    puts("  NS4_TEST_ALLOW_Q8_F16_CACHE=1  Keep the q8->f16 weight cache on (disabled by default here).");
+    puts("  NS4_TEST_MTP=FILE         Legacy MTP support GGUF for --mtp-verify-depth.");
+    puts("  NS4_TEST_DSPARK=FILE      DSpark support GGUF for --dspark-verify-depth.");
 }
 
-static const ds4_test_entry *test_find_entry(const char *arg) {
-#ifndef DS4_NO_GPU
+static const ns4_test_entry *test_find_entry(const char *arg) {
+#ifndef NS4_NO_GPU
     if (!strcmp(arg, "--metal-mpp-equivalence")) {
         arg = "--tensor-equivalence";
     }
@@ -2515,13 +2515,13 @@ static const ds4_test_entry *test_find_entry(const char *arg) {
     return NULL;
 }
 
-static void test_run_entry(const ds4_test_entry *entry) {
+static void test_run_entry(const ns4_test_entry *entry) {
     int before = test_failures;
     fprintf(stderr, "%s:\n", entry->name);
     entry->fn();
     fprintf(stderr, "%s: ", entry->name);
-    ds4_log(stderr,
-            test_failures == before ? DS4_LOG_OK : DS4_LOG_ERROR,
+    ns4_log(stderr,
+            test_failures == before ? NS4_LOG_OK : NS4_LOG_ERROR,
             "%s",
             test_failures == before ? "OK" : "ERR");
     fputc('\n', stderr);
@@ -2535,9 +2535,9 @@ int main(int argc, char **argv) {
      * transient free VRAM, so cache-on logits are not reproducible, which
      * the bit-exactness assertions here cannot tolerate.  Serving always
      * disables it; do the same unless the caller explicitly opts back in
-     * with DS4_TEST_ALLOW_Q8_F16_CACHE=1. */
-    if (!test_env_bool("DS4_TEST_ALLOW_Q8_F16_CACHE")) {
-        setenv("DS4_CUDA_NO_Q8_F16_CACHE", "1", 0);
+     * with NS4_TEST_ALLOW_Q8_F16_CACHE=1. */
+    if (!test_env_bool("NS4_TEST_ALLOW_Q8_F16_CACHE")) {
+        setenv("NS4_CUDA_NO_Q8_F16_CACHE", "1", 0);
     }
     bool run_all = argc == 1;
     bool selected[sizeof(test_entries) / sizeof(test_entries[0])] = {0};
@@ -2554,9 +2554,9 @@ int main(int argc, char **argv) {
             test_print_help(argv[0]);
             return 0;
         } else {
-            const ds4_test_entry *entry = test_find_entry(argv[i]);
+            const ns4_test_entry *entry = test_find_entry(argv[i]);
             if (!entry) {
-                fprintf(stderr, "ds4-test: unknown test switch: %s\n", argv[i]);
+                fprintf(stderr, "ns4-test: unknown test switch: %s\n", argv[i]);
                 test_print_help(argv[0]);
                 return 2;
             }
@@ -2574,14 +2574,14 @@ int main(int argc, char **argv) {
         }
     }
 
-#ifndef DS4_NO_GPU
+#ifndef NS4_NO_GPU
     test_close_engines();
 #endif
 
     if (test_failures) {
-        fprintf(stderr, "ds4 tests: %d failure(s)\n", test_failures);
+        fprintf(stderr, "ns4 tests: %d failure(s)\n", test_failures);
         return 1;
     }
-    puts("ds4 tests: ok");
+    puts("ns4 tests: ok");
     return 0;
 }

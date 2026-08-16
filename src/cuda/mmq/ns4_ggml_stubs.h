@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
-// ds4_ggml_stubs.h - minimal ggml-API stubs for ds4's vendored mmq kernels.
+// ns4_ggml_stubs.h - minimal ggml-API stubs for ns4's vendored mmq kernels.
 //
 // The mmq.cuh / mma.cuh / vecdotq.cuh / quantize.cuh / mmid.cuh / common.cuh
 // files in this directory are vendored verbatim from llama.cpp's ggml-cuda
 // backend (MIT, copyright 2023-2026 The ggml authors). They transitively
-// #include "ggml.h", "ggml-impl.h", "ggml-cuda.h" - in ds4 those names
+// #include "ggml.h", "ggml-impl.h", "ggml-cuda.h" - in ns4 those names
 // resolve to thin redirect headers in this directory which all #include this
 // stubs file.
 //
@@ -102,7 +102,7 @@
 #endif
 
 #ifndef GGML_CUDA_NAME
-#define GGML_CUDA_NAME "DS4_CUDA"
+#define GGML_CUDA_NAME "NS4_CUDA"
 #endif
 
 #ifndef GGML_CUDA_MAX_DEVICES
@@ -117,7 +117,7 @@
 #define GGML_LOG_DEBUG(...) ((void)0)
 #endif
 
-// Cuda-graphs are explicitly disabled - ds4 manages its own streams.
+// Cuda-graphs are explicitly disabled - ns4 manages its own streams.
 #undef GGML_CUDA_USE_GRAPHS
 #undef GGML_HIP_GRAPHS
 #undef GGML_MUSA_GRAPHS
@@ -186,7 +186,7 @@ enum ggml_glu_op {
 //
 // Field set matches the upstream order/types so cudaGraph node_properties
 // (which holds a `ggml_tensor node` by value inside `#ifdef USE_CUDA_GRAPH`)
-// also compiles. Sizes are conservative for storage; ds4 never copies into
+// also compiles. Sizes are conservative for storage; ns4 never copies into
 // these.
 // ----------------------------------------------------------------------------
 

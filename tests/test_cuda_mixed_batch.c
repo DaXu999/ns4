@@ -7,16 +7,16 @@
  * configuration.
  *
  * Run with:
- *   DS4_TEST_MODEL=/path/to/model.gguf make test-cuda-mixed-batch
+ *   NS4_TEST_MODEL=/path/to/model.gguf make test-cuda-mixed-batch
  *
  * Exercise compressed/indexed context with:
- *   DS4_TEST_CONTEXT=4096 DS4_TEST_MIXED_INITIAL=2048 \
- *   DS4_TEST_MIXED_ROUNDS=8 make test-cuda-mixed-batch
+ *   NS4_TEST_CONTEXT=4096 NS4_TEST_MIXED_INITIAL=2048 \
+ *   NS4_TEST_MIXED_ROUNDS=8 make test-cuda-mixed-batch
  */
 
-#include "ds4.h"
-#include "ds4_gpu_args.h"
-#include "ds4_gpu_mgpu.h"
+#include "ns4.h"
+#include "ns4_gpu_args.h"
+#include "ns4_gpu_mgpu.h"
 
 #include <math.h>
 #include <stdbool.h>
@@ -68,11 +68,11 @@ static int env_int(const char *name, int fallback, int min, int max) {
     return (int)parsed;
 }
 
-static void compare_logits(ds4_session *mixed, ds4_session *control,
+static void compare_logits(ns4_session *mixed, ns4_session *control,
                            float *mixed_logits, float *control_logits,
                            int vocab, const char *kind, int row, int round) {
-    if (ds4_session_copy_logits(mixed, mixed_logits, vocab) != vocab ||
-        ds4_session_copy_logits(control, control_logits, vocab) != vocab) {
+    if (ns4_session_copy_logits(mixed, mixed_logits, vocab) != vocab ||
+        ns4_session_copy_logits(control, control_logits, vocab) != vocab) {
         fail("copy logits", NULL, row, round);
     }
 
@@ -86,8 +86,8 @@ static void compare_logits(ds4_session *mixed, ds4_session *control,
         if (!isfinite(delta)) delta = INFINITY;
         if (delta > worst) worst = delta;
     }
-    const int mixed_argmax = ds4_session_argmax(mixed);
-    const int control_argmax = ds4_session_argmax(control);
+    const int mixed_argmax = ns4_session_argmax(mixed);
+    const int control_argmax = ns4_session_argmax(control);
     if (different != 0 || mixed_argmax != control_argmax) {
         fprintf(stderr,
                 "FAIL: %s logits row=%d round=%d differing=%d worst=%g "
@@ -99,29 +99,29 @@ static void compare_logits(ds4_session *mixed, ds4_session *control,
 }
 
 int main(void) {
-    const char *model = getenv("DS4_TEST_MODEL");
-    if (!model || !model[0]) fail("DS4_TEST_MODEL is not set", NULL, -1, -1);
+    const char *model = getenv("NS4_TEST_MODEL");
+    if (!model || !model[0]) fail("NS4_TEST_MODEL is not set", NULL, -1, -1);
 
     const int session_count = env_int(
-            "DS4_TEST_SESSION_COUNT", DEFAULT_SESSION_COUNT, 3,
+            "NS4_TEST_SESSION_COUNT", DEFAULT_SESSION_COUNT, 3,
             MAX_SESSION_COUNT);
     const int context = env_int(
-            "DS4_TEST_CONTEXT", DEFAULT_CONTEXT, DEFAULT_CONTEXT, 65536);
+            "NS4_TEST_CONTEXT", DEFAULT_CONTEXT, DEFAULT_CONTEXT, 65536);
     const int initial = env_int(
-            "DS4_TEST_MIXED_INITIAL", DEFAULT_INITIAL, 128, context - 1);
+            "NS4_TEST_MIXED_INITIAL", DEFAULT_INITIAL, 128, context - 1);
     const int quantum = env_int(
-            "DS4_TEST_MIXED_QUANTUM", DEFAULT_QUANTUM, 1, context - 1);
+            "NS4_TEST_MIXED_QUANTUM", DEFAULT_QUANTUM, 1, context - 1);
     const int rounds = env_int(
-            "DS4_TEST_MIXED_ROUNDS", DEFAULT_ROUNDS, 1, 64);
+            "NS4_TEST_MIXED_ROUNDS", DEFAULT_ROUNDS, 1, 64);
     if ((int64_t)initial + (int64_t)quantum * rounds >= context) {
         fail("mixed test frontier reaches context limit", NULL, -1, -1);
     }
 
-    setenv("DS4_CUDA_MIXED_PREFILL_DECODE", "1", 1);
+    setenv("NS4_CUDA_MIXED_PREFILL_DECODE", "1", 1);
 
-    const char *gpu_devices = getenv("DS4_TEST_GPU_DEVICES");
+    const char *gpu_devices = getenv("NS4_TEST_GPU_DEVICES");
     if (!gpu_devices || !gpu_devices[0]) gpu_devices = "0,2,4,6,1,3,5,7";
-    ds4_gpu_config gpu = {0};
+    ns4_gpu_config gpu = {0};
     bool skip_cuda = false;
     char err[256] = {0};
     if (parse_gpu_vram_arg("auto", gpu_devices, &gpu, &skip_cuda,
@@ -129,16 +129,16 @@ int main(void) {
         fail("GPU configuration", err, -1, -1);
     }
 
-    ds4_engine_options options = {
+    ns4_engine_options options = {
         .model_path = model,
-        .backend = DS4_BACKEND_CUDA,
+        .backend = NS4_BACKEND_CUDA,
         .n_threads = 1,
         .cuda_tensor_parallel = true,
         .share_session_prefill_workspace = true,
         .placement_ctx_hint = (uint32_t)context,
     };
-    ds4_engine *engine = NULL;
-    if (ds4_engine_create_with_gpu_config(&engine, &options, &gpu) != 0) {
+    ns4_engine *engine = NULL;
+    if (ns4_engine_create_with_gpu_config(&engine, &options, &gpu) != 0) {
         fail("engine open", NULL, -1, -1);
     }
 
@@ -154,45 +154,45 @@ int main(void) {
     }
     *dst = '\0';
 
-    ds4_tokens long_prompt = {0};
-    ds4_tokenize_text(engine, text, &long_prompt);
+    ns4_tokens long_prompt = {0};
+    ns4_tokenize_text(engine, text, &long_prompt);
     free(text);
     const int final_frontier = initial + quantum * rounds;
     if (long_prompt.len < final_frontier) {
         fail("generated prefill prompt is too short", NULL, -1, -1);
     }
 
-    ds4_session *prefill_mixed = NULL;
-    ds4_session *prefill_control = NULL;
-    if (ds4_session_create(&prefill_mixed, engine, (uint32_t)context) != 0 ||
-        ds4_session_create(&prefill_control, engine, (uint32_t)context) != 0) {
+    ns4_session *prefill_mixed = NULL;
+    ns4_session *prefill_control = NULL;
+    if (ns4_session_create(&prefill_mixed, engine, (uint32_t)context) != 0 ||
+        ns4_session_create(&prefill_control, engine, (uint32_t)context) != 0) {
         fail("prefill session creation", NULL, -1, -1);
     }
-    ds4_tokens prefix = long_prompt;
+    ns4_tokens prefix = long_prompt;
     prefix.len = initial;
-    if (ds4_session_sync(prefill_mixed, &prefix, err, sizeof(err)) != 0 ||
-        ds4_session_sync(prefill_control, &prefix, err, sizeof(err)) != 0) {
+    if (ns4_session_sync(prefill_mixed, &prefix, err, sizeof(err)) != 0 ||
+        ns4_session_sync(prefill_control, &prefix, err, sizeof(err)) != 0) {
         fail("initial prefill", err, -1, -1);
     }
 
-    ds4_session *mixed[MAX_SESSION_COUNT] = {0};
-    ds4_session *control[MAX_SESSION_COUNT] = {0};
-    ds4_tokens decode_prompt[MAX_SESSION_COUNT] = {0};
+    ns4_session *mixed[MAX_SESSION_COUNT] = {0};
+    ns4_session *control[MAX_SESSION_COUNT] = {0};
+    ns4_tokens decode_prompt[MAX_SESSION_COUNT] = {0};
     const int prompt_count =
         (int)(sizeof(decode_prompts) / sizeof(decode_prompts[0]));
     for (int i = 0; i < session_count; i++) {
-        ds4_encode_chat_prompt(
+        ns4_encode_chat_prompt(
                 engine, NULL, decode_prompts[i % prompt_count],
-                DS4_THINK_NONE, &decode_prompt[i]);
-        if (ds4_session_create(&mixed[i], engine, (uint32_t)context) != 0 ||
-            ds4_session_create(&control[i], engine, (uint32_t)context) != 0 ||
-            ds4_session_sync(mixed[i], &decode_prompt[i], err, sizeof(err)) != 0 ||
-            ds4_session_sync(control[i], &decode_prompt[i], err, sizeof(err)) != 0) {
+                NS4_THINK_NONE, &decode_prompt[i]);
+        if (ns4_session_create(&mixed[i], engine, (uint32_t)context) != 0 ||
+            ns4_session_create(&control[i], engine, (uint32_t)context) != 0 ||
+            ns4_session_sync(mixed[i], &decode_prompt[i], err, sizeof(err)) != 0 ||
+            ns4_session_sync(control[i], &decode_prompt[i], err, sizeof(err)) != 0) {
             fail("decode session setup", err, i, -1);
         }
     }
 
-    const int vocab = ds4_engine_vocab_size(engine);
+    const int vocab = ns4_engine_vocab_size(engine);
     float *mixed_logits = malloc((size_t)vocab * sizeof(*mixed_logits));
     float *control_logits = malloc((size_t)vocab * sizeof(*control_logits));
     if (!mixed_logits || !control_logits) {
@@ -201,45 +201,45 @@ int main(void) {
 
     double separate_total = 0.0;
     double mixed_total = 0.0;
-    const bool allow_fallback = getenv("DS4_TEST_ALLOW_FALLBACK") != NULL;
+    const bool allow_fallback = getenv("NS4_TEST_ALLOW_FALLBACK") != NULL;
     bool all_native = true;
     for (int round = 0; round < rounds; round++) {
-        ds4_decode_item mixed_items[MAX_SESSION_COUNT];
-        ds4_decode_item control_items[MAX_SESSION_COUNT];
+        ns4_decode_item mixed_items[MAX_SESSION_COUNT];
+        ns4_decode_item control_items[MAX_SESSION_COUNT];
         for (int row = 0; row < session_count; row++) {
             const int i = (round & 1) != 0
                 ? session_count - 1 - row : row;
-            const int mixed_token = ds4_session_argmax(mixed[i]);
-            const int control_token = ds4_session_argmax(control[i]);
+            const int mixed_token = ns4_session_argmax(mixed[i]);
+            const int control_token = ns4_session_argmax(control[i]);
             if (mixed_token != control_token) {
                 fail("pre-step argmax mismatch", NULL, i, round);
             }
-            mixed_items[row] = (ds4_decode_item){mixed[i], mixed_token};
-            control_items[row] = (ds4_decode_item){control[i], control_token};
+            mixed_items[row] = (ns4_decode_item){mixed[i], mixed_token};
+            control_items[row] = (ns4_decode_item){control[i], control_token};
         }
-        ds4_tokens target = long_prompt;
+        ns4_tokens target = long_prompt;
         target.len = initial + (round + 1) * quantum;
 
         double started = now_ms();
-        if (ds4_session_sync(
+        if (ns4_session_sync(
                     prefill_control, &target, err, sizeof(err)) != 0 ||
-            ds4_sessions_eval_batch(
+            ns4_sessions_eval_batch(
                     control_items, session_count, err, sizeof(err)) != 0) {
             fail("serialized step", err, -1, round);
         }
         const double separate_ms = now_ms() - started;
         separate_total += separate_ms;
 
-        const uint64_t native_before = ds4_test_mixed_native_count();
+        const uint64_t native_before = ns4_test_mixed_native_count();
         started = now_ms();
-        if (ds4_sessions_eval_batch_with_prefill(
+        if (ns4_sessions_eval_batch_with_prefill(
                     mixed_items, session_count, prefill_mixed, &target,
                     err, sizeof(err)) != 0) {
             fail("mixed step", err, -1, round);
         }
         const double mixed_ms = now_ms() - started;
         mixed_total += mixed_ms;
-        const uint64_t native_after = ds4_test_mixed_native_count();
+        const uint64_t native_after = ns4_test_mixed_native_count();
         if (native_after != native_before + 1u) {
             all_native = false;
             if (!allow_fallback || native_after != native_before) {
@@ -272,13 +272,13 @@ int main(void) {
     free(control_logits);
     free(mixed_logits);
     for (int i = 0; i < session_count; i++) {
-        ds4_tokens_free(&decode_prompt[i]);
-        ds4_session_free(control[i]);
-        ds4_session_free(mixed[i]);
+        ns4_tokens_free(&decode_prompt[i]);
+        ns4_session_free(control[i]);
+        ns4_session_free(mixed[i]);
     }
-    ds4_session_free(prefill_control);
-    ds4_session_free(prefill_mixed);
-    ds4_tokens_free(&long_prompt);
-    ds4_engine_close(engine);
+    ns4_session_free(prefill_control);
+    ns4_session_free(prefill_mixed);
+    ns4_tokens_free(&long_prompt);
+    ns4_engine_close(engine);
     return 0;
 }

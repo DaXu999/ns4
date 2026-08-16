@@ -1,14 +1,14 @@
 #!/bin/sh
 set -eu
 
-DS4_BIN=${DS4_BIN:-./ds4}
-MODEL=${DS4_DSPARK_MODEL:-${DS4_TEST_MODEL:-./ds4flash.gguf}}
-SUPPORT=${DS4_DSPARK_SUPPORT:-gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf}
-TOKENS=${DS4_DSPARK_FIXTURE_TOKENS:-32}
-REQUIRE_PARTIAL=${DS4_DSPARK_FIXTURE_REQUIRE_PARTIAL:-0}
-PROPOSAL_QUALITY_GUARD=${DS4_DSPARK_FIXTURE_REQUIRE_PROPOSAL_QUALITY:-auto}
-C_ADD_MIN_ACCEPTED=${DS4_DSPARK_FIXTURE_C_ADD_MIN_ACCEPTED:-8}
-CONFIDENCE=${DS4_DSPARK_FIXTURE_CONFIDENCE:-}
+NS4_BIN=${NS4_BIN:-./ns4}
+MODEL=${NS4_DSPARK_MODEL:-${NS4_TEST_MODEL:-./ns4flash.gguf}}
+SUPPORT=${NS4_DSPARK_SUPPORT:-gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf}
+TOKENS=${NS4_DSPARK_FIXTURE_TOKENS:-32}
+REQUIRE_PARTIAL=${NS4_DSPARK_FIXTURE_REQUIRE_PARTIAL:-0}
+PROPOSAL_QUALITY_GUARD=${NS4_DSPARK_FIXTURE_REQUIRE_PROPOSAL_QUALITY:-auto}
+C_ADD_MIN_ACCEPTED=${NS4_DSPARK_FIXTURE_C_ADD_MIN_ACCEPTED:-8}
+CONFIDENCE=${NS4_DSPARK_FIXTURE_CONFIDENCE:-}
 partial_cases=0
 
 proposal_quality_guard_enabled() {
@@ -26,7 +26,7 @@ proposal_quality_guard_enabled() {
         return 0
         ;;
     *)
-        echo "dspark-fixture: invalid DS4_DSPARK_FIXTURE_REQUIRE_PROPOSAL_QUALITY=$PROPOSAL_QUALITY_GUARD" >&2
+        echo "dspark-fixture: invalid NS4_DSPARK_FIXTURE_REQUIRE_PROPOSAL_QUALITY=$PROPOSAL_QUALITY_GUARD" >&2
         exit 1
         ;;
     esac
@@ -34,7 +34,7 @@ proposal_quality_guard_enabled() {
 
 case "$C_ADD_MIN_ACCEPTED" in
 ""|*[!0-9]*)
-    echo "dspark-fixture: invalid DS4_DSPARK_FIXTURE_C_ADD_MIN_ACCEPTED=$C_ADD_MIN_ACCEPTED" >&2
+    echo "dspark-fixture: invalid NS4_DSPARK_FIXTURE_C_ADD_MIN_ACCEPTED=$C_ADD_MIN_ACCEPTED" >&2
     exit 1
     ;;
 esac
@@ -44,9 +44,9 @@ if proposal_quality_guard_enabled; then
     PROPOSAL_QUALITY_GUARD_ACTIVE=1
 fi
 
-if [ "$REQUIRE_PARTIAL" != 0 ] && [ "${DS4_DSPARK_SCHEDULER_TAIL_MIN_TOKENS+x}" != x ]; then
-    DS4_DSPARK_SCHEDULER_TAIL_MIN_TOKENS=0
-    export DS4_DSPARK_SCHEDULER_TAIL_MIN_TOKENS
+if [ "$REQUIRE_PARTIAL" != 0 ] && [ "${NS4_DSPARK_SCHEDULER_TAIL_MIN_TOKENS+x}" != x ]; then
+    NS4_DSPARK_SCHEDULER_TAIL_MIN_TOKENS=0
+    export NS4_DSPARK_SCHEDULER_TAIL_MIN_TOKENS
 fi
 
 file_bytes() {
@@ -76,12 +76,12 @@ print_metadata() {
     hw_model=$(sysctl -n hw.model 2>/dev/null || true)
     hw_cpu=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || true)
     confidence=${CONFIDENCE:-default}
-    scheduler=${DS4_DSPARK_SCHEDULER:-default}
-    no_draft_skip=${DS4_DSPARK_SCHEDULER_NO_DRAFT_SKIP:-default}
-    short_accept_skip=${DS4_DSPARK_SCHEDULER_SHORT_ACCEPT_NO_DRAFT_SKIP:-default}
-    cold_low_conf_skip=${DS4_DSPARK_SCHEDULER_COLD_LOW_CONFIDENCE_SKIP:-default}
-    cold_low_conf_milli=${DS4_DSPARK_SCHEDULER_COLD_LOW_CONFIDENCE_MILLI:-default}
-    tail_min_tokens=${DS4_DSPARK_SCHEDULER_TAIL_MIN_TOKENS:-default}
+    scheduler=${NS4_DSPARK_SCHEDULER:-default}
+    no_draft_skip=${NS4_DSPARK_SCHEDULER_NO_DRAFT_SKIP:-default}
+    short_accept_skip=${NS4_DSPARK_SCHEDULER_SHORT_ACCEPT_NO_DRAFT_SKIP:-default}
+    cold_low_conf_skip=${NS4_DSPARK_SCHEDULER_COLD_LOW_CONFIDENCE_SKIP:-default}
+    cold_low_conf_milli=${NS4_DSPARK_SCHEDULER_COLD_LOW_CONFIDENCE_MILLI:-default}
+    tail_min_tokens=${NS4_DSPARK_SCHEDULER_TAIL_MIN_TOKENS:-default}
 
     printf '# commit=%s\n' "$(git_commit_label)"
     printf '# hardware_os=%s hardware_model=%s hardware_cpu=%s\n' \
@@ -95,14 +95,14 @@ print_metadata() {
         "$tail_min_tokens" "$PROPOSAL_QUALITY_GUARD" \
         "$PROPOSAL_QUALITY_GUARD_ACTIVE" "$C_ADD_MIN_ACCEPTED"
     printf '# baseline_command=%s -m %s --tokens %s --temp 0 --nothink -p <fixture-prompt>\n' \
-        "$DS4_BIN" "$MODEL" "$TOKENS"
-    printf '# dspark_command=DS4_DSPARK_STATS=1 %s --dspark%s -m %s --mtp %s --tokens %s --temp 0 --nothink -p <fixture-prompt>\n' \
-        "$DS4_BIN" "${CONFIDENCE:+ --dspark-confidence $CONFIDENCE}" \
+        "$NS4_BIN" "$MODEL" "$TOKENS"
+    printf '# dspark_command=NS4_DSPARK_STATS=1 %s --dspark%s -m %s --mtp %s --tokens %s --temp 0 --nothink -p <fixture-prompt>\n' \
+        "$NS4_BIN" "${CONFIDENCE:+ --dspark-confidence $CONFIDENCE}" \
         "$MODEL" "$SUPPORT" "$TOKENS"
 }
 
-if [ ! -x "$DS4_BIN" ]; then
-    echo "dspark-fixture: skipped, missing executable $DS4_BIN" >&2
+if [ ! -x "$NS4_BIN" ]; then
+    echo "dspark-fixture: skipped, missing executable $NS4_BIN" >&2
     exit 0
 fi
 if [ ! -f "$MODEL" ]; then
@@ -114,7 +114,7 @@ if [ ! -f "$SUPPORT" ]; then
     exit 0
 fi
 
-tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/ds4-dspark-fixture.XXXXXX")
+tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/ns4-dspark-fixture.XXXXXX")
 trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
 
 run_case() {
@@ -125,19 +125,19 @@ run_case() {
     dspark_out="$tmpdir/$id.dspark.out"
     dspark_err="$tmpdir/$id.dspark.err"
 
-    "$DS4_BIN" -m "$MODEL" \
+    "$NS4_BIN" -m "$MODEL" \
         --tokens "$TOKENS" --temp 0 --nothink -p "$prompt" \
         >"$base_out" 2>"$base_err"
 
     if [ -n "$CONFIDENCE" ]; then
-        DS4_DSPARK_STATS=1 \
-        "$DS4_BIN" --dspark --dspark-confidence "$CONFIDENCE" \
+        NS4_DSPARK_STATS=1 \
+        "$NS4_BIN" --dspark --dspark-confidence "$CONFIDENCE" \
             -m "$MODEL" --mtp "$SUPPORT" \
             --tokens "$TOKENS" --temp 0 --nothink -p "$prompt" \
             >"$dspark_out" 2>"$dspark_err"
     else
-        DS4_DSPARK_STATS=1 \
-        "$DS4_BIN" --dspark -m "$MODEL" --mtp "$SUPPORT" \
+        NS4_DSPARK_STATS=1 \
+        "$NS4_BIN" --dspark -m "$MODEL" --mtp "$SUPPORT" \
             --tokens "$TOKENS" --temp 0 --nothink -p "$prompt" \
             >"$dspark_out" 2>"$dspark_err"
     fi
@@ -153,7 +153,7 @@ run_case() {
 
     base_tps=$(sed -n 's/.*generation: \([0-9.][0-9.]*\) t\/s.*/\1/p' "$base_err" | tail -n 1)
     dspark_tps=$(sed -n 's/.*generation: \([0-9.][0-9.]*\) t\/s.*/\1/p' "$dspark_err" | tail -n 1)
-    stats=$(grep 'DSpark stats' "$dspark_err" | tail -n 1 | sed 's/^ds4: DSpark stats //')
+    stats=$(grep 'DSpark stats' "$dspark_err" | tail -n 1 | sed 's/^ns4: DSpark stats //')
     if [ -z "$stats" ]; then
         echo "dspark-fixture: missing DSpark stats for $id" >&2
         return 1
