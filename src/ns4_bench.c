@@ -50,7 +50,6 @@ typedef struct {
     bool warm_weights;
     bool quality;
     bool ssd_streaming;
-    bool ssd_streaming_cold;
     bool cuda_tensor_parallel;
     bool show_output;
 } bench_config;
@@ -262,8 +261,6 @@ static bench_config parse_options(int argc, char **argv) {
             c.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
             c.ssd_streaming = true;
-        } else if (!strcmp(arg, "--ssd-streaming-cold")) {
-            c.ssd_streaming_cold = true;
         } else if (!strcmp(arg, "--simulate-used-memory")) {
             if (!ns4_parse_gib_arg(need_arg(&i, argc, argv, arg),
                                    &c.simulate_used_memory_bytes)) {
@@ -541,7 +538,6 @@ int main(int argc, char **argv) {
         .quality = cfg.quality,
         .cuda_tensor_parallel = cfg.cuda_tensor_parallel,
         .ssd_streaming = cfg.ssd_streaming,
-        .ssd_streaming_cold = cfg.ssd_streaming_cold,
         .expert_profile_path = cfg.expert_profile_path,
         .distributed = cfg.dist,
     };

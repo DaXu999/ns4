@@ -113,7 +113,6 @@ typedef struct {
     bool dspark_confidence_threshold_set;
     bool cuda_tensor_parallel;
     bool ssd_streaming;
-    bool ssd_streaming_cold;
     bool inspect_only;
     /* Multi-GPU placement uses this to price per-layer KV storage. */
     int placement_ctx_hint;

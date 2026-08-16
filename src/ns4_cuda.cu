@@ -29645,14 +29645,6 @@ extern "C" void ns4_gpu_stream_expert_cache_release_resident(void) {
     cuda_stream_selected_cache_release();
 }
 
-extern "C" int ns4_gpu_stream_expert_cache_seed_selected(
-        const ns4_gpu_stream_expert_table *table,
-        const int32_t *selected_ids,
-        uint32_t n_selected) {
-    (void)table; (void)selected_ids; (void)n_selected;
-    return 1;
-}
-
 extern "C" int ns4_gpu_stream_expert_cache_prepare_selected_batch(
         const ns4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,

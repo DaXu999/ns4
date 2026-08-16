@@ -249,8 +249,7 @@ on this backend (the resident-cache budgeting that existed for the removed
 Metal-era backend was never implemented on CUDA and its flags were removed --
 see [docs/PROVENANCE.md](docs/PROVENANCE.md)). Non-routed weights, KV cache,
 graph scratch, and activations still need resident memory.
-`--ssd-streaming-cold` skips the streaming warm-up work and exists for
-measurements.
+There is no cache-size or warm-up tuning surface left on this backend.
 
 ### Practical SSD streaming examples
 

@@ -12974,8 +12974,6 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
  * tensor names follow the model stages rather than generic graph nodes.
  */
 
-enum { NS4_STREAMING_PREFILL_CACHE_SEED_MAX_TOKENS = 64 };
-
 typedef struct {
     /* Class P — per-tier replicated kernel scratch buffers.
      * Each used tier has its own copy; active_tier names the slot the
@@ -13259,8 +13257,6 @@ typedef struct {
     bool mtp_enabled;
     /* Prefill helpers retained alongside the CUDA tiered workspace. */
     ns4_gpu_tensor *batch_q_half;
-    ns4_gpu_tensor *prefill_seed_router_selected;
-    uint32_t prefill_seed_tokens;
     uint64_t prefill_selected_profile_rows;
     uint64_t prefill_selected_profile_unique;
     uint64_t prefill_selected_profile_selected_bytes;
@@ -13268,7 +13264,6 @@ typedef struct {
     uint32_t prefill_selected_profile_layers;
     uint32_t prefill_selected_profile_min_unique;
     uint32_t prefill_selected_profile_max_unique;
-    bool ssd_streaming_cold;
     bool streaming_static_decode_map_current;
     float *cpu_router_norm;
 
@@ -13685,7 +13680,6 @@ static void graph_copy_prefill_workspace_pointers(
     NS4_GPU_PREFILL_WORKSPACE_FIELDS(NS4_COPY_PREFILL_FIELD)
 #undef NS4_COPY_PREFILL_FIELD
     dst->batch_q_half = src->batch_q_half;
-    dst->prefill_seed_router_selected = src->prefill_seed_router_selected;
 }
 
 static void graph_transfer_prefill_workspace(
@@ -13708,7 +13702,6 @@ static uint64_t graph_prefill_workspace_bytes(const ns4_gpu_graph *g) {
 #undef NS4_COUNT_PREFILL_FIELD
     }
     total += ns4_gpu_tensor_bytes(g->batch_q_half);
-    total += ns4_gpu_tensor_bytes(g->prefill_seed_router_selected);
     return total;
 }
 
@@ -13722,9 +13715,7 @@ static void graph_free_prefill_workspace(ns4_gpu_graph *g) {
 #undef NS4_FREE_PREFILL_FIELD
     }
     ns4_gpu_tensor_free(g->batch_q_half);
-    ns4_gpu_tensor_free(g->prefill_seed_router_selected);
     g->batch_q_half = NULL;
-    g->prefill_seed_router_selected = NULL;
     g->owns_prefill_workspace = false;
 }
 
@@ -15205,9 +15196,6 @@ static bool graph_alloc_raw_cap(
         if (NS4_GPU_ATTN_COMP_CACHE_F16) {
             g->batch_q_half = ns4_gpu_tensor_alloc(pc * q_dim * sizeof(uint16_t));
         }
-        g->prefill_seed_router_selected = ns4_gpu_tensor_alloc(
-                (uint64_t)NS4_N_LAYER * NS4_STREAMING_PREFILL_CACHE_SEED_MAX_TOKENS *
-                NS4_N_EXPERT_USED * sizeof(int32_t));
     }
 
     bool layer_cache_ok = true;
@@ -15309,8 +15297,7 @@ static bool graph_alloc_raw_cap(
                     /* Class E — validate the emb_tier slot. */
                     graph_prefill_tokens(g) &&
                     g->cpu_router_norm &&
-                    (!NS4_GPU_ATTN_COMP_CACHE_F16 || g->batch_q_half) &&
-                    g->prefill_seed_router_selected;
+                    (!NS4_GPU_ATTN_COMP_CACHE_F16 || g->batch_q_half);
     if (!ok) graph_free(g);
     return ok;
 }
@@ -17727,22 +17714,6 @@ static bool graph_decode_mxfp4_selected_slots_expected(
            getenv("NS4_CUDA_DISABLE_MXFP4_SELECTED_EXPERT_VIEWS") == NULL;
 }
 
-static bool graph_streaming_expert_cache_seed_layer_expected(
-        const ns4_gpu_graph     *g,
-        const ns4_layer_weights *layer) {
-    if (!g ||
-        !g->ssd_streaming ||
-        !layer ||
-        !layer->ffn_gate_exps ||
-        !layer->ffn_up_exps ||
-        !layer->ffn_down_exps) {
-        return false;
-    }
-    if (graph_decode_iq2_selected_slots_expected(g, layer) ||
-        graph_decode_mxfp4_selected_slots_expected(g, layer)) return true;
-    return false;
-}
-
 static bool graph_decode_cuda_selected_slots_expected(
         const ns4_gpu_graph     *g,
         const ns4_layer_weights *layer) {
@@ -17781,33 +17752,6 @@ static bool graph_decode_cuda_selected_slots_expected(
     (void)layer;
     return false;
 #endif
-}
-
-static uint32_t graph_streaming_prefill_cache_seed_k(const ns4_gpu_graph *g) {
-    const bool enabled =
-        graph_env_present("NS4_CUDA_ENABLE_STREAMING_PREFILL_CACHE_SEED");
-    if (!g ||
-        !g->ssd_streaming ||
-        !enabled) {
-        return 0;
-    }
-
-    uint32_t k = 1;
-    const char *env = graph_env_value("NS4_CUDA_STREAMING_PREFILL_CACHE_SEED_K");
-    if (env && env[0]) {
-        char *end = NULL;
-        unsigned long v = strtoul(env, &end, 10);
-        if (end != env && *end == '\0') {
-            if (v == 0) return 0;
-            k = v > NS4_STREAMING_PREFILL_CACHE_SEED_MAX_TOKENS ?
-                NS4_STREAMING_PREFILL_CACHE_SEED_MAX_TOKENS : (uint32_t)v;
-        }
-    }
-    return k;
-}
-
-static bool graph_streaming_prefill_cache_seed_enabled(const ns4_gpu_graph *g) {
-    return graph_streaming_prefill_cache_seed_k(g) != 0;
 }
 
 
@@ -25954,106 +25898,6 @@ static bool graph_prefill_decode_streaming_range(
     return true;
 }
 
-static bool graph_capture_prefill_seed_router_selected(
-        ns4_gpu_graph *g,
-        uint32_t       il,
-        uint32_t       n_tokens) {
-    uint32_t k = graph_streaming_prefill_cache_seed_k(g);
-    if (k == 0) return true;
-    if (k > n_tokens) k = n_tokens;
-    g->prefill_seed_tokens = k;
-    if (!g->prefill_seed_router_selected || !graph_batch_router_selected(g) ||
-        il >= NS4_N_LAYER || n_tokens == 0 || sizeof(int) != sizeof(int32_t)) {
-        return false;
-    }
-
-    const uint64_t bytes = (uint64_t)k * NS4_N_EXPERT_USED * sizeof(int32_t);
-    const uint64_t src_off = (uint64_t)(n_tokens - k) *
-                             NS4_N_EXPERT_USED * sizeof(int);
-    const uint64_t dst_off = (uint64_t)il *
-                             NS4_STREAMING_PREFILL_CACHE_SEED_MAX_TOKENS *
-                             NS4_N_EXPERT_USED * sizeof(int32_t);
-    return ns4_gpu_tensor_copy(g->prefill_seed_router_selected,
-                               dst_off,
-                               graph_batch_router_selected(g),
-                               src_off,
-                               bytes) != 0;
-}
-
-static bool graph_seed_streaming_expert_cache_from_prefill(
-        ns4_gpu_graph     *g,
-        const ns4_model   *model,
-        const ns4_weights *weights) {
-    const uint32_t seed_tokens = g ? g->prefill_seed_tokens : 0;
-    if (!graph_streaming_prefill_cache_seed_enabled(g)) return true;
-    if (!model || !weights || !g->prefill_seed_router_selected || seed_tokens == 0) {
-        return false;
-    }
-
-    int32_t selected[NS4_MAX_LAYER *
-                     NS4_STREAMING_PREFILL_CACHE_SEED_MAX_TOKENS *
-                     NS4_MAX_EXPERT_USED];
-    const uint64_t bytes = (uint64_t)NS4_N_LAYER *
-                           NS4_STREAMING_PREFILL_CACHE_SEED_MAX_TOKENS *
-                           NS4_N_EXPERT_USED * sizeof(selected[0]);
-    if (ns4_gpu_tensor_read(g->prefill_seed_router_selected,
-                            0,
-                            selected,
-                            bytes) == 0) {
-        return false;
-    }
-
-    const bool profile =
-        graph_env_present("NS4_CUDA_STREAMING_PREFILL_CACHE_SEED_PROFILE");
-    const double t0 = profile ? now_sec() : 0.0;
-    uint32_t seeded_layers = 0;
-    uint32_t seeded_rows = 0;
-    for (uint32_t il = 0; il < NS4_N_LAYER; il++) {
-        const ns4_layer_weights *layer = &weights->layer[il];
-        if (!graph_streaming_expert_cache_seed_layer_expected(g, layer)) {
-            continue;
-        }
-
-        const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
-        const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
-        if (layer->ffn_gate_exps->dim[1] > UINT64_MAX / gate_row_bytes ||
-            layer->ffn_down_exps->dim[1] > UINT64_MAX / down_row_bytes) {
-            fprintf(stderr, "ns4: prefill expert-cache seed byte size overflow at layer %u\n", il);
-            return false;
-        }
-        const uint64_t gate_expert_bytes = layer->ffn_gate_exps->dim[1] * gate_row_bytes;
-        const uint64_t down_expert_bytes = layer->ffn_down_exps->dim[1] * down_row_bytes;
-        const ns4_gpu_stream_expert_table table =
-            graph_stream_expert_table_make(model,
-                                           layer,
-                                           il,
-                                           gate_expert_bytes,
-                                           down_expert_bytes);
-        for (uint32_t row = 0; row < seed_tokens; row++) {
-            const size_t sel_off = ((size_t)il *
-                                    NS4_STREAMING_PREFILL_CACHE_SEED_MAX_TOKENS +
-                                    row) * NS4_N_EXPERT_USED;
-            if (ns4_gpu_stream_expert_cache_seed_selected(
-                        &table,
-                        selected + sel_off,
-                        NS4_N_EXPERT_USED) == 0) {
-                return false;
-            }
-            seeded_rows++;
-        }
-        seeded_layers++;
-    }
-    if (profile) {
-        fprintf(stderr,
-                "ns4: streaming prefill expert-cache seed k=%u layers=%u rows=%u time=%.3f ms\n",
-                seed_tokens,
-                seeded_layers,
-                seeded_rows,
-                (now_sec() - t0) * 1000.0);
-    }
-    return true;
-}
-
 typedef struct {
     int id0;
     int id1;
@@ -29620,9 +29464,6 @@ static bool graph_prefill_layer_major(
                                                                   il,
                                                                   start,
                                                                   n_tokens);
-            if (ok) ok = graph_capture_prefill_seed_router_selected(g,
-                                                                          il,
-                                                                          n_tokens);
             const double t_ffn_encoded = now_sec();
             if (ok) ok = ns4_gpu_end_commands() != 0;
             const double t_ffn_done = now_sec();
@@ -29661,9 +29502,6 @@ static bool graph_prefill_layer_major(
                                                                   il,
                                                                   start,
                                                                   n_tokens);
-            if (ok) ok = graph_capture_prefill_seed_router_selected(g,
-                                                                          il,
-                                                                          n_tokens);
             const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
             if (ok) ok = ns4_gpu_end_commands() != 0;
             const double t_done = (profile || throttle) ? now_sec() : 0.0;
@@ -29747,9 +29585,6 @@ static bool graph_prefill_layer_major(
     }
     if (show_progress) fputc('\n', stderr);
     graph_stream_prefill_selected_profile_summary(g);
-    if (!graph_seed_streaming_expert_cache_from_prefill(g, model, weights)) {
-        return false;
-    }
 
     const uint64_t hc_dim = (uint64_t)NS4_N_HC * NS4_N_EMBD;
     uint32_t output_row = (uint32_t)n_tokens - 1u;
@@ -31055,7 +30890,6 @@ struct ns4_engine {
     bool dspark_strict;
     bool cuda_tensor_parallel;
     bool ssd_streaming;
-    bool ssd_streaming_cold;
     ns4_distributed_options distributed;
     bool gpu_ready;
     bool mtp_ready;
@@ -32532,7 +32366,6 @@ static int generate_graph_raw_swa(
         int                 ctx_size,
         bool                quality,
         bool                ssd_streaming,
-        bool                ssd_streaming_cold,
         int                 power_percent,
         uint32_t            prefill_chunk,
         const char        * directional_steering_file,
@@ -32569,7 +32402,6 @@ static int generate_graph_raw_swa(
     }
     g.quality = quality;
     g.ssd_streaming = ssd_streaming;
-    g.ssd_streaming_cold = ssd_streaming_cold;
     g.power_percent = power_percent > 0 ? (uint32_t)power_percent : 100u;
     if (!graph_load_directional_steering(&g,
                                                directional_steering_file,
@@ -35561,7 +35393,6 @@ int ns4_engine_collect_imatrix(ns4_engine *e,
     }
     g.quality = e->quality;
     g.ssd_streaming = e->ssd_streaming;
-    g.ssd_streaming_cold = e->ssd_streaming_cold;
     g.power_percent = (uint32_t)e->power_percent;
 
     ns4_imatrix_collector collector;
@@ -36391,7 +36222,6 @@ int ns4_engine_generate_argmax(
         return generate_graph_raw_swa(model, vocab, weights, prompt,
                                             n_predict, ctx_size, e->quality,
                                             e->ssd_streaming,
-                                            e->ssd_streaming_cold,
                                             e->power_percent,
                                             e->prefill_chunk,
                                             e->directional_steering_file,
@@ -37790,7 +37620,6 @@ static int ns4_engine_open_internal(ns4_engine **out,
     e->dspark_strict = opt->dspark_strict;
     e->cuda_tensor_parallel = opt->cuda_tensor_parallel;
     e->ssd_streaming = opt->ssd_streaming;
-    e->ssd_streaming_cold = opt->ssd_streaming_cold;
     e->distributed = opt->distributed;
     e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
     e->prefill_chunk =
@@ -38655,7 +38484,6 @@ int ns4_session_create(ns4_session **out, ns4_engine *e, int ctx_size) {
     }
     s->graph.quality = e->quality;
     s->graph.ssd_streaming = e->ssd_streaming;
-    s->graph.ssd_streaming_cold = e->ssd_streaming_cold;
     s->graph.power_percent = (uint32_t)e->power_percent;
     if (!graph_load_directional_steering(&s->graph,
                                                e->directional_steering_file,

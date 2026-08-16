@@ -253,17 +253,14 @@ PRO support is experimental, but release builds must not break it silently.
 SSD streaming is a capacity path, so test both correctness and user experience.
 
 - Flash q2/q2-q4 streaming:
-  `./ns4 -m ns4flash.gguf --ssd-streaming --ssd-streaming-cache-experts 32GB -p "..."`
+  `./ns4 -m ns4flash.gguf --ssd-streaming -p "..."`
 - Regression test mixed-quant Flash SSD streaming. Use the mixed q2/q4 GGUF
   with boosted Q4 routed-expert layers and a prompt long enough to exercise the
   selected-address prefill path; it must not fail with "model range is not
   covered by mapped model views":
-  `./ns4 -m gguf/DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf --ssd-streaming --ssd-streaming-cache-experts 16GB --ctx 4096 --tokens 1 --nothink --prompt-file /tmp/ns4_600tok_prompt.txt`.
-- Cold streaming measurement:
-  run once with `--ssd-streaming-cold` and verify no deadlock, missing expert,
-  or impossible slowdown.
-- Confirm startup reports cache budget and that generation does not stall on
-  repeated expert misses for a small interactive prompt.
+  `./ns4 -m gguf/DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf --ssd-streaming --ctx 4096 --tokens 1 --nothink --prompt-file /tmp/ns4_600tok_prompt.txt`.
+- Confirm generation does not stall on repeated expert misses for a small
+  interactive prompt.
 - If streaming cache internals changed, test the same prompt twice and compare
   first-token/logprob sanity between runs.
 

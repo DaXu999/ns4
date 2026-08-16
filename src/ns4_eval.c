@@ -1218,7 +1218,6 @@ typedef struct {
     bool warm_weights;
     bool quality;
     bool ssd_streaming;
-    bool ssd_streaming_cold;
     bool self_test_extractors;
 } eval_config;
 
@@ -1568,8 +1567,6 @@ static eval_config parse_options(int argc, char **argv) {
             c.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
             c.ssd_streaming = true;
-        } else if (!strcmp(arg, "--ssd-streaming-cold")) {
-            c.ssd_streaming_cold = true;
         } else if (!strcmp(arg, "--simulate-used-memory")) {
             if (!ns4_parse_gib_arg(need_arg(&i, argc, argv, arg),
                                    &c.simulate_used_memory_bytes)) {
@@ -4110,7 +4107,6 @@ int main(int argc, char **argv) {
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
         .ssd_streaming = cfg.ssd_streaming,
-        .ssd_streaming_cold = cfg.ssd_streaming_cold,
         .distributed = cfg.dist,
     };
     char dist_err[256];

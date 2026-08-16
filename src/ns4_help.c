@@ -163,7 +163,6 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "-t, --threads N", "CPU helper threads for host-side/reference work.");
     opt(fp, c, "--power N", "GPU duty-cycle target, 1..100. Default: 100");
     opt(fp, c, "--ssd-streaming", "CUDA: opt in to SSD-backed model streaming instead of full residency.");
-    opt(fp, c, "--ssd-streaming-cold", "SSD streaming: skip default popularity-based expert-cache preload.");
     opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");
     opt(fp, c, "--prefill-chunk N", "Graph prefill chunk size. Default: CUDA TP 2048; PRO long prompts 8192; others 4096.");
     if (full) {

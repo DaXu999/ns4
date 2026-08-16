@@ -143,7 +143,6 @@ static ns4_engine *test_open_engine(bool quality) {
         .backend = NS4_BACKEND_CUDA,
         .quality = quality,
         .ssd_streaming = test_env_bool("NS4_TEST_SSD_STREAMING"),
-        .ssd_streaming_cold = test_env_bool("NS4_TEST_SSD_STREAMING_COLD"),
         .mtp_path = (mtp && mtp[0] && !quality) ? mtp : NULL,
         .mtp_draft_tokens = (mtp && mtp[0] && !quality) ? 4 : 0,
     };
@@ -2473,7 +2472,6 @@ static ns4_engine *test_open_dspark_engine(const char *support_path) {
         .backend = NS4_BACKEND_CUDA,
         .quality = false,
         .ssd_streaming = test_env_bool("NS4_TEST_SSD_STREAMING"),
-        .ssd_streaming_cold = test_env_bool("NS4_TEST_SSD_STREAMING_COLD"),
         .mtp_path = support_path,
         .mtp_draft_tokens = 0,
         .dspark = true,
@@ -2633,7 +2631,6 @@ static void test_print_help(const char *prog) {
     puts("\nEnvironment:");
     puts("  NS4_TEST_MODEL=FILE        Model path. Default: ns4flash.gguf");
     puts("  NS4_TEST_SSD_STREAMING=1   Run model tests through SSD streaming.");
-    puts("  NS4_TEST_SSD_STREAMING_COLD=1  Skip streaming hot expert preload.");
     puts("  NS4_CUDA_DISABLE_STREAMING_COLD_DECODE_PREFILL=1  Force canonical streamed cold prefill.");
     puts("  NS4_TEST_LONG_PROMPT=FILE  Rendered long-context story fact prompt.");
     puts("  NS4_TEST_VECTOR_FILE=FILE  Official fixture. Default: flash-0731/official.vec.");

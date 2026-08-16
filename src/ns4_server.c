@@ -12433,8 +12433,6 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
             c.engine.ssd_streaming = true;
-        } else if (!strcmp(arg, "--ssd-streaming-cold")) {
-            c.engine.ssd_streaming_cold = true;
         } else if (!strcmp(arg, "--simulate-used-memory")) {
             if (!ns4_parse_gib_arg(need_arg(&i, argc, argv, arg),
                                    &c.engine.simulate_used_memory_bytes)) {

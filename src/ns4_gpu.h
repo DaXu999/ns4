@@ -141,10 +141,6 @@ typedef struct ns4_gpu_stream_expert_table {
  * cache itself is intentionally kept warm across sessions. */
 void ns4_gpu_stream_expert_cache_reset_route_hotness(void);
 void ns4_gpu_stream_expert_cache_release_resident(void);
-int ns4_gpu_stream_expert_cache_seed_selected(
-        const ns4_gpu_stream_expert_table *table,
-        const int32_t                     *selected_ids,
-        uint32_t                           n_selected);
 int ns4_gpu_stream_expert_cache_begin_selected_load(
         const ns4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
