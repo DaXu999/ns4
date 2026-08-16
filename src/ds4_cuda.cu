@@ -4468,7 +4468,7 @@ extern "C" int ds4_gpu_build_derived_artifacts(
      * weight loads in the decode gate/up kernel are unmergeable 16-bit loads
      * (visible as ld.global.b16 in the PTX).  The aligned-SoA artifact is
      * byte-neutral and 64-byte aligns each block's quants, which measures
-     * 1.40x on that kernel -- see speed-bench/decode-profiling/
+     * 1.40x on that kernel -- see bench/decode-profiling/
      * iq2_dequant_bench.cu.  Residency stays neutral because the build runs
      * before the weight upload and cuda_span_fully_replaced then skips every
      * replaced raw span.  Only the MoE artifacts are enabled here; the Q8
@@ -7759,7 +7759,7 @@ __device__ static int dsv4_e2m1fn_code_dev(float x) {
 
 /* indexer_hadamard_fp4_kernel with the mirror write fused in: same math, same
  * stores, plus the (code, scale) pair the quantizer already had in hand.
- * Verified bit-identical f32 output in speed-bench/decode-profiling/
+ * Verified bit-identical f32 output in bench/decode-profiling/
  * indexer_scan_bench.cu. */
 __global__ static void indexer_hadamard_fp4_mirror_kernel(
         float *x, unsigned char *mirror, uint32_t first_row,
@@ -12902,7 +12902,7 @@ __device__ static void hc4_split_one(float *out, const float *mix, const float *
  *
  * The serial form runs on thread 0 while the other 255 threads of the block
  * wait at the __syncthreads that follows it.  Measured standalone by
- * speed-bench/decode-profiling/hc_occ_bench.cu it is 7.10 us of a 12.87 us
+ * bench/decode-profiling/hc_occ_bench.cu it is 7.10 us of a 12.87 us
  * kernel -- roughly 18k cycles of a fully dependent divide chain (8 Sinkhorn
  * passes x 64 divides) with no second thread to hide any of it.  Decode pays
  * that twice per layer at every context, so it is a fixed per-token cost, not
@@ -13871,7 +13871,7 @@ __global__ static void indexer_score_one_int_kernel(
  * where a shared-memory round trip separates them) nvcc would contract the
  * term mul into the group add and drift 1 ULP.  Bit-identical to the direct
  * kernel; measured 86.5 -> 64.2 us at n_comp 32768, 170.7 -> 101.9 at 65536
- * (speed-bench/decode-profiling/indexer_scan_bench.cu). */
+ * (bench/decode-profiling/indexer_scan_bench.cu). */
 __global__ static void indexer_score_one_mirror_kernel(
         float *scores,
         const float *q,
@@ -15540,7 +15540,7 @@ __global__ static void indexer_topk_tree_merge_pow2_kernel(
  *
  * topk_score_better is a strict total order on (score, index) and indices are
  * unique, so the top-k list and its order are unique and any exact algorithm
- * reproduces the shipped output bit for bit. speed-bench/decode-profiling/
+ * reproduces the shipped output bit for bit. bench/decode-profiling/
  * topk_bench.cu memcmps that against the kernels above rather than assuming
  * it, over four score distributions including one with four distinct values,
  * which is the only way to reach the degenerate exit below.

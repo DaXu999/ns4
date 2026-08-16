@@ -56,7 +56,7 @@
 
 set -euo pipefail
 
-ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd -- "$ROOT"
 
 MODEL="${DS4_MODEL:-$ROOT/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf}"
@@ -75,8 +75,8 @@ die() { printf 'run-cuda-436k-server: %s\n' "$*" >&2; exit 1; }
 # CUDA object does not update it. This has silently served a stale binary
 # before -- once after the FA2 work landed, and again after the 2026-08-12
 # decode kernels. Refuse rather than serve last week's kernels.
-if [[ -f ./ds4_cuda.o && ./ds4_cuda.o -nt ./ds4-server ]]; then
-    die "ds4-server is older than ds4_cuda.o -- relink first:
+if [[ -f ./src/ds4_cuda.o && ./src/ds4_cuda.o -nt ./ds4-server ]]; then
+    die "ds4-server is older than src/ds4_cuda.o -- relink first:
        make ds4-server CUDA_ARCH=sm_120   (takes <1s if the objects are current)"
 fi
 

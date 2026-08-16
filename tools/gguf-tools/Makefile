@@ -1,22 +1,11 @@
 CC ?= cc
 CXX ?= c++
-UNAME_S := $(shell uname -s)
-LLAMA_CPP_DIR ?= ../../deepseek-v4-quants/llama.cpp
+LLAMA_CPP_DIR ?= ../../../deepseek-v4-quants/llama.cpp
 LLAMA_CPP_BUILD ?= $(LLAMA_CPP_DIR)/build-remote
 LLAMA_CPP_BIN ?= $(LLAMA_CPP_BUILD)/bin
 LLAMA_CPP_CXXFLAGS ?= -O3 -Wall -Wextra -std=c++17 \
 	-I$(LLAMA_CPP_DIR)/include -I$(LLAMA_CPP_DIR)/ggml/include
 
-ifeq ($(UNAME_S),Darwin)
-NATIVE_CPU_FLAG ?= -mcpu=native
-QUALITY_LDLIBS := -lm -pthread -framework Foundation -framework Metal
-QUALITY_TARGETS := ds4.o ds4_metal.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o rax.o ds4_gpu_args.o
-QUALITY_OBJS := ../ds4.o ../ds4_metal.o ../ds4_distributed.o ../ds4_tp.o ../ds4_ssd.o ../ds4_layer_pack.o ../rax.o ../ds4_gpu_args.o
-QUALITY_LINK := $(CC) $(CFLAGS) -I.. -o
-LLAMA_CPP_LDLIBS ?= -L$(LLAMA_CPP_BIN) -Wl,-rpath,$(abspath $(LLAMA_CPP_BIN)) \
-	-lllama -lggml -lggml-base -lggml-cpu -lggml-blas -lggml-metal \
-	-framework Foundation -framework Metal -framework Accelerate
-else
 NATIVE_CPU_FLAG ?= -march=native
 CUDA_NVCC := $(shell command -v nvcc 2>/dev/null)
 CUDA_HOME ?= $(if $(wildcard /usr/local/cuda/bin/nvcc),/usr/local/cuda,$(if $(CUDA_NVCC),$(patsubst %/bin/nvcc,%,$(CUDA_NVCC)),/usr/local/cuda))
@@ -27,16 +16,13 @@ NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 QUALITY_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
-QUALITY_TARGETS := ds4.o ds4_cuda.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o rax.o ds4_gpu_args.o \
-	cuda/mmq/ds4_ggml_stubs.o cuda/mmq/ds4_mmq.o cuda/mmq/ds4_mmq_d2r.o \
-	cuda/mmq/quantize.o cuda/mmq/mmid.o cuda/mmq/mmvq.o cuda/mmq/ds4_repack.o
-QUALITY_OBJS := ../ds4.o ../ds4_cuda.o ../ds4_distributed.o ../ds4_tp.o ../ds4_ssd.o ../ds4_layer_pack.o ../rax.o ../ds4_gpu_args.o \
-	../cuda/mmq/ds4_ggml_stubs.o ../cuda/mmq/ds4_mmq.o ../cuda/mmq/ds4_mmq_d2r.o \
-	../cuda/mmq/quantize.o ../cuda/mmq/mmid.o ../cuda/mmq/mmvq.o ../cuda/mmq/ds4_repack.o
-QUALITY_LINK := $(NVCC) $(NVCCFLAGS) -I.. -o
+QUALITY_TARGETS := src/ds4.o src/ds4_cuda.o src/ds4_distributed.o src/ds4_ssd.o src/ds4_layer_pack.o vendor/rax.o src/ds4_gpu_args.o \
+	src/cuda/mmq/ds4_ggml_stubs.o src/cuda/mmq/ds4_mmq.o src/cuda/mmq/ds4_mmq_d2r.o \
+	src/cuda/mmq/quantize.o src/cuda/mmq/mmid.o src/cuda/mmq/mmvq.o src/cuda/mmq/ds4_repack.o
+QUALITY_OBJS := $(addprefix ../../,$(QUALITY_TARGETS))
+QUALITY_LINK := $(NVCC) $(NVCCFLAGS) -I../../src -I../../vendor -o
 LLAMA_CPP_LDLIBS ?= -L$(LLAMA_CPP_BIN) -Wl,-rpath,$(abspath $(LLAMA_CPP_BIN)) \
 	-lllama -lggml -lggml-base -lggml-cpu -ldl -lpthread
-endif
 
 CFLAGS ?= -O3 -Wall -Wextra -std=c11 $(NATIVE_CPU_FLAG)
 CPPFLAGS ?= -D_GNU_SOURCE
@@ -49,7 +35,7 @@ deepseek4-quantize: deepseek4-quantize.c quants.c quants.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ deepseek4-quantize.c quants.c -lm -pthread
 
 quality-score:
-	$(MAKE) -C .. $(QUALITY_TARGETS)
+	$(MAKE) -C ../.. $(QUALITY_TARGETS)
 	$(QUALITY_LINK) quality-testing/score_official quality-testing/score_official.c $(QUALITY_OBJS) $(QUALITY_LDLIBS)
 
 quality-llama-score:

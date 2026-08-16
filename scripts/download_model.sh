@@ -11,7 +11,7 @@ PRO_Q4_LAYERS00_30_FILE="DeepSeek-V4-Pro-Q4K-Layers00-30.gguf"
 PRO_Q4_LAYERS31_OUTPUT_FILE="DeepSeek-V4-Pro-Q4K-Layers-31-output.gguf"
 DS4F_DSPARK_FILE="DeepSeek-V4-Flash-DSpark-support-0731.gguf"
 
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
 case "$OUT_DIR" in
     /*) ;;

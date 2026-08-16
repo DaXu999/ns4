@@ -20,13 +20,13 @@
  *
  * NOT WIRED IN YET.  This header expects `fd_row_geom` / `fd_compute_geom`
  * from ds4_cuda.cu to be in scope, and is exercised by
- * speed-bench/decode-profiling/fd2_bench.cu.  It is not on the live decode path:
+ * bench/decode-profiling/fd2_bench.cu.  It is not on the live decode path:
  * for this model the decode attention that actually runs is
  * attention_decode_score_split_* (the shipped attention_flash_decode_kernel
  * is gated behind a topk != NULL caller and never fires), and attention is
  * only ~5.7% of a decode token, so wiring it is worth ~2-3% end to end
  * against the ~5.5us/launch floor documented in
- * speed-bench/DECODE_LAUNCH_BUDGET.md.  Measured: 12.5us kernel + 7.1us combine vs
+ * bench/DECODE_LAUNCH_BUDGET.md.  Measured: 12.5us kernel + 7.1us combine vs
  * 25us for the shipped path, rel_l2 2.7e-4 against the fp32 reference.
  */
 
