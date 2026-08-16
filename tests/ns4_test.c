@@ -60,6 +60,52 @@ static void test_restore_env(const char *name, char *saved) {
     }
 }
 
+/* The tuned production decode stack (the run-cuda-436k-server.sh levers).
+ * These change kernel selection and summation order -- deterministic, but
+ * numerically different from the conservative default paths.  Tests that
+ * compare against captured vectors clear the stack; --tensor-equivalence
+ * A/Bs the two configurations directly. */
+static const char *const test_decode_stack_names[] = {
+    "NS4_CUDA_INDEXER_SCAN_INT",
+    "NS4_CUDA_F16_ONE_WIDE",
+    "NS4_CUDA_F16_PAIR_WIDE",
+    "NS4_CUDA_Q8_PAIR_WIDE",
+    "NS4_CUDA_DECODE_INDEXER_SPARSE_THRESHOLD",
+};
+static const char *const test_decode_stack_values[] = {
+    "1", "256", "256", "256", "4096",
+};
+#define TEST_DECODE_STACK_COUNT \
+    (sizeof(test_decode_stack_names) / sizeof(test_decode_stack_names[0]))
+
+typedef struct {
+    char *saved[TEST_DECODE_STACK_COUNT];
+} test_decode_stack_env;
+
+static test_decode_stack_env test_save_decode_stack(void) {
+    test_decode_stack_env s;
+    for (size_t i = 0; i < TEST_DECODE_STACK_COUNT; i++) {
+        s.saved[i] = test_save_env(test_decode_stack_names[i]);
+    }
+    return s;
+}
+
+static void test_set_decode_stack(bool enabled) {
+    for (size_t i = 0; i < TEST_DECODE_STACK_COUNT; i++) {
+        if (enabled) {
+            setenv(test_decode_stack_names[i], test_decode_stack_values[i], 1);
+        } else {
+            unsetenv(test_decode_stack_names[i]);
+        }
+    }
+}
+
+static void test_restore_decode_stack(test_decode_stack_env s) {
+    for (size_t i = 0; i < TEST_DECODE_STACK_COUNT; i++) {
+        test_restore_env(test_decode_stack_names[i], s.saved[i]);
+    }
+}
+
 typedef struct {
     char *cold_decode;
     char *batch_selected_addr;
@@ -795,6 +841,120 @@ static void test_gpu_q8_0_decode_pair_exact(void) {
 
 
 
+/* F32 bit patterns that stress every f32->f16 conversion boundary: signed
+ * zeros, infinities, quiet/signalling NaNs, F32 subnormals, the minimum-F16-
+ * subnormal and subnormal/normal boundaries, round-to-nearest-even ties, and
+ * the overflow boundary.  Restored from the pre-CUDA-only test suite, where
+ * the conversion coverage was lost with the backend-specific block. */
+static const uint32_t test_copy_f32_patterns[] = {
+    0x00000000u, 0x80000000u, /* signed zero */
+    0x7f800000u, 0xff800000u, /* infinities */
+    0x7fc00000u, 0x7fc12345u, 0xffc54321u, 0x7fa00001u, /* NaNs */
+    0x00000001u, 0x007fffffu, 0x80000001u, 0x807fffffu, /* F32 subnormals */
+    0x32ffffffu, 0x33000000u, 0x33000001u,
+    0x337fffffu, 0x33800000u, 0x33800001u, /* minimum F16 subnormal boundary */
+    0x387fbfffu, 0x387fc000u, 0x387fffffu,
+    0x38800000u, 0x38800001u, /* maximum subnormal/minimum normal boundary */
+    0x3f800fffu, 0x3f801000u, 0x3f801001u,
+    0x3f802fffu, 0x3f803000u, 0x3f803001u, /* round-to-nearest ties */
+    0x477fdfffu, 0x477fe000u, 0x477fefffu,
+    0x477ff000u, 0x477ff001u, 0x47800000u, /* maximum/overflow boundary */
+    0xc77fe000u, 0xbf801000u, 0x3eaaaaabu, 0xbeaaaaabu,
+};
+
+/* Host IEEE-754 round-to-nearest-even f32->f16 reference (mirrors the
+ * engine's scalar converter; signalling NaNs quiet to 0x7e00). */
+static uint16_t test_ref_f32_to_f16(uint32_t bits) {
+    const uint32_t sign = (bits >> 16) & 0x8000u;
+    int32_t exp = (int32_t)((bits >> 23) & 0xffu) - 127 + 15;
+    uint32_t mant = bits & 0x7fffffu;
+
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign;
+        mant |= 0x800000u;
+        const uint32_t shift = (uint32_t)(14 - exp);
+        uint32_t half_mant = mant >> shift;
+        const uint32_t round_bit = (mant >> (shift - 1)) & 1u;
+        const uint32_t sticky = mant & ((1u << (shift - 1)) - 1u);
+        if (round_bit && (sticky || (half_mant & 1u))) half_mant++;
+        return (uint16_t)(sign | half_mant);
+    }
+    if (exp >= 31) {
+        if (((bits >> 23) & 0xffu) == 0xffu && mant != 0) {
+            return (uint16_t)(sign | 0x7e00u);
+        }
+        return (uint16_t)(sign | 0x7c00u);
+    }
+    uint32_t half = sign | ((uint32_t)exp << 10) | (mant >> 13);
+    const uint32_t round = mant & 0x1fffu;
+    if (round > 0x1000u || (round == 0x1000u && (half & 1u))) half++;
+    return (uint16_t)half;
+}
+
+static void test_gpu_f32_f16_conversion_patterns(void) {
+    const uint32_t n_patterns =
+        (uint32_t)(sizeof(test_copy_f32_patterns) / sizeof(test_copy_f32_patterns[0]));
+    /* Tile the patterns across a buffer larger than one block so every
+     * pattern lands at several lane/block positions. */
+    const uint32_t n = 4096;
+
+    ns4_gpu_tensor *src32 = ns4_gpu_tensor_alloc((uint64_t)n * sizeof(float));
+    ns4_gpu_tensor *dst16 = ns4_gpu_tensor_alloc((uint64_t)n * sizeof(uint16_t));
+    TEST_ASSERT(src32 != NULL && dst16 != NULL);
+    if (!src32 || !dst16) return;
+
+    uint32_t *host32 = malloc((size_t)n * sizeof(uint32_t));
+    uint16_t *host16 = malloc((size_t)n * sizeof(uint16_t));
+    TEST_ASSERT(host32 != NULL && host16 != NULL);
+    for (uint32_t salt = 0; salt < 3; salt++) {
+        for (uint32_t i = 0; i < n; i++) {
+            host32[i] = test_copy_f32_patterns[(i + salt) % n_patterns];
+        }
+        TEST_ASSERT(ns4_gpu_tensor_write(src32, 0, host32,
+                                         (uint64_t)n * sizeof(uint32_t)) != 0);
+        TEST_ASSERT(ns4_gpu_tensor_copy_f32_to_f16(dst16, 0, src32, 0, n) != 0);
+        TEST_ASSERT(ns4_gpu_tensor_read(dst16, 0, host16,
+                                        (uint64_t)n * sizeof(uint16_t)) != 0);
+
+        uint32_t mismatches = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            const uint32_t in_bits = host32[i];
+            const uint16_t got = host16[i];
+            const uint16_t want = test_ref_f32_to_f16(in_bits);
+            const int in_is_nan = ((in_bits >> 23) & 0xffu) == 0xffu &&
+                                  (in_bits & 0x7fffffu) != 0;
+            if (in_is_nan) {
+                /* NaN propagation is implementation-defined across
+                 * converters: CUDA's F2F emits the canonical NaN 0x7fff,
+                 * discarding payload and even the sign bit.  Require only
+                 * that a NaN stays a NaN. */
+                const int got_is_nan = (got & 0x7c00u) == 0x7c00u &&
+                                       (got & 0x03ffu) != 0;
+                if (!got_is_nan) {
+                    if (mismatches < 8) {
+                        fprintf(stderr,
+                                "ns4-test: f32->f16 NaN pattern mismatch i=%u in=0x%08x got=0x%04x\n",
+                                i, in_bits, got);
+                    }
+                    mismatches++;
+                }
+            } else if (got != want) {
+                if (mismatches < 8) {
+                    fprintf(stderr,
+                            "ns4-test: f32->f16 pattern mismatch i=%u in=0x%08x got=0x%04x want=0x%04x\n",
+                            i, in_bits, got, want);
+                }
+                mismatches++;
+            }
+        }
+        TEST_ASSERT(mismatches == 0);
+    }
+    free(host32);
+    free(host16);
+    ns4_gpu_tensor_free(src32);
+    ns4_gpu_tensor_free(dst16);
+}
+
 static void test_gpu_kernel_group(void) {
     /* These allocate device tensors directly instead of going through
      * test_get_engine(), so the backend has to be brought up explicitly.
@@ -804,6 +964,7 @@ static void test_gpu_kernel_group(void) {
         fprintf(stderr, "ns4-test: kernel group skipped, GPU backend unavailable\n");
         return;
     }
+    test_gpu_f32_f16_conversion_patterns();
     test_gpu_f16_matvec_fast_nr0_4();
     test_gpu_f16_prefill_matmul();
     test_gpu_q8_0_prefill_matmul();
@@ -1262,19 +1423,19 @@ static void test_official_logprob_vectors_run(const char *case_filter) {
     if (!fp) return;
 
     char *saved_prefill_chunk = test_save_env("NS4_CUDA_PREFILL_CHUNK");
-    char *saved_disable_metal4 = test_save_env("NS4_CUDA_DISABLE_METAL4");
+    test_decode_stack_env saved_stack = test_save_decode_stack();
     test_streaming_prefill_env saved_canonical_streaming_prefill =
         test_force_canonical_streaming_prefill();
     setenv("NS4_CUDA_PREFILL_CHUNK", "2048", 1);
-    if (getenv("NS4_TEST_LOGPROB_AUTO_METAL") == NULL) {
-        setenv("NS4_CUDA_DISABLE_METAL4", "1", 1);
-    } else {
-        unsetenv("NS4_CUDA_DISABLE_METAL4");
+    /* Score against the official vectors on the conservative default paths;
+     * NS4_TEST_LOGPROB_TUNED=1 keeps the ambient tuned decode stack instead. */
+    if (getenv("NS4_TEST_LOGPROB_TUNED") == NULL) {
+        test_set_decode_stack(false);
     }
     ns4_engine *engine = test_open_engine(false);
     if (!engine) {
         test_restore_canonical_streaming_prefill(saved_canonical_streaming_prefill);
-        test_restore_env("NS4_CUDA_DISABLE_METAL4", saved_disable_metal4);
+        test_restore_decode_stack(saved_stack);
         test_restore_env("NS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
         fclose(fp);
         return;
@@ -1299,7 +1460,7 @@ static void test_official_logprob_vectors_run(const char *case_filter) {
     TEST_ASSERT(!case_filter || !case_filter[0] || ran == 1);
     ns4_engine_close(engine);
     test_restore_canonical_streaming_prefill(saved_canonical_streaming_prefill);
-    test_restore_env("NS4_CUDA_DISABLE_METAL4", saved_disable_metal4);
+    test_restore_decode_stack(saved_stack);
     test_restore_env("NS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
     fclose(fp);
 }
@@ -1492,19 +1653,20 @@ static void test_local_golden_vectors(void) {
     if (!fp) return;
 
     char *saved_prefill_chunk = test_save_env("NS4_CUDA_PREFILL_CHUNK");
-    char *saved_disable_metal4 = test_save_env("NS4_CUDA_DISABLE_METAL4");
+    test_decode_stack_env saved_stack = test_save_decode_stack();
     char *saved_moe_tile_max = test_save_env("NS4_CUDA_MOE_TILE_MAX");
     test_streaming_prefill_env saved_canonical_streaming_prefill =
         test_force_canonical_streaming_prefill();
     setenv("NS4_CUDA_PREFILL_CHUNK", "4096", 1);
-    setenv("NS4_CUDA_DISABLE_METAL4", "1", 1);
+    /* Bit-exact golden vectors were captured on the default paths. */
+    test_set_decode_stack(false);
     unsetenv("NS4_CUDA_MOE_TILE_MAX");
 
     ns4_engine *engine = test_open_engine(false);
     if (!engine) {
         test_restore_canonical_streaming_prefill(saved_canonical_streaming_prefill);
         test_restore_env("NS4_CUDA_MOE_TILE_MAX", saved_moe_tile_max);
-        test_restore_env("NS4_CUDA_DISABLE_METAL4", saved_disable_metal4);
+        test_restore_decode_stack(saved_stack);
         test_restore_env("NS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
         fclose(fp);
         return;
@@ -1519,7 +1681,7 @@ static void test_local_golden_vectors(void) {
     ns4_engine_close(engine);
     test_restore_canonical_streaming_prefill(saved_canonical_streaming_prefill);
     test_restore_env("NS4_CUDA_MOE_TILE_MAX", saved_moe_tile_max);
-    test_restore_env("NS4_CUDA_DISABLE_METAL4", saved_disable_metal4);
+    test_restore_decode_stack(saved_stack);
     test_restore_env("NS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
     fclose(fp);
 }
@@ -1923,11 +2085,14 @@ static void test_gpu_mpp_equivalence(void) {
     test_mpp_eq_case cases[TEST_MPP_EQ_MAX_CASES];
     memset(cases, 0, sizeof(cases));
 
-    char *saved_disable_metal4 = test_save_env("NS4_CUDA_DISABLE_METAL4");
-    setenv("NS4_CUDA_DISABLE_METAL4", "1", 1);
+    /* Reference pass: conservative default decode paths. The candidate pass
+     * below runs the tuned production stack; the test asserts the tuned
+     * levers keep greedy decode on the same tokens. */
+    test_decode_stack_env saved_stack = test_save_decode_stack();
+    test_set_decode_stack(false);
     ns4_engine *ref_engine = test_open_engine(false);
     if (!ref_engine) {
-        test_restore_env("NS4_CUDA_DISABLE_METAL4", saved_disable_metal4);
+        test_restore_decode_stack(saved_stack);
         return;
     }
 
@@ -1944,9 +2109,10 @@ static void test_gpu_mpp_equivalence(void) {
                                      &tc->ref_gen_len));
     }
     ns4_engine_close(ref_engine);
-    test_restore_env("NS4_CUDA_DISABLE_METAL4", saved_disable_metal4);
 
-    test_run_mpp_candidate("auto", cases, ncase);
+    test_set_decode_stack(true);
+    test_run_mpp_candidate("tuned", cases, ncase);
+    test_restore_decode_stack(saved_stack);
 
     for (int i = 0; i < ncase; i++) test_mpp_eq_case_free(&cases[i]);
 }
@@ -2444,7 +2610,7 @@ static const ns4_test_entry test_entries[] = {
     {"--local-golden-vectors", "local-golden-vectors", "local top-k/logit drift regression for long prefill", test_local_golden_vectors},
     {"--short-prefill", "short-prefill", "ratio-4 short prefill regression", test_gpu_short_prefill_ratio4},
     {"--kernels", "kernels", "isolated GPU kernel numeric regressions", test_gpu_kernel_group},
-    {"--tensor-equivalence", "tensor-equivalence", "fast/quality prompt-logit and greedy equivalence", test_gpu_mpp_equivalence},
+    {"--tensor-equivalence", "tensor-equivalence", "tuned decode stack vs conservative default prompt-logit and greedy equivalence", test_gpu_mpp_equivalence},
     {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
     {"--dspark-verify-depth", "dspark-verify-depth", "DSpark speculative verify commits autoregressive-identical tokens at draft depth > 2", test_dspark_verify_depth},
