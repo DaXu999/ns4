@@ -152,8 +152,6 @@ top-logprob slices, so do not replace them with one sampled chat answer.
   For resident multi-GPU CUDA, pass the normal placement flags to the scorer,
   for example `--gpu-vram auto --gpu-devices 0,2,4,6,1,3,5,7
   --cuda-tensor-parallel`.
-- Run the 100-case DeepSeek V4 PRO fixture for every released PRO GGUF:
-  `tools/gguf-tools/quality-testing/score_official /path/to/deepseek-v4-pro.gguf tools/gguf-tools/quality-testing/data/pro/manifest.tsv /tmp/pro.tsv 4096`.
 - For SSD streaming, run the same official-continuation scorer once with full
   residency and once with `--ssd-streaming` for the release model.  The summary
   and API agreement should stay in the same quality band.
@@ -237,18 +235,7 @@ or backend fallback selection changes.
   reject the combination before evaluation. They must not partially activate
   native batching.
 
-## 5. PRO Path
-
-PRO support is experimental, but release builds must not break it silently.
-
-- If a PRO-capable machine is available, run a short PRO q2 prompt and verify
-  the correct template, thinking behavior, and endpoint aliases.
-- For PRO Q4 distributed builds, test only on the intended high-memory machines.
-- If PRO cannot be run locally, at least build all binaries and review changes
-  touching model shape, tensor lookup, routed expert mapping, template logic,
-  and KV payload compatibility.
-
-## 6. SSD Streaming
+## 5. SSD Streaming
 
 SSD streaming is a capacity path, so test both correctness and user experience.
 
@@ -264,7 +251,7 @@ SSD streaming is a capacity path, so test both correctness and user experience.
 - If streaming cache internals changed, test the same prompt twice and compare
   first-token/logprob sanity between runs.
 
-## 7. CUDA / DGX Spark
+## 6. CUDA / DGX Spark
 
 Before a release, ask the user for CUDA access if it is not already configured.
 Use the DGX Spark / GB10 host `<user>@<cuda-host>`.  Do not claim CUDA is
@@ -328,7 +315,7 @@ release-ready without this pass.
 - If CUDA Q4, distributed, streaming hooks, tensor span loading, or model cache
   code changed, test the specific GGUF and split mode that uses that path.
 
-## 8. Distributed Inference
+## 7. Distributed Inference
 
 Distributed code has regressed around route setup, KV snapshots, request IDs,
 and split model loading.  Test it whenever distributed, KV, session, or model
@@ -343,7 +330,7 @@ loading code changes.
 - If CUDA distributed is relevant, test across the CUDA hosts and record
   generation speed, not just "it works".
 
-## 9. Disk KV Cache
+## 8. Disk KV Cache
 
 Disk KV cache bugs are high impact for server users.
 
@@ -357,13 +344,12 @@ Disk KV cache bugs are high impact for server users.
 - Test stripped agent sessions: `/strip <id>` then `/switch <id>` should rebuild
   by prefill and render sane history.
 
-## 10. Server APIs
+## 9. Server APIs
 
 The server must keep compatibility across OpenAI, Responses, and Anthropic
 clients.
 
-- `GET /v1/models/deepseek-v4-flash` and `GET /v1/models/deepseek-v4-pro`
-  should both serve whichever GGUF is loaded.
+- `GET /v1/models/deepseek-v4-flash` should serve whichever GGUF is loaded.
 - Test OpenAI chat completion, OpenAI Responses, and Anthropic messages.
 - Test SSE streaming with thinking enabled and disabled.
 - Test keepalive during long prefill and confirm clients do not time out.
@@ -374,7 +360,7 @@ clients.
 - Test `--trace` and confirm rendered prompts, cache decisions, generated text,
   and tool-parser events are useful without leaking unrelated state.
 
-## 11. ns4-agent
+## 10. ns4-agent
 
 The agent is the most stateful component.  Test it manually, not only by build.
 
@@ -406,16 +392,16 @@ The agent is the most stateful component.  Test it manually, not only by build.
   status bar fill to terminal width, syntax highlighting in Markdown/code blocks,
   and SSH/remote terminal flicker.
 
-## 12. Download Script And Model Files
+## 11. Download Script And Model Files
 
 - Test `download_model.sh` in a temporary directory so local weights are not
   overwritten.
-- Test one Flash target and one PRO target enough to verify URL, resume, Hugging
+- Test a Flash target enough to verify URL, resume, Hugging
   Face CLI/curl behavior, file naming, and symlink policy.
 - Verify legacy removed targets fail clearly.
 - Verify README model names match the script and Hugging Face repository.
 
-## 13. Performance And Power
+## 12. Performance And Power
 
 - Run `ns4-bench` on the release machine and compare with tracked CSV baselines.
 - Test `--power 100` is not throttled.
@@ -424,7 +410,7 @@ The agent is the most stateful component.  Test it manually, not only by build.
 - Confirm context buffer size, raw KV rows, compressed KV rows, and mmap behavior
   match expectations for 32k, 100k, and any release-advertised context size.
 
-## 14. Speed Regression
+## 13. Speed Regression
 
 Performance is a release gate. A correct result that is unexpectedly much
 slower still needs an explanation before release.
@@ -461,7 +447,7 @@ its production server without explicit permission for the current QA pass. If
 permission is granted, the existing hard floor remains 110 aggregate t/s for
 the 16-row decode oracle.
 
-## 15. Release Sign-off
+## 14. Release Sign-off
 
 Do not sign off until:
 

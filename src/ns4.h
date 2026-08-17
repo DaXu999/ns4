@@ -185,9 +185,9 @@ uint32_t ns4_engine_layer_compress_ratio(ns4_engine *e, uint32_t layer);
 uint64_t ns4_engine_hidden_f32_values(ns4_engine *e);
 int ns4_engine_embd_dim(ns4_engine *e);
 uint64_t ns4_engine_model_bytes(ns4_engine *e);
-/* Stable id for cache compatibility.  0 is the original Flash shape, so old
- * KV files with the previously-zero reserved byte remain Flash-compatible;
- * Pro and later shapes must use nonzero ids. */
+/* Stable id for cache compatibility.  0 is the Flash shape, so old KV files
+ * with the previously-zero reserved byte remain Flash-compatible; any future
+ * non-Flash shape must use a nonzero id. */
 int ns4_engine_model_id(ns4_engine *e);
 const char *ns4_backend_name(ns4_backend backend);
 bool ns4_think_mode_enabled(ns4_think_mode mode);
@@ -196,7 +196,7 @@ const char *ns4_think_max_prefix(void);
 uint32_t ns4_think_max_min_context(void);
 ns4_think_mode ns4_think_mode_for_context(ns4_think_mode mode, int ctx_size);
 /* Uses the active model shape selected by ns4_engine_open(); call after opening
- * the GGUF so Flash/Pro dimensions are known. */
+ * the GGUF so the model dimensions are known. */
 ns4_context_memory ns4_context_memory_estimate(ns4_backend backend, int ctx_size);
 ns4_context_memory ns4_context_memory_estimate_with_prefill(
         ns4_backend backend,

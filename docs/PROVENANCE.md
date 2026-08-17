@@ -25,6 +25,12 @@ history.
   resident-cache project would reintroduce this deliberately.
 - **PRO Q4 expert-table preload**: likewise double-stubbed on CUDA;
   removed.
+- **DeepSeek V4 PRO support.** ns4 is a Flash-only engine. The PRO model
+  shape and its engine branches, the `deepseek-v4-pro` server alias, the
+  PRO download targets, the PRO quality fixture set, and the PRO-only CUDA
+  opt-in switches were removed after the import; a PRO GGUF now fails shape
+  validation with a clear error. Recovery lives in this repository's
+  history and in ds4.
 - **The agent front end** (`ns4-agent` and its web-tool layer): deferred,
   not dropped — serving is the first-priority path. It can be
   reintroduced from the ds4 sources when agent work resumes.
@@ -52,4 +58,5 @@ imported byte-for-byte from ds4 (several deliberately contain the old
 `ds4` spellings inside prompt text and fixture headers). Do not rename
 inside them: the calibration dataset feeds imatrix collection, the quality
 data and test vectors are scoring fixtures, and changing their bytes
-changes what they measure.
+changes what they measure. The PRO fixture set (`quality-testing/data/pro/`)
+was removed with PRO support; the remaining sets stay frozen.

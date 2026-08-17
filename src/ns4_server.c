@@ -967,14 +967,12 @@ static server_model_syntax server_model_syntax_for_engine(ns4_engine *engine) {
 }
 
 static const char *server_model_id_from_engine(ns4_engine *engine) {
-    return ns4_engine_model_id(engine) == 1 ?
-           "deepseek-v4-pro" : "deepseek-v4-flash";
+    (void)engine;
+    return "deepseek-v4-flash";
 }
 
 static bool server_model_alias_known(const char *id) {
-    return id &&
-           (!strcmp(id, "deepseek-v4-flash") ||
-            !strcmp(id, "deepseek-v4-pro"));
+    return id && !strcmp(id, "deepseek-v4-flash");
 }
 
 static void stop_list_clear(stop_list *stops) {
@@ -8912,7 +8910,7 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
     if (wanted.len == 0) return;
     /* Tool replay payloads are stored next to KV checkpoints; keep them model
      * scoped too, since token positions and graph state are not portable across
-     * Flash/Pro shapes even when the rendered chat text is identical. */
+     * model shapes even when the rendered chat text is identical. */
     uint8_t model_id = s->engine ? (uint8_t)ns4_engine_model_id(s->engine) : 0;
 
     DIR *d = opendir(s->kv.dir);
@@ -12034,8 +12032,6 @@ static bool send_models(server *s, int fd) {
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
     append_model_json(&b, s, "deepseek-v4-flash");
-    buf_putc(&b, ',');
-    append_model_json(&b, s, "deepseek-v4-pro");
     buf_puts(&b, "]}\n");
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -14109,7 +14105,7 @@ static void test_model_alias_thinking_controls(void) {
     TEST_ASSERT(!model_alias_disables_thinking("deepseek-v4-flash"));
     TEST_ASSERT(model_alias_enables_thinking("deepseek-reasoner"));
     TEST_ASSERT(server_model_alias_known("deepseek-v4-flash"));
-    TEST_ASSERT(server_model_alias_known("deepseek-v4-pro"));
+    TEST_ASSERT(!server_model_alias_known("deepseek-v4-pro"));
 }
 
 static void test_api_thinking_controls_parse(void) {
@@ -15844,10 +15840,10 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":32768") != NULL);
     buf_free(&b);
 
-    append_model_json_values(&b, "deepseek-v4-pro", "DeepSeek V4 Pro",
+    append_model_json_values(&b, "deepseek-v4-flash", "DeepSeek V4 Flash",
                              100000, 4096);
-    TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-pro\"") != NULL);
-    TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Pro\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-flash\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":100000") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":4096") != NULL);
     buf_free(&b);

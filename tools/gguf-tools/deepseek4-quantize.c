@@ -1,9 +1,9 @@
 /*
- * DeepSeek V4 Flash/Pro HF -> GGUF quantizer.
+ * DeepSeek V4 Flash HF -> GGUF quantizer.
  *
  * This is a plain C, model-specific version of the NS4 quantization pipeline.
- * It deliberately keeps only the pieces needed by the DeepSeek V4 Flash and
- * Pro GGUF recipes used by this repository:
+ * It deliberately keeps only the pieces needed by the DeepSeek V4 Flash
+ * GGUF recipes used by this repository:
  *
  * - safetensors index/header loading;
  * - FP8 E4M3 + E8M0 dequantization for dense tensors;
@@ -2630,7 +2630,7 @@ static void free_dspark_support_plan(dspark_support_plan *plan) {
 
 static void usage(const char *argv0) {
     printf("usage: %s --hf DIR --template MODEL.gguf --out OUT.gguf [options]\n", argv0);
-    printf("\nDeepSeek V4 Flash/Pro safetensors -> GGUF quantizer in plain C.\n\n");
+    printf("\nDeepSeek V4 Flash safetensors -> GGUF quantizer in plain C.\n\n");
     printf("options:\n");
     printf("  --hf DIR               Hugging Face model directory with model.safetensors.index.json\n");
     printf("  --template FILE        existing NS4 GGUF used for metadata, tensor order, shapes\n");

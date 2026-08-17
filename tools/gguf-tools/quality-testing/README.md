@@ -15,8 +15,6 @@ calling hosted APIs:
 
 - `data/flash`: 100 DeepSeek V4 Flash 0731 continuations collected from the
   official DeepSeek API with `top_logprobs=20`.
-- `data/pro`: 100 DeepSeek V4 PRO continuations collected from the official
-  DeepSeek API with `top_logprobs=20`.
 
 DeepSeek V4 Flash also has tracked official smoke vectors in
 `tests/test-vectors/`.  Those vectors drive `./ns4_test --logprob-vectors` and
@@ -56,19 +54,18 @@ make -C gguf-tools quality-llama-score
 ```sh
 gguf-tools/quality-testing/score_official \
   ../deepseek-v4-quants/gguf/OLD.gguf \
-  gguf-tools/quality-testing/data/pro/manifest.tsv \
+  gguf-tools/quality-testing/data/flash/manifest.tsv \
   /tmp/old.tsv \
   4096
 
 gguf-tools/quality-testing/score_official \
   ../deepseek-v4-quants/gguf/NEW.gguf \
-  gguf-tools/quality-testing/data/pro/manifest.tsv \
+  gguf-tools/quality-testing/data/flash/manifest.tsv \
   /tmp/new.tsv \
   4096
 ```
 
-Use `data/flash/manifest.tsv` for Flash GGUFs and
-`data/pro/manifest.tsv` for PRO GGUFs.  The scorer and comparator do not care
+Use `data/flash/manifest.tsv` for Flash GGUFs.  The scorer and comparator do not care
 which model produced the manifest; the manifest path selects the continuation
 set.
 

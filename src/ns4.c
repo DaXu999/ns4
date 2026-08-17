@@ -5,7 +5,7 @@
  * This file is deliberately vertical: it owns GGUF loading, the fixed
  * DeepSeek V4 tensor layouts, CPU reference kernels, the whole-model GPU
  * graph driver, and tokenizer wiring.  Model shape selection is intentionally
- * narrow: validation accepts the known Flash and Pro layouts and fails early
+ * narrow: validation accepts the known Flash layout and fails early
  * for anything else.
  *
  * Loading is mmap based.  The loader parses only the GGUF header, metadata
@@ -180,9 +180,9 @@ static const char *graph_env_value(const char *name) {
  * Model Shape Profiles.
  * =========================================================================
  *
- * The weight binder and metadata validator select one of the known model
- * profiles below.  Arrays reserve the maximum Pro dimensions; hot loops read
- * the active profile after GGUF validation.
+ * The weight binder and metadata validator match the GGUF against the Flash
+ * profile below.  Arrays reserve fixed maxima with headroom over the model
+ * dimensions; hot loops read the active profile after GGUF validation.
  */
 
 enum {
@@ -210,14 +210,8 @@ enum {
     NS4_MAX_HC_SINKHORN_ITER = 20,
 };
 
-typedef enum {
-    NS4_VARIANT_FLASH = 0,
-    NS4_VARIANT_PRO   = 1,
-} ns4_variant;
-
 typedef struct {
     const char *name;
-    ns4_variant variant;
     uint32_t n_layer;
     uint32_t n_embd;
     uint32_t n_vocab;
@@ -254,7 +248,6 @@ typedef struct {
 
 static const ns4_shape NS4_SHAPE_FLASH = {
     .name = "DeepSeek V4 Flash",
-    .variant = NS4_VARIANT_FLASH,
     .n_layer = 43,
     .n_embd = 4096,
     .n_vocab = 129280,
@@ -289,47 +282,8 @@ static const ns4_shape NS4_SHAPE_FLASH = {
     .rope_orig_ctx = NS4_DEFAULT_ROPE_ORIG_CTX,
 };
 
-static const ns4_shape NS4_SHAPE_PRO = {
-    .name = "DeepSeek V4 Pro",
-    .variant = NS4_VARIANT_PRO,
-    .n_layer = 61,
-    .n_embd = 7168,
-    .n_vocab = 129280,
-    .n_head = 128,
-    .n_head_kv = 1,
-    .n_head_dim = 512,
-    .n_value_dim = 512,
-    .n_rot = 64,
-    .n_out_group = 16,
-    .n_lora_q = 1536,
-    .n_lora_o = 1024,
-    .n_expert = 384,
-    .n_expert_used = 6,
-    .n_expert_shared = 1,
-    .n_ff_exp = 3072,
-    .n_hash_layer = 3,
-    .n_swa = 128,
-    .n_indexer_head = 64,
-    .n_indexer_head_dim = 128,
-    .n_indexer_top_k = 1024,
-    .n_hc = 4,
-    .n_hc_sinkhorn_iter = 20,
-    .rms_eps = NS4_DEFAULT_RMS_EPS,
-    .hc_eps = NS4_DEFAULT_HC_EPS,
-    .expert_weight_scale = 2.5f,
-    .swiglu_clamp_exp = NS4_DEFAULT_SWIGLU_CLAMP_EXP,
-    .rope_freq_base = NS4_DEFAULT_ROPE_FREQ_BASE,
-    .rope_scale_factor = NS4_DEFAULT_ROPE_SCALE_FACTOR,
-    .rope_yarn_beta_fast = NS4_DEFAULT_ROPE_YARN_BETA_FAST,
-    .rope_yarn_beta_slow = NS4_DEFAULT_ROPE_YARN_BETA_SLOW,
-    .compress_rope_freq_base = NS4_DEFAULT_COMPRESS_ROPE_FREQ_BASE,
-    .rope_orig_ctx = NS4_DEFAULT_ROPE_ORIG_CTX,
-};
-
-
 static ns4_shape g_ns4_shape = {
     .name = "DeepSeek V4 Flash",
-    .variant = NS4_VARIANT_FLASH,
     .n_layer = 43,
     .n_embd = 4096,
     .n_vocab = 129280,
@@ -367,7 +321,6 @@ static ns4_shape g_ns4_shape = {
 static uint32_t g_ns4_compress_ratios[NS4_MAX_LAYER] = {0};
 
 #define NS4_MODEL_SHAPE_NAME          (g_ns4_shape.name)
-#define NS4_MODEL_VARIANT             (g_ns4_shape.variant)
 #define NS4_N_LAYER                   (g_ns4_shape.n_layer)
 #define NS4_N_EMBD                    (g_ns4_shape.n_embd)
 #define NS4_N_VOCAB                   (g_ns4_shape.n_vocab)
@@ -738,18 +691,8 @@ static uint32_t ns4_layer_compress_ratio(uint32_t il) {
 
 static uint32_t ns4_expected_layer_compress_ratio(uint32_t il) {
     if (il >= NS4_N_LAYER) ns4_die("DeepSeek4 layer index is outside the loaded model layout");
-
-    switch (NS4_MODEL_VARIANT) {
-    case NS4_VARIANT_FLASH:
-        if (il < 2) return 0;
-        return (il & 1u) == 0 ? 4u : 128u;
-    case NS4_VARIANT_PRO:
-        if (il < 2) return 128u;
-        return (il & 1u) == 0 ? 4u : 128u;
-    default:
-        ns4_die("unsupported DeepSeek4 model variant");
-    }
-    return 0;
+    if (il < 2) return 0;
+    return (il & 1u) == 0 ? 4u : 128u;
 }
 
 static void ns4_die_errno(const char *what, const char *path) {
@@ -4668,17 +4611,6 @@ static void ns4_select_shape_from_metadata(
         g_ns4_shape = NS4_SHAPE_FLASH;
         return;
     }
-    if (ns4_shape_matches_metadata(&NS4_SHAPE_PRO,
-                                   n_layer, n_embd, n_vocab, n_head, n_head_kv,
-                                   n_head_dim, n_value_dim, n_rot, n_lora_q,
-                                   n_lora_o, n_out_group, n_expert,
-                                   n_expert_used, n_ff_exp, n_expert_shared,
-                                   n_hash_layer, n_swa, n_indexer_head,
-                                   n_indexer_head_dim, n_indexer_top_k, n_hc,
-                                   n_hc_sinkhorn_iter)) {
-        g_ns4_shape = NS4_SHAPE_PRO;
-        return;
-    }
 
     fprintf(stderr,
             "ns4: unsupported DeepSeek4 shape: layers=%u embd=%u heads=%u "
@@ -5050,45 +4982,9 @@ static void model_map_span_vec_append(ns4_model_map_span_vec *spans, uint64_t lo
     spans->v[spans->len++] = (ns4_model_map_span){lo, hi, isolate};
 }
 
-static uint32_t model_map_q4_pro_group_views(void) {
-    uint32_t views = 1;
-    const char *env = getenv("NS4_CUDA_Q4_PRO_MAP_GROUPS");
-    if (env && env[0]) {
-        char *end = NULL;
-        unsigned long v = strtoul(env, &end, 10);
-        if (end != env && *end == '\0' && v > 0 && v <= 384 && (384u % (uint32_t)v) == 0) {
-            views = (uint32_t)v;
-        }
-    }
-    return views;
-}
-
 static void model_map_span_vec_include_one(ns4_model_map_span_vec *spans, const ns4_tensor *t) {
     if (!t || t->bytes == 0) return;
     const uint64_t q4_isolated_min_bytes = 2ull * 1024ull * 1024ull * 1024ull;
-    const uint32_t q4_pro_group_views = model_map_q4_pro_group_views();
-    if (t->type == NS4_TENSOR_Q4_K &&
-        t->ndim == 3 &&
-        t->dim[2] == 384 &&
-        t->bytes >= q4_isolated_min_bytes &&
-        (t->bytes % q4_pro_group_views) == 0)
-    {
-        /*
-         * PRO Q4 routed expert tensors are too large to hide inside broad
-         * layer spans. Isolate them so the default selected-expert path does
-         * not stack large aliases on top of layer-sized model views. Optional
-         * group splits are enabled by NS4_CUDA_Q4_PRO_MAP_GROUPS for
-         * experiments that bind stable grouped views.
-         */
-        const uint64_t group_bytes = t->bytes / q4_pro_group_views;
-        if (group_bytes > spans->max_tensor_bytes) spans->max_tensor_bytes = group_bytes;
-        for (uint32_t i = 0; i < q4_pro_group_views; i++) {
-            const uint64_t lo = t->abs_offset + (uint64_t)i * group_bytes;
-            model_map_span_vec_append(spans, lo, lo + group_bytes, true);
-        }
-        return;
-    }
-
     uint64_t lo = UINT64_MAX, hi = 0;
     model_map_span_include_tensor(t, &lo, &hi, &spans->max_tensor_bytes);
     const bool isolate = (t->type == NS4_TENSOR_Q4_K ||
@@ -11001,7 +10897,7 @@ static uint32_t ns4_prefill_cap_for_prompt(int prompt_len,
                 cap = (uint32_t)v;
             }
         } else if (prompt_len > 4096) {
-            cap = NS4_MODEL_VARIANT == NS4_VARIANT_PRO ? 8192u : 4096u;
+            cap = 4096u;
         }
     }
 
@@ -17576,11 +17472,6 @@ static bool graph_attention_output_dense_quant_batch(
         const ns4_gpu_tensor *heads,
         uint32_t                n_tokens);
 
-static bool graph_use_pro_q4_cpu_router(void) {
-    static int cache = -1;
-    return graph_env_flag("NS4_CUDA_PRO_Q4_CPU_ROUTER", &cache);
-}
-
 static bool graph_use_streaming_iq2_cpu_router(void) {
     return getenv("NS4_CUDA_ENABLE_STREAMING_IQ2_CPU_ROUTER") != NULL &&
            getenv("NS4_CUDA_DISABLE_STREAMING_IQ2_CPU_ROUTER") == NULL;
@@ -17605,8 +17496,7 @@ static bool graph_use_cuda_selected_shared_overlap(const ns4_gpu_graph *g) {
 }
 
 static bool graph_q4_non_streaming_opt_in_enabled(void) {
-    return getenv("NS4_CUDA_ENABLE_Q4_SELECTED_EXPERT_VIEWS") != NULL ||
-           getenv("NS4_CUDA_ENABLE_PRO_Q4_SELECTED_EXPERT_VIEWS") != NULL;
+    return getenv("NS4_CUDA_ENABLE_Q4_SELECTED_EXPERT_VIEWS") != NULL;
 }
 
 static bool graph_q4_selected_paths_allowed(const ns4_gpu_graph *g) {
@@ -17638,12 +17528,6 @@ static bool graph_use_iq2_selected_async_early_commit(
 static bool graph_decode_cpu_router_applicable(
         const ns4_gpu_graph     *g,
         const ns4_layer_weights *layer) {
-    const bool pro_q4 =
-        NS4_MODEL_VARIANT == NS4_VARIANT_PRO &&
-        graph_use_pro_q4_cpu_router() &&
-        layer->ffn_gate_exps->type == NS4_TENSOR_Q4_K &&
-        layer->ffn_up_exps->type == NS4_TENSOR_Q4_K &&
-        layer->ffn_down_exps->type == NS4_TENSOR_Q4_K;
     const bool streaming_iq2 =
         g &&
         g->ssd_streaming &&
@@ -17658,7 +17542,7 @@ static bool graph_decode_cpu_router_applicable(
         !graph_env_present("NS4_CUDA_MOE_WRITE_CLAMPED_ACT") &&
         !graph_env_present("NS4_CUDA_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") &&
         !graph_env_present("NS4_CUDA_DISABLE_IQ2_SELECTED_EXPERT_VIEWS");
-    return pro_q4 || streaming_iq2;
+    return streaming_iq2;
 }
 
 static bool graph_decode_q4_selected_slots_expected(
@@ -17815,7 +17699,6 @@ static bool graph_decode_cpu_router(
         uint32_t                il,
         uint32_t                token) {
     const bool profile =
-        getenv("NS4_CUDA_PRO_Q4_CPU_ROUTER_PROFILE") != NULL ||
         getenv("NS4_CUDA_STREAMING_IQ2_CPU_ROUTER_PROFILE") != NULL;
     const double t0 = profile ? now_sec() : 0.0;
     if (ns4_gpu_end_commands() == 0) return false;
@@ -25743,7 +25626,7 @@ static bool graph_eval_token_raw_swa(
 
 static bool graph_streaming_decode_prefill_wide_default(
         const ns4_weights *weights) {
-    if (NS4_MODEL_VARIANT != NS4_VARIANT_FLASH || !weights || NS4_N_LAYER == 0) {
+    if (!weights || NS4_N_LAYER == 0) {
         return false;
     }
     const uint32_t type = weights->layer[0].ffn_gate_exps->type;
@@ -25771,10 +25654,6 @@ static uint32_t graph_streaming_decode_prefill_max_tokens(
         }
     }
 
-    if (NS4_MODEL_VARIANT != NS4_VARIANT_PRO &&
-        NS4_MODEL_VARIANT != NS4_VARIANT_FLASH) {
-        return 0u;
-    }
     return graph_streaming_decode_prefill_wide_default(weights) ? 64u : 18u;
 }
 
@@ -30397,7 +30276,7 @@ static uint32_t graph_raw_cap_for_context(int ctx_size, uint32_t prefill_cap) {
 }
 
 /* Choose the prefill ubatch size. Whole-batch is fastest for normal prompts.
- * Long Flash prompts default to 4096-token chunks; PRO defaults to 8192. */
+ * Long prompts default to 4096-token chunks. */
 static uint32_t graph_prefill_cap_for_prompt(int prompt_len,
                                                    uint32_t prefill_chunk) {
     return ns4_prefill_cap_for_prompt(prompt_len, prefill_chunk);
@@ -32355,7 +32234,7 @@ static int generate_raw_swa_cpu(
 
 
 /* GPU generation entry point.  The model runs as one local whole-graph
- * pipeline: graph prefill followed by graph decode steps.  Streaming PRO may
+ * pipeline: graph prefill followed by graph decode steps.  Streaming runs may
  * use decode-style prefill for short prompts. */
 static int generate_graph_raw_swa(
         const ns4_model   * model,
@@ -38258,7 +38137,7 @@ uint64_t ns4_engine_hidden_f32_values(ns4_engine *e) {
 
 int ns4_engine_model_id(ns4_engine *e) {
     (void)e;
-    return (int)NS4_MODEL_VARIANT;
+    return 0;
 }
 
 int ns4_engine_embd_dim(ns4_engine *e) {
@@ -40903,7 +40782,6 @@ static bool graph_session_batch_attn_pre_supported(
         int count,
         const ns4_weights *weights) {
     if (!items || count < 3 || !weights ||
-        NS4_MODEL_VARIANT != NS4_VARIANT_FLASH ||
         graph_use_reference_hc_decode() ||
         graph_use_reference_hc_norm_decode()) {
         return false;

@@ -2,9 +2,8 @@
   <img src="logo.svg" alt="DwarfStar logo" width="220">
 </p>
 
-**ns4** is a small native inference engine optimized first for
-**DeepSeek V4 Flash**. On very high-memory machines it also supports
-**DeepSeek V4 PRO**. It is self-contained and deliberately narrow,
+**ns4** is a small native inference engine for
+**DeepSeek V4 Flash**. It is self-contained and deliberately narrow,
 not a general GGUF runner. Model loading, prompt rendering, tool calls, KV
 state, and the HTTP server are built and tested together.
 The repository also includes tools and data for GGUF, imatrix, quality, and speed.
@@ -31,7 +30,7 @@ workstations. A model may be removed when a better replacement arrives.
 ## Motivations
 
 * Capable open-weight models now fit on high-end personal machines.
-* DeepSeek V4 Flash and PRO tolerate aggressive routed-expert quantization.
+* DeepSeek V4 Flash tolerates aggressive routed-expert quantization.
 * Compressed KV caches and fast local SSDs make long contexts practical.
 * The idea of an inference system specialized for a few models.
 
@@ -86,7 +85,7 @@ next sections.
 - [tools/gguf-tools/imatrix/dataset/README.md](tools/gguf-tools/imatrix/dataset/README.md):
   how the calibration prompt corpus is generated.
 - [tools/gguf-tools/quality-testing/README.md](tools/gguf-tools/quality-testing/README.md):
-  how local GGUFs are scored against official DeepSeek V4 Flash/PRO continuations.
+  how local GGUFs are scored against official DeepSeek V4 Flash continuations.
 - [tools/dir-steering/README.md](tools/dir-steering/README.md): directional
   steering data, vector generation, and usage.
 - [bench/README.md](bench/README.md): benchmark commands, charts, and CSV
@@ -114,7 +113,6 @@ Download one main model. **Prefer the imatrix versions.**
 ./scripts/download_model.sh ds4f-q2-q4   # q2 with the last 6 expert layers at q4
 ./scripts/download_model.sh ds4f-q4      # >= 256 GB RAM machines
 ./scripts/download_model.sh ds4f-mxfp4   # native MXFP4 experts, about 156 GB
-./scripts/download_model.sh pro-q2-imatrix  # 512 GB RAM machines, PRO q2 imatrix quant
 ```
 
 The MXFP4 GGUF preserves DeepSeek's released MXFP4 routed-expert weights rather
@@ -122,27 +120,16 @@ than requantizing them. Blackwell CUDA devices use
 native FP4 matrix instructions and FP4 activations for batched expert work.
 Decode and other CUDA devices use Q8 activations.
 
-For the full PRO Q4 distributed run, download one half on each machine:
-
-```sh
-./scripts/download_model.sh pro-q4-layers00-30      # first half of PRO Q4 split
-./scripts/download_model.sh pro-q4-layers31-output  # second half of PRO Q4 split
-```
-
 The script downloads from `https://huggingface.co/antirez/deepseek-v4-gguf`,
 stores files under `./gguf/`, resumes partial downloads with `curl -C -`, and
 updates `./ns4flash.gguf` to point at the selected main model.
-The `pro-q4-layers00-30`, `pro-q4-layers31-output`, and `pro-q4-split` targets
-download distributed PRO Q4 pieces and do not update `./ns4flash.gguf`.
 Authentication is optional for public downloads, but `--token TOKEN`,
 `HF_TOKEN`, or the local Hugging Face token cache are used when present.
 
 If you want to regenerate GGUF files or collect a new imatrix, see
 [tools/gguf-tools/README.md](tools/gguf-tools/README.md). Those tools are meant for offline
 model-building work and can take a long time on the full DeepSeek V4 Flash
-weights. Flash GGUF generation is supported by the local tools. PRO GGUF
-production currently still depends on the external `llama.cpp`-based workflow;
-native tooling can be added later.
+weights.
 
 Then build:
 
@@ -181,8 +168,7 @@ GGUF of about 5.6 GiB. It is not a standalone model. Download it once:
 
 The support file can be used with the 0731 Flash `ds4f-q2`, `ds4f-q2-q4`, and
 `ds4f-q4` models listed above. It is checkpoint-specific
-and must not be paired with an older Flash model. For now **DeepSeek V4 PRO**
-is not supported. The main model may be resident or use
+and must not be paired with an older Flash model. The main model may be resident or use
 `--ssd-streaming`; the support model still adds its own weights and runtime
 state to the memory requirement. DSpark replaces the legacy one-stage MTP
 support model for that run rather than stacking with it.
@@ -265,20 +251,6 @@ Start with the 2-bit Flash GGUF:
   --nothink
 ```
 
-PRO q2 streaming is experimental but usable for inspection and occasional work
-when you accept slow generation. Start with `--nothink`, then re-enable
-thinking with a conservative generation limit once the machine is stable:
-
-```sh
-./scripts/download_model.sh pro-q2-imatrix
-
-./ns4 \
-  -m gguf/DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix.gguf \
-  --ssd-streaming \
-  --ctx 32768 \
-  --nothink
-```
-
 ## Distributed inference with pipeline parallelism
 
 Pipeline parallelism lets ns4 **run a model that is too large for one machine** by
@@ -331,41 +303,20 @@ single-process to 24.67 t/s distributed, a 19.4% loss. Distributed inference is
 therefore mainly for fitting larger models and speeding up long prefills, not
 for making decode faster.
 
-### Full DeepSeek V4 PRO Q4 across two machines
+### Full 4-bit Flash across two machines
 
-The full-size PRO Q4 GGUF can be run across two 512 GB machines by giving the
-coordinator layers `0:30` and the worker
-`31:output`. Use the split GGUF files so each side maps only the tensors it
-needs:
+The 153 GB 4-bit Flash quant can be run across two 128 GB machines by
+splitting the layers, for example coordinator `0:19` and worker `20:output`.
+Both machines download the same GGUF; `--layers` makes each process map only
+its own slice:
 
 ```sh
-# Coordinator machine.
-./scripts/download_model.sh pro-q4-layers00-30
-
-# Worker machine.
-./scripts/download_model.sh pro-q4-layers31-output
+# Both machines.
+./scripts/download_model.sh ds4f-q4
 ```
 
-The two files are:
-
-```text
-gguf/DeepSeek-V4-Pro-Q4K-Layers00-30.gguf
-gguf/DeepSeek-V4-Pro-Q4K-Layers-31-output.gguf
-```
-
-This is a capacity use case: each process maps only its own half of the model,
+This is a capacity use case: each process maps only its own part of the model,
 while the worker owns the output head and returns logits.
-
-The PRO Q4 path uses queue-resident exact expert tables for the large routed
-experts. This avoids the broad multi-GiB routed-tensor bindings that made early
-distributed PRO Q4 attempts either run very slowly or hit backend memory
-accounting limits. In a short greedy smoke test over a direct
-gigabit-Ethernet link, the model generated coherent text and
-measured 11.47 t/s generation after startup. Per-token telemetry was balanced:
-local layers were around 39-43 ms, remote layers around 44-49 ms, for total
-token times around 84-92 ms. Expect a slow startup while each side maps and
-makes its half of the model resident. Long-context PRO Q4 prefill and decode
-performance still needs separate benchmarking.
 
 The measurements above use a Thunderbolt 5 cable. The implementation is plain
 TCP and also works over slower links, including WiFi, but fast Ethernet is
@@ -377,18 +328,18 @@ owns the output head and returns logits directly.
 Minimal two-host configuration:
 
 ```sh
-# Machine A: coordinator, owns tokenization, sampling, the prompt, and layers 0..30.
+# Machine A: coordinator, owns tokenization, sampling, the prompt, and layers 0..19.
 ./ns4 \
-  -m gguf/DeepSeek-V4-Pro-Q4K-Layers00-30.gguf \
+  -m ./ns4flash.gguf \
   --role coordinator \
-  --layers 0:30 \
+  --layers 0:19 \
   --listen 169.254.43.68 1234
 
-# Machine B: worker, connects to A and owns layers 31..output.
+# Machine B: worker, connects to A and owns layers 20..output.
 ./ns4 \
-  -m gguf/DeepSeek-V4-Pro-Q4K-Layers-31-output.gguf \
+  -m ./ns4flash.gguf \
   --role worker \
-  --layers 31:output \
+  --layers 20:output \
   --coordinator 169.254.43.68 1234
 ```
 
@@ -803,13 +754,12 @@ Supported endpoints:
 
 - `GET /v1/models`
 - `GET /v1/models/deepseek-v4-flash`
-- `GET /v1/models/deepseek-v4-pro`
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
 - `POST /v1/completions`
 - `POST /v1/messages`
 
-The Flash and PRO model endpoints are compatibility aliases. They both report
+The Flash model endpoint is a compatibility alias. It reports
 the model currently loaded from the GGUF passed with `-m`; the endpoint name does
 not select a different model.
 
@@ -858,7 +808,7 @@ explicitly when remote machines should be able to connect.
 
 ### Tool call handling and canonicalization
 
-DeepSeek V4 emits tool calls as [DSML text](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/encoding/README.md). Agent clients do not send that
+DeepSeek V4 emits tool calls as [DSML text](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/encoding/README.md). Agent clients do not send that
 same text back on the next request: they send normalized OpenAI/Anthropic JSON
 tool-call objects. **If the server re-rendered those objects slightly
 differently, the rendered byte prefix would no longer match the live KV

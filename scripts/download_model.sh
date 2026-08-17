@@ -6,9 +6,6 @@ DS4F_Q2_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatri
 DS4F_Q4_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf"
 DS4F_MXFP4_FILE="DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf"
 DS4F_Q2_Q4_FILE="DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf"
-PRO_Q2_IMATRIX_FILE="DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix.gguf"
-PRO_Q4_LAYERS00_30_FILE="DeepSeek-V4-Pro-Q4K-Layers00-30.gguf"
-PRO_Q4_LAYERS31_OUTPUT_FILE="DeepSeek-V4-Pro-Q4K-Layers-31-output.gguf"
 DS4F_DSPARK_FILE="DeepSeek-V4-Flash-DSpark-support-0731.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -29,10 +26,6 @@ Usage:
   ./download_model.sh ds4f-q4 [--token TOKEN]
   ./download_model.sh ds4f-mxfp4 [--token TOKEN]
   ./download_model.sh ds4f-dspark [--token TOKEN]
-  ./download_model.sh pro-q2-imatrix [--token TOKEN]
-  ./download_model.sh pro-q4-layers00-30 [--token TOKEN]
-  ./download_model.sh pro-q4-layers31-output [--token TOKEN]
-  ./download_model.sh pro-q4-split [--token TOKEN]
 
 Targets:
 
@@ -59,23 +52,6 @@ Targets:
        Optional DSpark speculative decoding support GGUF for Flash 0731, about
        6 GB. Enable it with --dspark and --mtp when running ns4 or ns4-server.
 
-  pro-q2-imatrix
-       DeepSeek V4 PRO q2 imatrix quant, as a single GGUF file. About 430 GB
-       on disk; intended for 512 GB RAM machines.
-
-  pro-q4-layers00-30
-       First half of the DeepSeek V4 PRO Q4 routed-expert quant, layers 0..30.
-       Use on the coordinator in a two-Mac-Studio distributed run. About 426 GB.
-
-  pro-q4-layers31-output
-       Second half of the DeepSeek V4 PRO Q4 routed-expert quant, layers
-       31..output. Use on the worker in a two-Mac-Studio distributed run.
-       About 412 GB.
-
-  pro-q4-split
-       Downloads both PRO Q4 split files into the download directory. About
-       838 GB total. This target does not update ./ns4flash.gguf.
-
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
                  cache is used if present.
@@ -94,9 +70,8 @@ Then the default commands work:
 After downloading DSpark support, enable it explicitly in greedy mode:
   ./ns4 --dspark --mtp <download directory>/$DS4F_DSPARK_FILE --temp 0
 
-PRO files are downloaded with the official Hugging Face downloader
-because they are too large, sharded, or nested for the curl path used by the
-smaller DeepSeek Flash GGUF files.
+The ds4f-mxfp4 file is downloaded with the official Hugging Face downloader
+instead of the curl path used by the other Flash GGUF files.
 EOF
 }
 
@@ -107,7 +82,6 @@ fi
 
 MODEL=$1
 shift
-MODEL_FILES=
 LINK_MODEL=1
 FORCE_HF_DOWNLOAD=0
 FLATTEN_DOWNLOADS=0
@@ -118,13 +92,6 @@ case "$MODEL" in
     ds4f-q4) MODEL_FILE=$DS4F_Q4_FILE ;;
     ds4f-mxfp4) MODEL_FILE=$DS4F_MXFP4_FILE; FORCE_HF_DOWNLOAD=1 ;;
     ds4f-dspark) MODEL_FILE=$DS4F_DSPARK_FILE; LINK_MODEL=0 ;;
-    pro-q2-imatrix) MODEL_FILE=$PRO_Q2_IMATRIX_FILE ;;
-    pro-q4-layers00-30) MODEL_FILE=$PRO_Q4_LAYERS00_30_FILE; LINK_MODEL=0 ;;
-    pro-q4-layers31-output) MODEL_FILE=$PRO_Q4_LAYERS31_OUTPUT_FILE; LINK_MODEL=0 ;;
-    pro-q4-split)
-        MODEL_FILES="$PRO_Q4_LAYERS00_30_FILE $PRO_Q4_LAYERS31_OUTPUT_FILE"
-        LINK_MODEL=0
-        ;;
     -h|--help|help)
         usage
         exit 0
@@ -163,14 +130,7 @@ needs_hf_download() {
     if [ "${FORCE_HF_DOWNLOAD:-0}" -eq 1 ]; then
         return 0
     fi
-    case "$1" in
-        "$PRO_Q2_IMATRIX_FILE"|"$PRO_Q4_LAYERS00_30_FILE"|"$PRO_Q4_LAYERS31_OUTPUT_FILE")
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
-    esac
+    return 1
 }
 
 find_hf_command() {
@@ -285,22 +245,12 @@ download_one() {
     mv "$part" "$out"
 }
 
-if [ -n "$MODEL_FILES" ]; then
-    for file in $MODEL_FILES; do
-        download_one "$file"
-    done
-else
-    download_one "$MODEL_FILE"
-fi
+download_one "$MODEL_FILE"
 
 if [ "$MODEL" = "ds4f-dspark" ]; then
     echo
     echo "DSpark support downloaded. Enable it explicitly in greedy mode:"
     echo "  ./ns4 --dspark -m ./ns4flash.gguf --mtp $OUT_DIR/$DS4F_DSPARK_FILE --temp 0"
-elif [ "$MODEL" = "pro-q4-layers00-30" ] || [ "$MODEL" = "pro-q4-layers31-output" ] || [ "$MODEL" = "pro-q4-split" ]; then
-    echo
-    echo "Downloaded PRO Q4 distributed split file(s). Use them with --layers,"
-    echo "for example coordinator layers 0:30 and worker layers 31:output."
 elif [ "$LINK_MODEL" -eq 1 ]; then
     cd "$ROOT"
     ln -sfn "$OUT_DIR/$MODEL_FILE" ns4flash.gguf
