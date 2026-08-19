@@ -98,7 +98,7 @@ When upstream lands a bugfix or perf improvement we want, the procedure is:
 
 ```sh
 cd /tmp/llama-research && git fetch && git checkout <NEW_COMMIT>
-cd /Users/ent/code/ns4-mmq-lift/cuda/mmq
+cd <ns4-checkout>/src/cuda/mmq
 cp /tmp/llama-research/ggml/src/ggml-cuda/{mmq.cuh,mma.cuh,vecdotq.cuh,quantize.cuh,quantize.cu,mmid.cuh,mmid.cu,common.cuh} .
 cp /tmp/llama-research/ggml/src/ggml-common.h .
 cp /tmp/llama-research/ggml/src/ggml-cuda/vendors/cuda.h vendors/
@@ -144,9 +144,7 @@ default `NS4_CUDA_MMQ_MOE_MIN_TOKENS=2` (legacy decode preserved):
 | 16384  | 357.99          | 1001.29    | **2.80x**  | 38.71            | 37.86       | 0.978x    |
 
 Sustained ~2.80x prefill speedup across the swept context range; gen
-within 2.5% of baseline (run-to-run variance).  See `local/docs/`
-(auto-round companion repo) for the full Phase 0-7 execution log,
-parity-test output, and detailed plan.
+within 2.5% of baseline (run-to-run variance).
 
 ## ns4 local rename
 

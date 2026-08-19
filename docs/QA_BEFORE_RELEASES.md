@@ -3,24 +3,21 @@
 This is the release gate for ns4.  Run it before tagging or pushing a
 release build.  The goal is not to prove every code path exhaustively; it is to
 exercise the paths that have historically regressed: CUDA graph inference,
-SSD streaming, distributed execution, disk KV cache, server APIs, and the
-agent TUI/tool state machine.
+SSD streaming, distributed execution, disk KV cache, and server APIs.
 
 Do not run multiple huge model processes at the same time.  Record the commit,
 hardware, GGUF file, context size, and any non-default flags for every manual
 run.
 
-Preferred release test hosts:
+Release test hardware:
 
-- CUDA / DGX Spark: `<user>@<cuda-host>`.
+- Primary: a single RTX PRO 6000 Blackwell class GPU (local).
+- Experimental: DGX Spark / GB10.
+- Optional: a multi-GPU CUDA host for the tensor-parallel gates, when one is
+  available.
 
-`<permission-only-host>` is permission-only. Never connect to it for QA, stop or start
-its server, build there, or run tests or benchmarks there without asking
-Salvatore and receiving explicit permission for that specific QA pass. Earlier
-permission does not carry over to later work.
-
-The CUDA hosts are in a remote lan reachable through the VPN active in this
-system.
+Ask before running QA on any remote or shared host, and ask again for each
+new QA pass; earlier permission does not carry over.
 
 ## 1. Repository And Build Sanity
 
@@ -34,14 +31,13 @@ system.
   complete output and require no `warning:` or NVCC `warning #` lines. Fix the
   source when possible; use a narrow target-specific suppression only when a
   test deliberately compiles a partial translation unit.
-- Repeat the warning-free build gate on the release hardware:
-  `make clean && make cuda-spark` on DGX Spark,
-  `make clean && make cuda-generic CUDA_HOME=/usr` on the multi-GPU CUDA host
-  only after receiving permission for `<permission-only-host>`.
+- Repeat the warning-free build gate on every validated release target:
+  `make clean && make cuda CUDA_ARCH=sm_120` on the primary host and
+  `make clean && make cuda-spark` on DGX Spark.
 - Run whitespace checks before committing:
   `git diff --check`.
-- Confirm `./ns4 --help`, `./ns4-server --help`, and `./ns4-agent --help` render
-  cleanly, with readable section colors and no broken wrapping.
+- Confirm `./ns4 --help` and `./ns4-server --help` render cleanly, with
+  readable section colors and no broken wrapping.
 
 ## 2. Core Regression Tests
 
@@ -112,10 +108,7 @@ numbers in the QA report so omissions are visible.
     APIs. A complete tool block inside unclosed reasoning must be recovered
     once, preceding prose must remain reasoning, and no synthetic continuation
     may be generated.
-13. Run `./ns4_agent_test` under ASan with agent-cache strings whose declared
-    lengths exceed the remaining file. Loading must fail without allocating
-    the declared size, and a valid cache must still load.
-14. Run the server parser tests under UBSan with `NaN`, positive infinity, and
+13. Run the server parser tests under UBSan with `NaN`, positive infinity, and
     negative infinity where integer JSON fields are expected. Conversion must
     be defined and clamped, with no sanitizer report.
 
@@ -127,7 +120,7 @@ teacher-forced continuation checks against hosted-model output and API
 top-logprob slices, so do not replace them with one sampled chat answer.
 
 - Build the scorer:
-  `make -C gguf-tools quality-score`.
+  `make -C tools/gguf-tools quality-score`.
 - Match every Flash GGUF to the fixture captured from the same checkpoint.
   The current release checkpoint is 0731 and uses
   `tests/test-vectors/flash-0731/`; the older undated GGUF uses the preserved
@@ -161,7 +154,6 @@ top-logprob slices, so do not replace them with one sampled chat answer.
   API top-1/pair-order regression as a blocker unless the release notes call out
   an intentional quality tradeoff.
 - Keep the raw `summary` and `api_summary` lines in the release notes or QA log.
-  Do not use stale manifests from `misc/` as release evidence.
 
 ## 4. Flash Path
 
@@ -253,35 +245,30 @@ SSD streaming is a capacity path, so test both correctness and user experience.
 
 ## 6. CUDA / DGX Spark
 
-Before a release, ask the user for CUDA access if it is not already configured.
-Use the DGX Spark / GB10 host `<user>@<cuda-host>`.  Do not claim CUDA is
-release-ready without this pass.
+Do not claim a CUDA target is release-ready without this pass on that target.
 
-- Fetch or push the exact release commit to the CUDA machine.
+- Fetch or push the exact release commit to the target machine.
 - Build:
   `make clean && make cuda-spark`.
-- Require both the DGX Spark build and the eight-GPU CUDA build to complete
-  without compiler warnings. The eight-GPU build is performed only after
-  receiving explicit permission to use `<permission-only-host>` for this QA pass.
+- Require every validated CUDA build to complete without compiler warnings.
 - Run:
   `make cuda-regression`.
 - For native MXFP4 changes, run
-  `make test-mxfp4-cuda CUDA_ARCH=native` on the multi-GPU CUDA host only after
-  receiving explicit permission for `<permission-only-host>`, and
+  `make test-mxfp4-cuda CUDA_ARCH=native` on the primary host and
   `make test-mxfp4-cuda CUDA_ARCH=sm_121` on DGX Spark. Dense MMQ, routed MMQ,
   routed MMVQ, fused gate/up, and fused down must pass. The Spark run must also
   pass the Blackwell K-tile guard. This synthetic parity test does not replace
   full-model continuation scoring.
-- With that permission, run the native MXFP4 GGUF resident on the multi-GPU
-  host, and run it with `--ssd-streaming` on DGX Spark. Use the same greedy prompt and continuation
+- Run the native MXFP4 GGUF resident where it fits, and run it with
+  `--ssd-streaming` on DGX Spark. Use the same greedy prompt and continuation
   fixture on both. Record prefill and generation speed, require finite logits,
   and compare quality with the resident MXFP4 result. Blackwell MMQ quantizes
   activations to native FP4 for batched work; decode MMVQ keeps Q8 activations,
   so quality must be checked rather than inferred from kernel-only parity.
 - Run a short CLI prompt with the Flash GGUF and record generation t/s.
 - Run a longer prompt that exercises routed experts past a few thousand tokens.
-- With explicit permission for this QA pass, run the full-vocabulary decode
-  oracle on the eight-GPU CUDA host:
+- When a multi-GPU CUDA host is available, run the full-vocabulary decode
+  oracle there:
   `NS4_TEST_MODEL=/path/to/flash.gguf make test-cuda-session-batch`.
   Preserve the per-batch timing for 2, 4, and 8 rows and require
   `nonexact_logits=0`. Run the released Q4 file and the reduced-precision Q2
@@ -289,8 +276,8 @@ release-ready without this pass.
   MoE shapes must retain the ordered exact fallback.
 - With CUDA TP attention enabled, compatible Q4 runs must use grouped
   attention-core, QKV, KV-store, and attention-post by default and remain
-  full-vocabulary exact against isolated decode. On the eight-L40S host, the
-  16-row decode step must remain above 110 aggregate tokens/s. Repeat once with
+  full-vocabulary exact against isolated decode. The 16-row decode step must
+  not regress against the host's recorded baseline. Repeat once with
   `NS4_CUDA_TP_ATTN=0` only as rollback coverage; it is not the production
   configuration.
 - Run native mixed prefill/decode at the default frontier and at compressed
@@ -299,17 +286,17 @@ release-ready without this pass.
   `NS4_TEST_CONTEXT=4096 NS4_TEST_MIXED_INITIAL=2048 NS4_TEST_MIXED_ROUNDS=8
   NS4_TEST_MODEL=/path/to/flash.gguf make test-cuda-mixed-batch`.
   Every round must report exact logits and `mode=native`; a serialized fallback
-  is a failure for the eight-GPU TP/EP topology. Under CUDA TP attention, the
+  is a failure for the multi-GPU TP/EP topology. Under CUDA TP attention, the
   native mixed step must use the same exact grouped decode stages when their
   capability checks pass; record correctness and speedup separately. Also
   force an 800-row prefill quantum with
   `NS4_TEST_ALLOW_FALLBACK=1`; it must report the serialized safety fallback.
-- With explicit permission for the eight-GPU host, start `ns4-server` with 8
+- On the multi-GPU host, start `ns4-server` with 8
   and 16 batched sessions and issue at least that many simultaneous requests
   with mixed prompt lengths. Verify no session mix-up, deadlock, or starvation
   and record aggregate generation throughput.
 - On DGX Spark, verify the same public batch API and server concurrency use the
-  single-GPU fallback without creating peer-only TP/EP state. The eight-GPU
+  single-GPU fallback without creating peer-only TP/EP state. The multi-GPU
   native oracle is not a valid Spark test because its topology is intentionally
   unavailable there.
 - If CUDA Q4, distributed, streaming hooks, tensor span loading, or model cache
@@ -341,8 +328,6 @@ Disk KV cache bugs are high impact for server users.
   not evicted and useful anchors are retained.
 - Test rejection of incompatible checkpoints when model, quantization, context,
   or raw/compressed KV layout changes.
-- Test stripped agent sessions: `/strip <id>` then `/switch <id>` should rebuild
-  by prefill and render sane history.
 
 ## 9. Server APIs
 
@@ -353,46 +338,14 @@ clients.
 - Test OpenAI chat completion, OpenAI Responses, and Anthropic messages.
 - Test SSE streaming with thinking enabled and disabled.
 - Test keepalive during long prefill and confirm clients do not time out.
-- Only after receiving explicit permission for this QA pass, start
-  `ns4-server` on the eight-L40S CUDA TP target with the release TP options and
-  verify all 16 100k-context sessions allocate. Startup must report a
-  2048-token prefill cap; a silent fallback to 4096 is an OOM regression.
+- When a multi-GPU CUDA TP host is available, start `ns4-server` with the
+  release TP options and verify all 16 100k-context sessions allocate.
+  Startup must report a 2048-token prefill cap; a silent fallback to 4096 is
+  an OOM regression.
 - Test `--trace` and confirm rendered prompts, cache decisions, generated text,
   and tool-parser events are useful without leaking unrelated state.
 
-## 10. ns4-agent
-
-The agent is the most stateful component.  Test it manually, not only by build.
-
-- Startup banner, status bar, help, `/power`, `/save`, `/list`, `/switch`,
-  `/history`, `/compact`, `/new`, `/del`, and `/strip`.
-- Ctrl+C during generation, during prefill, during a web fetch, and during a
-  long tool call.  After `Stopped by user`, typing a new prompt must work.
-- Queue messages while the model is busy.  Queued messages must not skip tool
-  execution; after tool results, the queued user text must be provided.
-- Read/search/edit/write tools:
-  create a temp project, ask for edits, verify old/new and `[upto]` anchored
-  edits fail safely on ambiguous matches and do not require retyping whole files.
-- Real coding edit loop:
-  delete `/tmp/mymandel`, ask ns4-agent to create a small C ASCII Mandelbrot
-  program there, build and run it, then in a second user turn ask for a small
-  modification that should naturally use the edit tool, such as changing the
-  ASCII character ramp or output dimensions.  Verify the agent edits the
-  existing file instead of rewriting the whole project, and that the final
-  program still builds and runs.
-- Bash tools:
-  test short output, large output truncation, non-zero exit output, long-running
-  jobs, `bash_status`, and `bash_stop`.
-- Web tools:
-  `google_search` and `visit_page` should ask for visible Chrome approval with
-  timeout, open pages without stealing focus when possible, extract Markdown,
-  close tabs, and handle consent/privacy walls as tool errors the model can see.
-- TUI:
-  test multiline prompt editing, history navigation, queued prompt display,
-  status bar fill to terminal width, syntax highlighting in Markdown/code blocks,
-  and SSH/remote terminal flicker.
-
-## 11. Download Script And Model Files
+## 10. Download Script And Model Files
 
 - Test `download_model.sh` in a temporary directory so local weights are not
   overwritten.
@@ -401,7 +354,7 @@ The agent is the most stateful component.  Test it manually, not only by build.
 - Verify legacy removed targets fail clearly.
 - Verify README model names match the script and Hugging Face repository.
 
-## 12. Performance And Power
+## 11. Performance And Power
 
 - Run `ns4-bench` on the release machine and compare with tracked CSV baselines.
 - Test `--power 100` is not throttled.
@@ -410,7 +363,7 @@ The agent is the most stateful component.  Test it manually, not only by build.
 - Confirm context buffer size, raw KV rows, compressed KV rows, and mmap behavior
   match expectations for 32k, 100k, and any release-advertised context size.
 
-## 13. Speed Regression
+## 12. Speed Regression
 
 Performance is a release gate. A correct result that is unexpectedly much
 slower still needs an explanation before release.
@@ -428,7 +381,7 @@ tests, record aggregate and per-session decode speed.
   to detect a context-dependent regression.
 - Compare startup time and peak memory as well as tokens per second when model
   loading, caches, streaming, or temporary arenas changed.
-- Run the backend-specific batch tests in sections 4 and 8. Fast single-session
+- Run the backend-specific batch tests in sections 4 and 6. Fast single-session
   decode does not substitute for aggregate multi-session throughput.
 
 These are the last known good observations available when this gate was added.
@@ -437,17 +390,13 @@ claims across different models or contexts.
 
 | System and backend | Model and workload | Prefill | Decode |
 | --- | --- | ---: | ---: |
-| DGX Spark GB10, CUDA | Flash q2, 7,047-token prompt | 343.81 t/s | 13.75 t/s |
-| 8x L40S, CUDA TP | Flash q4, 2,048-token prefill benchmark | 1,524.84 t/s | 46.93 t/s |
-| 8x L40S, CUDA TP | Flash q4, 16-row decode oracle | - | 126.0 aggregate t/s |
+| RTX PRO 6000 Blackwell, CUDA | Flash q2 imatrix 0731, ctx 131,072, tuned serving config | ~3,400 t/s | 74.9 t/s |
 
-The 8x L40S values are retained from the last recorded run on `<permission-only-host>`.
-They are historical references only: never connect to that host or interrupt
-its production server without explicit permission for the current QA pass. If
-permission is granted, the existing hard floor remains 110 aggregate t/s for
-the 16-row decode oracle.
+The RTX PRO 6000 row uses the tuned launcher configuration in
+`scripts/run-cuda-436k-server.sh`; compare against it with the same
+environment exports.
 
-## 14. Release Sign-off
+## 13. Release Sign-off
 
 Do not sign off until:
 
@@ -460,7 +409,6 @@ Do not sign off until:
   release target that was validated.
 - Disk KV cache was exercised.
 - Server API streaming was exercised.
-- Agent interruption and tool loops were exercised manually.
 - The speed-regression gate passed on every validated backend, with any skipped
   baseline or intentional slowdown documented.
 - CUDA native decode and mixed batching passed, including the forced fallback

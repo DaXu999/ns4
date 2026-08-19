@@ -29,11 +29,11 @@ For the tracked DeepSeek V4 Flash 0731 fixture:
 
 ```sh
 export DEEPSEEK_API_KEY=...
-python3 gguf-tools/quality-testing/collect_official.py \
+python3 tools/gguf-tools/quality-testing/collect_official.py \
   --model deepseek-v4-flash \
   --endpoint https://api.deepseek.com/chat/completions \
-  --prompts gguf-tools/quality-testing/prompts.jsonl \
-  --out gguf-tools/quality-testing/data/flash \
+  --prompts tools/gguf-tools/quality-testing/prompts.jsonl \
+  --out tools/gguf-tools/quality-testing/data/flash \
   --count 100 \
   --max-tokens 24 \
   --top-logprobs 20 \
@@ -41,26 +41,32 @@ python3 gguf-tools/quality-testing/collect_official.py \
   --reasoning-effort omit
 ```
 
+## 3. Build The Scorers
+
+```sh
+make -C tools/gguf-tools quality-score
+```
+
 The scorer links against the NS4 runtime and uses CUDA by default.
 
 Build the optional llama.cpp control scorer with:
 
 ```sh
-make -C gguf-tools quality-llama-score
+make -C tools/gguf-tools quality-llama-score
 ```
 
 ## 4. Score GGUF Variants
 
 ```sh
-gguf-tools/quality-testing/score_official \
-  ../deepseek-v4-quants/gguf/OLD.gguf \
-  gguf-tools/quality-testing/data/flash/manifest.tsv \
+tools/gguf-tools/quality-testing/score_official \
+  /path/to/OLD.gguf \
+  tools/gguf-tools/quality-testing/data/flash/manifest.tsv \
   /tmp/old.tsv \
   4096
 
-gguf-tools/quality-testing/score_official \
-  ../deepseek-v4-quants/gguf/NEW.gguf \
-  gguf-tools/quality-testing/data/flash/manifest.tsv \
+tools/gguf-tools/quality-testing/score_official \
+  /path/to/NEW.gguf \
+  tools/gguf-tools/quality-testing/data/flash/manifest.tsv \
   /tmp/new.tsv \
   4096
 ```
@@ -74,9 +80,9 @@ independent llama.cpp comparison of a DeepSeek V4 GGUF, use the same manifest
 and the token-identical NS4 prompt renderer:
 
 ```sh
-gguf-tools/quality-testing/score_llama \
+tools/gguf-tools/quality-testing/score_llama \
   /path/to/model.gguf \
-  gguf-tools/quality-testing/data/flash/manifest.tsv \
+  tools/gguf-tools/quality-testing/data/flash/manifest.tsv \
   /tmp/llama.tsv \
   4096 \
   deepseek-ns4
@@ -86,9 +92,9 @@ For a full-residency vs SSD-streaming comparison, score the same model twice and
 add the streaming flags to one run:
 
 ```sh
-gguf-tools/quality-testing/score_official \
+tools/gguf-tools/quality-testing/score_official \
   /path/to/model.gguf \
-  gguf-tools/quality-testing/data/flash/manifest.tsv \
+  tools/gguf-tools/quality-testing/data/flash/manifest.tsv \
   /tmp/streaming.tsv \
   4096 \
   --ssd-streaming
@@ -97,7 +103,7 @@ gguf-tools/quality-testing/score_official \
 ## 5. Compare
 
 ```sh
-python3 gguf-tools/quality-testing/compare_scores.py /tmp/old.tsv /tmp/new.tsv
+python3 tools/gguf-tools/quality-testing/compare_scores.py /tmp/old.tsv /tmp/new.tsv
 ```
 
 Output fields:

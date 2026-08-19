@@ -3,6 +3,10 @@
 DeepSeek-V4-Flash IQ2XXS, 43 layers, single-token decode. Prefill is untouched
 by everything here.
 
+Commit hashes cited below (`8890139`, `a71fc64`, `acf4a5e`, `4a5a6e7`,
+`12072a0`) refer to the ancestor ds4 history and are not reachable from this
+repository; the measurements and conclusions carry over unchanged.
+
 Originally measured 2026-08-06 at `8890139`; sections 1, 3 and 6 were
 re-measured 2026-08-12 at `a71fc64` and several of the original conclusions
 turned out to be wrong. Where that happened the old claim is kept and marked,
@@ -124,7 +128,7 @@ caller, so for this model's decode the live path was
 `attention_decode_score_split_*`, which materialises the whole
 `[n_head x n_score]` score matrix to global memory and reads KV twice.
 
-`cuda/flash2_decode.cuh` (FA2: heads on the MMA M axis, fp16 `m16n8k16` tensor
+`src/cuda/flash2_decode.cuh` (FA2: heads on the MMA M axis, fp16 `m16n8k16` tensor
 cores, online softmax, no score materialisation) now serves **both** decode
 callers as of `12072a0`, and `attention_decode_score_split_*` no longer appears
 in decode at all. 25.0 us -> 12.5 us of kernel + 7.1 us of combine per layer.

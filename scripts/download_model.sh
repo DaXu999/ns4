@@ -36,7 +36,7 @@ Targets:
   ds4f-q2-q4
        Mixed Flash quant: mostly q2 routed experts, with the last 6 layers
        using q4 routed experts. About 98 GB on disk. Good for higher
-       quality inference for 128 GB MacBooks. Works on DGX Spark but loading
+       quality inference on 128 GB machines. Works on DGX Spark but loading
        may struggle compared to ds4f-q2.
 
   ds4f-q4

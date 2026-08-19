@@ -1,8 +1,9 @@
 # Agent Notes
 
-`ns4.c` is a DeepSeek V4 Flash specific inference engine. It is not a generic
-GGUF runner. The goal is a small, readable, high-performance C codebase with
-CUDA kernels in `ns4_cuda.cu`.
+ns4 (NEUTRON STAR) is a lightning speed CUDA optimized inference engine and
+server for DeepSeek V4 Flash, a rework of the original ds4 project. It is not
+a generic GGUF runner. The goal is a small, readable, high-performance C
+codebase with CUDA kernels in `src/ns4_cuda.cu`.
 
 ## Goals
 
@@ -55,5 +56,5 @@ At every major change where one of the following could be affected, make sure to
 
 1. Test the normal CUDA path and that speed is still at the level it was.
 2. Test the SSD streaming path.
-3. Test the distributed inference if it could be affected, but ask the user before doing so.
-4. If the change could affect a remote CUDA host, ask the user for access before testing there.
+3. Test the distributed inference if it could be affected.
+4. Ask the user before testing on any remote or shared host.

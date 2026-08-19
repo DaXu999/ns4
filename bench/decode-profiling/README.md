@@ -44,19 +44,19 @@ chain lengths from 4 to 1600 (a decode token). Shows the ~8x amortisation.
 ## fd_bench.cu / fd_sweep.cu - the shipped flash decode kernel
 
 Both `#include "fd_baseline.inc"`, which is extracted verbatim from
-`ns4_cuda.cu` so the comparison stays honest:
+`src/ns4_cuda.cu` so the comparison stays honest:
 
-    sed -n '9635,9640p' ns4_cuda.cu  > fd_baseline.inc
-    sed -n '9666,9713p' ns4_cuda.cu >> fd_baseline.inc
-    sed -n '9715,9888p' ns4_cuda.cu >> fd_baseline.inc
+    sed -n '9635,9640p' src/ns4_cuda.cu  > fd_baseline.inc
+    sed -n '9666,9713p' src/ns4_cuda.cu >> fd_baseline.inc
+    sed -n '9715,9888p' src/ns4_cuda.cu >> fd_baseline.inc
 
-(line numbers as of `8890139`; re-extract if the kernel moves). `fd_sweep`
+(line numbers as of ancestor-ds4 `8890139`; re-extract if the kernel moves). `fd_sweep`
 walks the kernel's `<WARPS, TILE>` template parameters and the rows-per-split
 launch parameter. `TILE=32` exceeds the 48 KB static shared-memory cap.
 
 ## fd2_bench.cu - the FA2 kernel
 
-Validates `cuda/flash2_decode.cuh` against the shipped kernel (same inputs,
+Validates `src/cuda/flash2_decode.cuh` against the shipped kernel (same inputs,
 same combine semantics) and reports max relative error, relative L2, and a
 main/combine time split. `--split=N` sweeps the KV-row split; `--pos=N` moves
 the sequence position, which sets how many rows the geometry selects.
@@ -69,8 +69,8 @@ Shapes are hardcoded to DeepSeek-V4-Flash: 64 heads, 512-wide latent,
 Times `attention_flash_decode_combine_kernel` against the shape it replaced,
 and `memcmp`s their outputs to hold the "bit-identical" claim honest. The
 production kernel is `#include`d from `fd_combine.inc` (extracted verbatim from
-`ns4_cuda.cu`, recipe in the file header); the pre-rewrite control is frozen in
-the bench, since it is no longer in `ns4_cuda.cu` to extract.
+`src/ns4_cuda.cu`, recipe in the file header); the pre-rewrite control is frozen
+in the bench, since it is no longer in `src/ns4_cuda.cu` to extract.
 
     nvcc -O3 -arch=sm_120 -o fd_combine_bench fd_combine_bench.cu
     ./fd_combine_bench              # L2-warm, as in real decode
@@ -141,7 +141,7 @@ clock averaging 1760 MHz.
 Times the shipped chunked-bitonic selection against a radix select at the live
 decode shape (`n_comp` 8202, `top_k` 512, one token) and at the frontiers a
 long context reaches. Baselines are `#include`d from `topk_baseline.inc`,
-extracted verbatim from `ns4_cuda.cu` (recipe in the file header).
+extracted verbatim from `src/ns4_cuda.cu` (recipe in the file header).
 
     nvcc -O3 -arch=sm_120 -o topk_bench topk_bench.cu
     ./topk_bench --n=16394          # ctx 65536

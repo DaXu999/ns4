@@ -1,12 +1,12 @@
-# DS4 Imatrix Calibration Dataset
+# NS4 Imatrix Calibration Dataset
 
-This directory contains DS4-rendered chat prompts for collecting activation
+This directory contains NS4-rendered chat prompts for collecting activation
 statistics before building new low-bit GGUF files.
 
 Run:
 
 ```sh
-python3 gguf-tools/imatrix/dataset/build_ds4_imatrix_dataset.py
+python3 tools/gguf-tools/imatrix/dataset/build_ds4_imatrix_dataset.py
 ```
 
 Generated files:
@@ -28,7 +28,7 @@ Some records include DSML tool schemas, sampled DSML tool calls, and tool-result
 turns so the imatrix sees the same special-token patterns used by agent clients.
 The corpus is provider-neutral and also includes language/prose rewriting,
 summarization, copy-editing, extraction, multilingual translation, programming
-prompts, Bash scripting, algorithm recall, `ds4-eval` benchmark-reasoning
+prompts, Bash scripting, algorithm recall, `ns4-eval` benchmark-reasoning
 prompts, long-context code synthesis, agent transcript replay, log diagnosis,
 prose fact recovery, delayed-constraint and small needle tasks, CUDA/C code
 review tasks, and inference-specific debugging tasks.

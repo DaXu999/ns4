@@ -17,7 +17,7 @@ The important pieces are:
 ## Build
 
 ```sh
-make -C gguf-tools
+make -C tools/gguf-tools
 ```
 
 The quantizer is plain C and does not link GGML.  GGUF metadata handling,
@@ -187,7 +187,7 @@ See `quality-testing/README.md`.  The short version is:
 
 ```sh
 python3 tools/gguf-tools/quality-testing/collect_official.py
-make -C gguf-tools quality-score
+make -C tools/gguf-tools quality-score
 tools/gguf-tools/quality-testing/score_official MODEL.gguf tools/gguf-tools/quality-testing/data/flash/manifest.tsv /tmp/model.tsv 4096
 python3 tools/gguf-tools/quality-testing/compare_scores.py /tmp/old.tsv /tmp/new.tsv
 ```

@@ -38,12 +38,12 @@ more explanatory.
 Build the vector:
 
 ```sh
-python3 dir-steering/tools/build_direction.py \
+python3 tools/dir-steering/tools/build_direction.py \
   --ns4 ./ns4 \
   --model ns4flash.gguf \
-  --good-file dir-steering/examples/succinct.txt \
-  --bad-file dir-steering/examples/verbose.txt \
-  --out dir-steering/out/verbosity.json \
+  --good-file tools/dir-steering/examples/succinct.txt \
+  --bad-file tools/dir-steering/examples/verbose.txt \
+  --out tools/dir-steering/out/verbosity.json \
   --component ffn_out \
   --ctx 512
 ```
@@ -51,15 +51,15 @@ python3 dir-steering/tools/build_direction.py \
 This writes:
 
 ```text
-dir-steering/out/verbosity.json
-dir-steering/out/verbosity.f32
+tools/dir-steering/out/verbosity.json
+tools/dir-steering/out/verbosity.f32
 ```
 
 Try a terse run:
 
 ```sh
 ./ns4 -m ns4flash.gguf --nothink --temp 0 -n 160 \
-  --dir-steering-file dir-steering/out/verbosity.f32 \
+  --dir-steering-file tools/dir-steering/out/verbosity.f32 \
   --dir-steering-ffn -1 \
   -p "Explain why databases use indexes."
 ```
@@ -68,7 +68,7 @@ Try a verbose run:
 
 ```sh
 ./ns4 -m ns4flash.gguf --nothink --temp 0 -n 220 \
-  --dir-steering-file dir-steering/out/verbosity.f32 \
+  --dir-steering-file tools/dir-steering/out/verbosity.f32 \
   --dir-steering-ffn 2 \
   -p "Explain why databases use indexes."
 ```
@@ -84,11 +84,11 @@ The same vector can be used in either direction. The sign is the important part:
 Use the sweep helper to test several strengths on a fixed prompt set:
 
 ```sh
-python3 dir-steering/tools/run_sweep.py \
+python3 tools/dir-steering/tools/run_sweep.py \
   --ns4 ./ns4 \
   --model ns4flash.gguf \
-  --direction dir-steering/out/verbosity.f32 \
-  --prompts dir-steering/examples/eval_prompts.txt \
+  --direction tools/dir-steering/out/verbosity.f32 \
+  --prompts tools/dir-steering/examples/eval_prompts.txt \
   --scales "-1,-0.5,0,0.5,1,2" \
   --tokens 180 \
   --nothink
