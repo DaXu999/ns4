@@ -1,49 +1,57 @@
 #!/usr/bin/env bash
 #
 # Serve DeepSeek-V4-Flash IQ2XXS from one RTX PRO 6000 Blackwell (95.59 GiB
-# usable, 80.76 GiB of that the resident model) at the largest context that
-# still prefills at full speed.
+# usable, 80.76 GiB of that the resident model) at a large context with full
+# prefill speed and ~3 GiB of VRAM headroom.
 #
-# WHY --ctx 436000 AND NOT MORE
+# WHY --ctx 436000
 #
-# There are two separate limits above this and the useful one is not the one
-# that fails loudly.
+# Headroom, not speed. Re-measured on the fp4-mirror-only indexer-cache
+# build (it retired the f32 indexer rows, freeing ~1 GiB of KV-side VRAM at
+# this scale): prefill holds full speed at EVERY allocation from 436,000
+# through 536,000 -- every 4-16k step tested reads within +-0.15% of the
+# 436k control at the 8k/16k probe, and 500k/532k track the control within
+# +-0.08% at every frontier out to 262k. The
+# progressive roll-off this header used to document (-6% at 448k, -44% at
+# 468k, measured on the f32-indexer-cache build) is gone on the mirror-only
+# engine: it was prefill
+# scratch starved of free VRAM, and that starvation band no longer exists
+# before the hard limits below (the retired f32 indexer rows account for
+# about half of the gained range; the rest is that the old sensitivity
+# itself no longer reproduces).
 #
-#   1. context buffers >= 8192 MiB -- the KV cache silently becomes
-#      cudaMallocManaged and paging costs 3-40x. Hard failure boundary.
-#      --ctx 468000 sits at 8164 MiB, just under it.
-#   2. free VRAM for prefill scratch -- prefill's transient buffers and cuBLAS
-#      workspace come out of whatever the planned KV leaves behind, and the
-#      VRAM reserve does not guard them (ns4_cuda.cu:1417). This one binds
-#      well before (1), degrades gradually rather than failing, and is the
-#      reason for 436000.
+# The two limits that remain, in the order they bind:
 #
-# Prefill tk/s at ctx 8192, prefill-chunk 2048, warm-up run discarded:
+#   1. ctx >= ~537,900 (at prefill-chunk 2048): the KV cache switches to
+#      cudaMallocManaged. Deterministic size rule -- 536,000 stays on device
+#      KV, 540,000 flips, and session create prints "using managed KV cache"
+#      to stderr when it happens. Measured cost today is only ~1% on prefill
+#      and decode, flat to 262k depth -- not the old 3-40x paging cliff --
+#      but the margin to real paging is unmeasured. Stay below it.
+#   2. free-VRAM slack: a hard floor, not a slope. Session creation fails
+#      loudly ("CUDA tensor alloc failed: out of memory") once transient +
+#      persistent allocations no longer fit. Measured slack: ~3 GiB at
+#      436,000, ~1.0-1.4 GiB at 536,000, shrinking ~18.3 KiB per token of
+#      allocation.
 #
-#     ctx-alloc   context buffers   prefill   vs full
-#     412,000        7211 MiB        3865
-#     424,000        7415 MiB        3842
-#     436,000        7619 MiB        3847      full     <-- here
-#     448,000        7824 MiB        3598      -6%
-#     456,000        7960 MiB        3326      -13%
-#     464,000        8096 MiB        2909      -24%
-#     468,000        8164 MiB       ~2150      -44%
+# 436000 stays the default for the ~3 GiB of headroom -- room for driver and
+# runtime variance across boots, and for anything else that wants residency.
+# NS4_CTX=532000 is measured-good when the workload needs the context: full
+# prefill speed to 262k depth, live-server verified (24.7k-token prompt at
+# ~3.3k tk/s), ~1.1-1.5 GiB slack, 5.9k tokens under the managed flip.
 #
-# 436000 costs nothing: it tracks the smallest allocation that holds a given
-# sweep to within +-2% at every frontier out to 262k. Verified on this server,
-# same two prompts at 436k vs 468k:
+# Decode is not affected by the allocation (74.8-74.9 t/s at 131k, 71.0 at
+# 262k, 67.4 - 64.9 from 436k through 532k).
 #
-#                        436k                468k
-#     20,591 tok    3442 tk/s prefill   2158 tk/s   (-37%)   13.2s vs 17.3s
-#     68,069 tok    3404 tk/s prefill   2233 tk/s   (-34%)   25.8s vs 37.4s
-#
-# Decode does not care about the allocation (70.3 vs 68.6 t/s, 61.4 vs 59.2),
-# so if a workload only ever decodes, the larger context is free. Anything that
-# prefills should stay at 436000.
-#
-# Prefill decays with sequence length regardless of allocation -- ~3600 tk/s to
-# 65k, ~3400 at 131k, ~2500 at 262k. That is per-token attention and the DSA
-# indexer scan growing, not memory pressure, and no allocation avoids it.
+# Prefill decays with sequence length regardless of allocation -- on the
+# boot behind the README Speed table ~3,460 tk/s at 8k, ~3,290 at 65k,
+# ~3,150 at 131k, ~2,530 at 262k (bench/rtx_pro_6000.csv), and past
+# the table ~2,310 at 410k, ~2,140 at 524k (a 409,600-token prompt prefills at
+# ~2,626 tk/s aggregate, ~2.6 min, identical at alloc 436k and 532k).
+# Absolute prefill is boot-scoped on this instance (up to ~12% across
+# stop/start boots); the flatness across allocations is not. The decay is
+# per-token attention and the DSA indexer scan growing, not memory pressure,
+# and no allocation avoids it.
 #
 # The three env exports are not tuning niceties. Without them the q8->f16
 # weight cache grows until free VRAM hits the reserve, which on this model is
@@ -73,8 +81,8 @@ die() { printf 'run-cuda-436k-server: %s\n' "$*" >&2; exit 1; }
 
 # ns4-server links ns4_cuda.o but has its own link step, so a rebuild of the
 # CUDA object does not update it. This has silently served a stale binary
-# before -- once after the FA2 work landed, and again after the 2026-08-12
-# decode kernels. Refuse rather than serve last week's kernels.
+# before -- once after the FA2 work landed, and again after the 32-lane MoE
+# and wide-pair decode kernels. Refuse rather than serve last week's kernels.
 if [[ -f ./src/ns4_cuda.o && ./src/ns4_cuda.o -nt ./ns4-server ]]; then
     die "ns4-server is older than src/ns4_cuda.o -- relink first:
        make ns4-server CUDA_ARCH=sm_120   (takes <1s if the objects are current)"
@@ -84,8 +92,9 @@ export NS4_CUDA_NO_Q8_F16_CACHE="${NS4_CUDA_NO_Q8_F16_CACHE:-1}"
 export NS4_CUDA_WEIGHT_ARENA_CHUNK_MB="${NS4_CUDA_WEIGHT_ARENA_CHUNK_MB:-5184}"
 export NS4_CUDA_WEIGHT_PRELOAD_SPAN_MB="${NS4_CUDA_WEIGHT_PRELOAD_SPAN_MB:-512}"
 
-# Decode levers validated 2026-08-15 (summation-order NLL protocol; see the
-# memory notes).  All are numerically different from the bit-exact default
+# Decode levers from the fp4-mirror build, validated with the summation-order
+# NLL protocol (see the memory notes).  All are numerically different from
+# the bit-exact default
 # paths -- deterministic, but greedy continuations can differ from a run with
 # these unset.  Unset any of them to fall back:
 #   SCAN_INT     exact-integer dp4a indexer scan over the fp4 mirrors
@@ -102,7 +111,7 @@ export NS4_CUDA_DECODE_INDEXER_SPARSE_THRESHOLD="${NS4_CUDA_DECODE_INDEXER_SPARS
 
 printf 'run-cuda-436k-server: ctx=%s prefill-chunk=%s gpu-vram=%s -> %s:%s\n' \
     "$CTX" "$PREFILL_CHUNK" "$GPU_VRAM" "$SERVER_HOST" "$SERVER_PORT"
-printf 'run-cuda-436k-server: expect "context buffers 7619.27 MiB"; over ~7800 and prefill starts to drop\n'
+printf 'run-cuda-436k-server: expect "context buffers 7619.27 MiB" at the default ctx; full prefill speed holds through ctx 536000, managed KV past ~537900\n'
 
 exec ./ns4-server --cuda -m "$MODEL" \
     --gpu-vram "$GPU_VRAM" \
