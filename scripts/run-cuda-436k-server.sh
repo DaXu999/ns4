@@ -93,20 +93,28 @@ export NS4_CUDA_WEIGHT_ARENA_CHUNK_MB="${NS4_CUDA_WEIGHT_ARENA_CHUNK_MB:-5184}"
 export NS4_CUDA_WEIGHT_PRELOAD_SPAN_MB="${NS4_CUDA_WEIGHT_PRELOAD_SPAN_MB:-512}"
 
 # Decode levers from the fp4-mirror build, validated with the summation-order
-# NLL protocol (see the memory notes).  All are numerically different from
-# the bit-exact default
-# paths -- deterministic, but greedy continuations can differ from a run with
-# these unset.  Unset any of them to fall back:
-#   SCAN_INT     exact-integer dp4a indexer scan over the fp4 mirrors
-#   F16_ONE_WIDE replaces the cuBLAS one-token f16 GEMVs (router, indexer
-#                projection, hc fns) and their f32->f16 feed conversions
-#   F16_PAIR_WIDE / Q8_PAIR_WIDE  wide compressor / q8 pair GEMVs
+# NLL protocol (see the memory notes).  Quality-neutral and deterministic, but
+# every one except SCAN_INT is numerically different from the bit-exact
+# default paths, so greedy continuations eventually diverge from a run with
+# them unset.  Unset any of them to fall back; note SCAN_INT is presence-gated,
+# so NS4_CUDA_INDEXER_SCAN_INT=0 still ENABLES it -- unset it to disable:
+#   SCAN_INT      bit-exact.  Exact-integer dp4a indexer scan over the fp4
+#                 mirrors; matches the default f32 tree, short and long
+#   F16_ONE_WIDE  NOT bit-exact.  Replaces the cuBLAS one-token f16 GEMVs
+#                 (router, indexer projection, hc fns) and their f32->f16
+#                 feed conversions
+#   F16_PAIR_WIDE NOT bit-exact.  Wide compressor pair GEMV
+#   Q8_PAIR_WIDE  NOT bit-exact.  Wide q8 pair GEMV
+# Dropping the non-bit-exact levers (including the sparse threshold below)
+# costs nothing on prefill and 4.5-4.8% of decode from 16k up, 10-12% at 4-8k.
 export NS4_CUDA_INDEXER_SCAN_INT="${NS4_CUDA_INDEXER_SCAN_INT:-1}"
 export NS4_CUDA_F16_ONE_WIDE="${NS4_CUDA_F16_ONE_WIDE:-256}"
 export NS4_CUDA_F16_PAIR_WIDE="${NS4_CUDA_F16_PAIR_WIDE:-256}"
 export NS4_CUDA_Q8_PAIR_WIDE="${NS4_CUDA_Q8_PAIR_WIDE:-256}"
 # +7.5% decode at ctx 4096-8192, inert at 16k and above (accepted range ends
 # at 4096; the dense path cannot reach long context -- shared-memory bound).
+# NOT bit-exact: identical to the default path on short prompts, but it
+# changes results once the sequence reaches its 4k-8k band.
 export NS4_CUDA_DECODE_INDEXER_SPARSE_THRESHOLD="${NS4_CUDA_DECODE_INDEXER_SPARSE_THRESHOLD:-4096}"
 
 printf 'run-cuda-436k-server: ctx=%s prefill-chunk=%s gpu-vram=%s -> %s:%s\n' \

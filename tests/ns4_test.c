@@ -62,9 +62,14 @@ static void test_restore_env(const char *name, char *saved) {
 
 /* The tuned production decode stack (the run-cuda-436k-server.sh levers).
  * These change kernel selection and summation order -- deterministic, but
- * numerically different from the conservative default paths.  Tests that
- * compare against captured vectors clear the stack; --tensor-equivalence
- * A/Bs the two configurations directly. */
+ * every one except NS4_CUDA_INDEXER_SCAN_INT is numerically different from
+ * the conservative default paths: the F16_ONE/F16_PAIR/Q8_PAIR wide GEMVs are
+ * NOT bit-exact anywhere, the sparse threshold is NOT bit-exact inside its
+ * 4k-8k band, and SCAN_INT is bit-exact against the default f32 tree.  Note
+ * SCAN_INT is presence-gated in the engine, so clearing it, not setting "0",
+ * is what disables it.  Tests that compare against captured vectors clear the
+ * stack; --tensor-equivalence A/Bs the two configurations directly, asserting
+ * greedy-token equality and closeness statistics rather than bit-identity. */
 static const char *const test_decode_stack_names[] = {
     "NS4_CUDA_INDEXER_SCAN_INT",
     "NS4_CUDA_F16_ONE_WIDE",
