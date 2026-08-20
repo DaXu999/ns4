@@ -18,14 +18,14 @@ TOKEN=${HF_TOKEN:-}
 
 usage() {
     cat <<EOF
-DwarfStar GGUF downloader
+NEUTRON STAR GGUF downloader
 
 Usage:
-  ./download_model.sh ds4f-q2 [--token TOKEN]
-  ./download_model.sh ds4f-q2-q4 [--token TOKEN]
-  ./download_model.sh ds4f-q4 [--token TOKEN]
-  ./download_model.sh ds4f-mxfp4 [--token TOKEN]
-  ./download_model.sh ds4f-dspark [--token TOKEN]
+  scripts/download_model.sh ds4f-q2 [--token TOKEN]
+  scripts/download_model.sh ds4f-q2-q4 [--token TOKEN]
+  scripts/download_model.sh ds4f-q4 [--token TOKEN]
+  scripts/download_model.sh ds4f-mxfp4 [--token TOKEN]
+  scripts/download_model.sh ds4f-dspark [--token TOKEN]
 
 Targets:
 
@@ -138,7 +138,7 @@ find_hf_command() {
         printf '%s\n' hf
         return 0
     fi
-    for dir in "$HOME"/Library/Python/*/bin "$HOME"/.local/bin; do
+    for dir in "$HOME"/.local/bin; do
         if [ -x "$dir/hf" ]; then
             printf '%s\n' "$dir/hf"
             return 0

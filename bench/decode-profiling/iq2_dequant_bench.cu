@@ -69,7 +69,7 @@ typedef struct {
     uint16_t qs[CUDA_QK_K / 8];
 } cuda_block_iq2_xxs;
 
-#include "../../ns4_iq2_tables_cuda.inc"
+#include "../../src/ns4_iq2_tables_cuda.inc"
 
 /* Host mirrors of the two device __constant__ tables, for building the
  * derived tables and for the CPU reference. */

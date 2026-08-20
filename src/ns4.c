@@ -40,7 +40,7 @@
 #include "ns4.h"
 #include "ns4_distributed.h"
 
-/* Wave-2 multi-GPU types are needed in every build because the engine
+/* Multi-GPU types are needed in every build because the engine
  * struct embeds ns4_gpu_config and the placement table. ns4_layer_pack.h
  * is included unconditionally for the same reason (engine helpers call
  * the packer in multi-tier mode, but the headers are tiny and C-safe). */
@@ -18424,7 +18424,7 @@ static bool graph_encode_decode_layer_phase(
         } \
     } while (0)
     const bool tp_ablate_hcpre = graph_tp_ablate("hcpre");
-    /* Decode-island CUDA graph capture (design ported from the Entrpi/ns4
+    /* Decode-island CUDA graph capture (design ported from the Entrpi/ds4
      * batched-serving fork).  Two position-independent islands of the
      * decode layer are captured and replayed: island 0 is the hc-pre
      * stage (exactly the METAL_DECODE_LAYER_TO_QKV prefix), island 1 is
@@ -30778,11 +30778,10 @@ struct ns4_engine {
     ns4_gpu_graph shared_prefill_workspace;
 #endif
 
-    /* Wave-2 multi-GPU placement scaffolding: optional multi-GPU placement
-     * state. Zero-initialized for every existing caller (gpu_cfg == NULL)
-     * via xcalloc, so the single-tier path observes identical engine
-     * state to pre-multi-GPU CLI main. multi_tier == 1 is the gate for all
-     * new code paths. */
+    /* Optional multi-GPU placement state. Zero-initialized for every
+     * caller that passes gpu_cfg == NULL (xcalloc), so the single-tier
+     * path observes identical engine state. multi_tier == 1 gates every
+     * multi-tier code path. */
     ns4_gpu_config gpu_cfg;
     int            placement[NS4_MAX_LAYER + 2];
     int            n_placement_entries;
@@ -36316,15 +36315,14 @@ int ns4_engine_first_token_test(ns4_engine *e, const ns4_tokens *prompt) {
 }
 
 /* =========================================================================
- * Wave-2 multi-GPU placement scaffolding: engine placement helpers.
+ * Multi-GPU engine placement helpers.
  * =========================================================================
  *
  * These helpers compute and install the multi-GPU layer placement table.
  * They are reached only when ns4_engine_create_with_gpu_config is called
- * with a non-NULL ns4_gpu_config. When the caller passes NULL (every
- * existing caller — ns4_engine_open shim, ns4_test, ns4_cli, ns4_server,
- * ns4_bench, ns4_eval, ns4_agent), these helpers are not invoked and the
- * engine state is byte-equivalent to the pre-multi-GPU CLI main branch.
+ * with a non-NULL ns4_gpu_config. When the caller passes NULL (the
+ * ns4_engine_open shim and every single-tier tool), these helpers are not
+ * invoked and the engine state is unchanged.
  */
 
 /* Classify each model tensor by its placement entry.
@@ -36830,8 +36828,8 @@ static int engine_append_device_cache_range(
 }
 
 /* Install per-device selective caches for GPU-placed tensors. Skips any
- * tensor whose entry is placed on CPU — that case must be rejected at a
- * higher level for this PR (execution wiring not yet shipped). */
+ * tensor whose entry is placed on CPU — engine_install_gpu_placement
+ * rejects that case (CPU-tier execution is not wired). */
 static int engine_install_per_device_caches(ns4_engine *e) {
     /* Prereq: register the host model map so ns4_gpu_device_cache_tensors
      * can resolve g_model_host_base. We use the no-copy variant so
@@ -37074,10 +37072,8 @@ static void engine_print_layout(const ns4_engine *e) {
  * Ordering:
  *   1. Print layout FIRST so it is always visible to the operator,
  *      even if subsequent steps fail.
- *   2. Detect any CPU-spill placement; this PR refuses to open
- *      multi-tier engines with CPU spill because the execution-side
- *      wiring (CPU↔GPU boundary materialization) lands in the
- *      follow-up multi-GPU execution task.
+ *   2. Detect any CPU-spill placement and refuse to open: CPU-tier
+ *      execution (CPU<->GPU boundary materialization) is not wired.
  *   3. Register host model map and install per-device selective
  *      caches.
  *
@@ -37774,16 +37770,10 @@ static int ns4_engine_open_internal(ns4_engine **out,
 #ifndef NS4_NO_GPU
     if (graph_backend) {
         if (e->multi_tier) {
-            /* Wave-2 multi-tier branch.
-             *
-             * 1. Initialize all configured CUDA devices via ns4_gpu_init_multi
-             *    (the multi-GPU plumbing multi-device init that populates g_gpu[]).
-             * 2. Skip the legacy ns4_gpu_set_model_map_range / accelerator
-             *    cache calls — those are single-tier behavior.
-             * 3. Install per-device selective caches per the placement.
-             * 4. Refuse engine creation with the documented notice: this PR
-             *    ships scaffolding only; execution wiring lands in
-             *    multi-GPU execution. */
+            /* Multi-tier branch: initialize every configured CUDA device
+             * (ns4_gpu_init_multi populates g_gpu[]), skip the single-tier
+             * ns4_gpu_set_model_map_range / accelerator cache calls, and
+             * install per-device selective caches per the placement. */
             /* ns4_gpu_init_multi returns 1 on success and 0 on failure
              * (matches ns4_gpu_init). */
             if (ns4_gpu_init_multi(gpu_cfg) == 0) {
@@ -37806,19 +37796,16 @@ static int ns4_engine_open_internal(ns4_engine **out,
                 *out = NULL;
                 return 1;
             }
-            /* GPU-only multi-tier execution is now wired up
-             * (B2-B6: per-tier graph allocation, dispatch loops, boundary
-             * copies). CPU-spill placements were rejected by
-             * engine_install_gpu_placement above with stderr naming the
-             * CPU-spill execution follow-up. Skip the single-tier ns4_gpu_init /
-             * set_model_map_range path below — those calls are explicitly
-             * single-tier behavior (per the pre-B7 comment block). */
+            /* GPU-only multi-tier execution (per-tier graph allocation,
+             * dispatch loops, boundary copies) is wired; CPU-spill
+             * placements were rejected by engine_install_gpu_placement
+             * above. Skip the single-tier ns4_gpu_init /
+             * set_model_map_range path below. */
             *out = e;
             return 0;
         }
 
-        /* Single-tier path (every existing caller). Body is byte-equivalent
-         * to pre-multi-GPU CLI main. */
+        /* Single-tier path. */
         e->gpu_ready = ns4_gpu_init() != 0;
         if (!e->gpu_ready) {
             fprintf(stderr, "ns4: %s backend unavailable; aborting startup\n",

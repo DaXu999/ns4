@@ -9,8 +9,8 @@
 #
 #   * the tuned NS4_CUDA_* environment stack (keep in sync with
 #     scripts/run-cuda-436k-server.sh, the source of truth for it),
-#   * --ctx-alloc 436000 -- prefill depends on the allocated context, not
-#     just the sequence position, so measure at the served allocation,
+#   * --ctx-alloc 436000 -- the served allocation, so context buffers and
+#     free VRAM match serving (prefill speed itself is flat across it),
 #   * --prefill-chunk 2048, matching the launcher.
 #
 # Protocol: NS4_BENCH_RUNS full frontier ladders (default 4). Run 1 is

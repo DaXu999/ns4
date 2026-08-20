@@ -60,12 +60,13 @@ Primary target, single **RTX PRO 6000 Blackwell (96 GB)**, Flash q2 imatrix
 | 131k | ~3,149 t/s | 74.9 t/s |
 | 262k | ~2,533 t/s | 71.0 t/s |
 
-The launcher serves `--ctx 436000` from that one card: the largest allocation
-that still prefills at full speed (its header documents the sweep behind that
-number). Prefill decay with sequence position is per-token attention and DSA
-indexer cost, not memory pressure. The tuned decode levers it enables are
-deterministic but not bit-exact against the default paths; unset them to fall
-back.
+The launcher serves `--ctx 436000` from that one card for ~3 GiB of VRAM
+headroom, not for speed: prefill holds full speed at every allocation through
+536k, and its header documents the two limits that remain (the managed-KV flip
+near 538k and the free-VRAM floor). Prefill decay with sequence position is
+per-token attention and DSA indexer cost, not memory pressure. The tuned decode
+levers it enables are deterministic but not bit-exact against the default
+paths; unset them to fall back.
 
 See [bench/README.md](bench/README.md) for how numbers are collected and how
 to contribute results for other CUDA hardware.
@@ -145,7 +146,7 @@ to select another supported GGUF from `./gguf/`. Run `./ns4 --help` and
 `./ns4-server --help` for the full flag list.
 
 CUDA builds accept `--gpu-vram N[,N,...]` and `--gpu-devices N[,N,...]` in
-the CLI, server, and benchmark. VRAM values are per-device GiB budgets;
+the CLI, server, benchmark, and eval. VRAM values are per-device GiB budgets;
 `--gpu-vram auto` uses the free memory reported by CUDA. Placement reserves
 graph and KV memory for the requested context and refuses to start if model
 layers would spill to the CPU. Do not treat the CPU path as a production
@@ -315,13 +316,15 @@ and set the client context limit no higher than the server's `--ctx`.
 
 Size `--ctx` to your VRAM: KV/indexer context buffers cost about 18 KiB per
 token of allocated context with the 2-bit model -- about 7.6 GiB at the
-launcher's 436k setting -- and once context buffers reach 8 GiB the KV cache
-silently falls back to slow managed memory (a full 1M-token allocation would
-need ~17 GiB and is far past that line), so on a single 96 GB card a
-100k-436k window is the practical range (the 436k launcher is the measured
-single-card ceiling). The `384000` output limit below avoids
-client-side token caps, since the model can generate very long replies; the
-server still stops when the configured context window is full.
+launcher's 436k setting. Once the KV cache reaches 8 GiB (about 538k tokens at
+prefill chunk 2048) session creation prints `using managed KV cache` and the
+cache moves to managed memory: ~1% slower today, but the margin to real paging
+is unmeasured, so stay below it (a full 1M-token allocation would need ~17
+GiB). On a single 96 GB card the launcher's 436k keeps ~3 GiB of headroom and
+`NS4_CTX=532000` is measured-good when the workload needs the room; its header
+documents the free-VRAM floor in between. The `384000` output limit below
+avoids client-side token caps, since the model can generate very long replies;
+the server still stops when the configured context window is full.
 
 For **opencode**, add a provider and agent entry to
 `~/.config/opencode/opencode.json`:
@@ -667,8 +670,8 @@ Useful tuning and diagnostics:
   socket send time, and byte counts. This is the profiling tool for deciding
   whether a split is balanced.
 - `--dist-prefill-window N` bounds how many prefill chunks may be in flight;
-  `--dist-prefill-chunk N` exists for experiments (the default 4096 is
-  canonical).
+  `--dist-prefill-chunk N` exists for experiments (the default -- the session
+  prefill cap, normally 4096 -- is canonical).
 - `--dist-activation-bits 16|8` reduces activation traffic (16 is the first
   thing to try on slower links; 8 is approximate/experimental).
 
@@ -727,12 +730,13 @@ decode rows can be grouped across requests:
   --host 0.0.0.0
 ```
 
-The managed launcher `./scripts/run-nvidia-tp-server.sh` wraps this
-configuration and also enables the on-disk KV cache; set `NS4_MODEL` to
-select a different GGUF. Reduce the session count or context size if the
-requested resident KV caches do not fit after model loading. Without an
-explicit `--prefill-chunk`, this mode uses 2048-token chunks so a
-16-session, 100k-context layout retains enough VRAM for resident KV caches.
+The managed launcher `./scripts/run-nvidia-tp-server.sh` runs this topology
+with the native MXFP4 GGUF by default (set `NS4_MODEL` to serve the imatrix Q4
+file above instead) and also enables the on-disk KV cache. Reduce the session
+count or context size if the requested resident KV caches do not fit after
+model loading. Without an explicit `--prefill-chunk`, this mode uses
+2048-token chunks so a 16-session, 100k-context layout retains enough VRAM for
+resident KV caches.
 
 Any even card count that can hold the selected model and graph scratch is a
 valid topology; for a four-card P2P-paired subset such as physical GPUs
@@ -896,7 +900,7 @@ failures. The C runner pins a 2048-token prefill chunk for this strict
 comparison.
 
 ```sh
-make test                  # ./ns4-eval --self-test-extractors && ./ns4_test --all
+make test                  # ./ns4_test plus the extractor self-test and unit tests
 ./ns4_test --logprob-vectors
 ./ns4_test --server
 ```

@@ -15,9 +15,9 @@
  * The production kernel comes from fd_combine.inc, extracted verbatim from
  * ns4_cuda.cu so the comparison stays honest:
  *
- *     sed -n '9811,9816p'   ns4_cuda.cu  > fd_combine.inc  # kFD* constants
- *     sed -n '10031,10032p' ns4_cuda.cu >> fd_combine.inc  # kFDCombDims
- *     sed -n '10034,10119p' ns4_cuda.cu >> fd_combine.inc  # the kernel
+ *     sed -n '9811,9816p'   ../../src/ns4_cuda.cu  > fd_combine.inc  # kFD* constants
+ *     sed -n '10031,10032p' ../../src/ns4_cuda.cu >> fd_combine.inc  # kFDCombDims
+ *     sed -n '10034,10119p' ../../src/ns4_cuda.cu >> fd_combine.inc  # the kernel
  *
  * (line numbers as of acf4a5e + the uncommitted combine rewrite; re-extract if
  * the kernel moves).  The control is frozen in this file instead -- it is no

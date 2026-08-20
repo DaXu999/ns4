@@ -41,25 +41,31 @@ than the floor, the kernel is not the problem.
 Same kernels launched individually vs. replayed as one captured graph, for
 chain lengths from 4 to 1600 (a decode token). Shows the ~8x amortisation.
 
-## fd_bench.cu / fd_sweep.cu - the shipped flash decode kernel
+## fd_bench.cu / fd_sweep.cu - the CUDA-core flash decode kernel
 
-Both `#include "fd_baseline.inc"`, which is extracted verbatim from
-`src/ns4_cuda.cu` so the comparison stays honest:
+Ancestor-pinned: both `#include "fd_baseline.inc"`, an extract of
+`attention_flash_decode_kernel` and its geometry helpers that is not kept in
+the tree. Re-extract it from the current `src/ns4_cuda.cu` before building; the
+recipe, with line numbers as of ancestor-ds4 `8890139`, was:
 
     sed -n '9635,9640p' src/ns4_cuda.cu  > fd_baseline.inc
     sed -n '9666,9713p' src/ns4_cuda.cu >> fd_baseline.inc
     sed -n '9715,9888p' src/ns4_cuda.cu >> fd_baseline.inc
 
-(line numbers as of ancestor-ds4 `8890139`; re-extract if the kernel moves). `fd_sweep`
-walks the kernel's `<WARPS, TILE>` template parameters and the rows-per-split
-launch parameter. `TILE=32` exceeds the 48 KB static shared-memory cap.
+`fd_sweep` walks the kernel's `<WARPS, TILE>` template parameters and the
+rows-per-split launch parameter. `TILE=32` exceeds the 48 KB static
+shared-memory cap.
 
 ## fd2_bench.cu - the FA2 kernel
 
-Validates `src/cuda/flash2_decode.cuh` against the shipped kernel (same inputs,
-same combine semantics) and reports max relative error, relative L2, and a
-main/combine time split. `--split=N` sweeps the KV-row split; `--pos=N` moves
-the sequence position, which sets how many rows the geometry selects.
+Validates `src/cuda/flash2_decode.cuh` against the CUDA-core kernel (same
+inputs, same combine semantics) and reports max relative error, relative L2,
+and a main/combine time split. Ancestor-pinned like the two above: it includes
+`fd_baseline.inc` and `fd2.cuh`, the pre-integration copy of
+`src/cuda/flash2_decode.cuh`; point that include at the shipped header once
+`fd_baseline.inc` (which provides `fd_row_geom` / `fd_compute_geom`) is
+re-extracted. `--split=N` sweeps the KV-row split; `--pos=N` moves the sequence
+position, which sets how many rows the geometry selects.
 
 Shapes are hardcoded to DeepSeek-V4-Flash: 64 heads, 512-wide latent,
 `raw_cap` 2304, window 128, top-k 512, ratio 4.
@@ -157,5 +163,6 @@ different exits -- `tied` is the only one that reaches the equal-key path, and
 
 ## gguf_info.py
 
-Dumps GGUF metadata and per-tensor byte sizes for one layer, which is where
-the 195 MB/layer active-weight figure comes from.
+Dumps GGUF metadata and per-tensor byte sizes for one layer, the input to the
+per-layer active-weight table in `DECODE_LAUNCH_BUDGET.md` section 1 (no single
+layer is representative; see the correction note there).

@@ -864,7 +864,7 @@ static inline cublasHandle_t cuda_cublas_for_tier(int logical_tier) {
 /* ------------------------------------------------------------------------
  * Decode-island CUDA graph capture.
  *
- * Design ported from the Entrpi/ns4 batched-serving fork's per-layer
+ * Design ported from the Entrpi/ds4 batched-serving fork's per-layer
  * decode graph work (fork commits abe26575, 2200c675, 9caaa508; author
  * Entrpi <entrpi@proton.me>), re-implemented against upstream's decode
  * body.  Phase 1 captures the two position-independent islands of each
@@ -1135,18 +1135,18 @@ extern "C" int ns4_gpu_decode_graph_end(const ns4_decode_graph_key *key) {
 /* ------------------------------------------------------------------------
  * Vendored llama.cpp mmq prefill tier (cuda/mmq/, see cuda/mmq/VENDOR.md).
  *
- * Ported from the Entrpi/ns4 batched-serving fork (fork commits 39d3877c,
+ * Ported from the Entrpi/ds4 batched-serving fork (fork commits 39d3877c,
  * a56e07a5, 944482d5 and the Phase 5/6 MoE wiring; author Entrpi
- * <entrpi@proton.me>).  Phase 1 takes only the RAW-layout entries: dense
- * Q8_0 GEMMs and the IQ2_XXS gate/up + Q2_K down routed-MoE pipeline for
- * n_tok >= 2 (prefill and batched verify).  The aligned-SoA / D2R /
- * producer-quantized tiers and the weight server are deliberately left
- * behind: they need the repack artifact pipeline for a further ~25% on
- * top of the ~2.5x this tier gives.  Decode (n_tok == 1) is untouched.
- * mmq changes FP32 reduction order vs the cublas+dequant pipeline, so
- * prefill logits drift at ULP scale: validated against the official
- * continuation vectors rather than byte-diffs.  NS4_CUDA_MMQ=0 restores
- * the legacy dispatch. */
+ * <entrpi@proton.me>).  Wired here: the RAW-layout dense Q8_0 GEMMs (plain
+ * and D2R, NS4_MMQ_DENSE_D2R) and the IQ2_XXS gate/up + Q2_K down routed-MoE
+ * pipeline for n_tok >= 2 (prefill and batched verify), the MXFP4 MoE
+ * entries, and the aligned-SoA decode matvecs over artifacts ns4_repack
+ * builds in-process at load.  The fork's remaining aligned/SoA and
+ * producer-quantized entries compile as unwired alternates; its weight
+ * server and flat-pool producers are not ported.  mmq changes FP32
+ * reduction order vs the cublas+dequant pipeline, so prefill logits drift
+ * at ULP scale: validated against the official continuation vectors rather
+ * than byte-diffs.  NS4_CUDA_MMQ=0 restores the legacy dispatch. */
 /* Producer-fold registry lookup the vendored ns4_mmq.cu entries probe for
  * pre-quantized q8_1 activations (the fork's flat-pool M2-Inc2a fold).
  * The flat-pool producers are not ported, so nothing is ever registered:
@@ -16605,7 +16605,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ns4_gpu_tensor *out, const void *mode
     }
     const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes, logical_tier, "q8_0");
     if (!wptr) return 0;
-    /* mmq fused-dequant-matmul prefill tier (ported from the Entrpi/ns4
+    /* mmq fused-dequant-matmul prefill tier (ported from the Entrpi/ds4
      * fork).  Layout-compatible drop-in for the cuBLAS+dequant pipeline
      * below: mmq's [out_dim, n_tok] column-major output flattens to
      * [n_tok, out_dim] row-major, exactly what ns4 stores in out->ptr,
@@ -26594,7 +26594,7 @@ static int routed_moe_launch(
                 rc, layer_index, n_tokens);
         return 0;
     }
-    /* mmq routed-MoE prefill tier (ported from the Entrpi/ns4 fork).
+    /* mmq routed-MoE prefill tier (ported from the Entrpi/ds4 fork).
      * IQ2_XXS gate/up pair (one shared activation quantize + routing
      * pass) -> SwiGLU + clamp + router weight -> Q2_K down, treating
      * each (token, slot) assignment as its own single-expert row ->

@@ -305,7 +305,7 @@ void ggml_cuda_launch_mm_ids_helper(
             // assignment rows with a single active lane -> 22.5 ms/launch at
             // W4096 prefill (2.90 s of a 12k admission).  The optimized template
             // at neu_padded=1 covers 32 rows/iteration and emits bit-identical
-            // id maps (proto_mm_ids.cu: parity on uniform/skewed/2%-invalid/
+            // id maps (ds4 proto_mm_ids.cu: parity on uniform/skewed/2%-invalid/
             // decode shapes, 20.4x at the W4096 shape).  NS4_MMID_CASE1=0
             // reverts to the generic path.
             if (ns4_mmid_case1_enabled()) {

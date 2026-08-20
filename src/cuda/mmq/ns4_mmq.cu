@@ -154,7 +154,7 @@ static char *ns4_mmq_folded_q81(const float *X_f32, int64_t K, int n_tokens,
     return (char *)(uintptr_t)p;
 }
 
-// Default ON (2026-07-09 gated increment: same-boot ABBA 427->493 tok/s @12k,
+// Default ON (fork gated increment: same-boot ABBA 427->493 tok/s @12k,
 // gsm8k 97.5 / mbpp 90). NS4_MMQ_D2R=0 is the kill switch back to the
 // mul_mat_q SoA-tile down path.
 static bool d2r_enabled() {
@@ -181,7 +181,7 @@ static bool d2r_iq2_enabled() {
 // dense + tmp_fixup zeroed + an ncols_max that covers every expert's bucket
 // -- see ns4_mmq_moe_pair_impl for its exact value), after which every
 // element a consumer reads is stored by the GEMM itself and the zeroing was
-// ~1.0 s/12k-admission of pure memset tax.  Default OFF (2026-07-09 gated
+// ~1.0 s/12k-admission of pure memset tax.  Default OFF (fork gated
 // increment: L42 deep tensors BIT-IDENTICAL with/without, same-boot ABBA
 // 641.5 -> 678 tok/s @12k, gsm8k 119/120 / mbpp 36/40 / canary=[]).
 // NS4_MMQ_OUT_MEMSET=1 restores the zeroing.
@@ -478,8 +478,6 @@ extern "C" int ns4_mmq_should_use(int type_x, int64_t ne11, int64_t n_experts) {
 // ----------------------------------------------------------------------------
 
 // Per-device singleton context. Owns the pool for stream-K fixup scratch.
-// Phase 4 will make this per-stream as well; for now a single context per
-// device is sufficient for the dense path.
 namespace {
 
 __global__ static void ns4_mmq_sanitize_f32_kernel(float *p, uint64_t n) {
@@ -2331,7 +2329,7 @@ int ns4_mmq_moe_vec_impl(
 // vec_dot_iq2_xxs_q8_1 (vecdotq.cuh); only the float accumulation order
 // differs (per-warp-row here vs per-mmvq-tile there).  Proven +12% over the
 // raw-layout vec path at the production decode shape
-// (cuda/mmq/test/proto_iq2_aligned.cu).
+// (ds4 cuda/mmq/test/proto_iq2_aligned.cu, not imported).
 __global__ void iq2_xxs_aligned_moe_vec_kernel(
         float             *out,        // [n_tokens*n_expert_used, M]
         const uint2       *qs,         // 64B-aligned code pairs
@@ -3683,8 +3681,8 @@ extern "C" int ns4_mmq_mxfp4_moe_vec(
         n_tokens, n_experts, n_expert_used, stream);
 }
 
-// M1-Inc2b: exact inverse of the weight-server repack
-// (repack_iq2_xxs_aligned_kernel, tools/ns4_weight_server.cu): aligned-SoA
+// M1-Inc2b: exact inverse of the aligned repack
+// (repack_iq2_xxs_aligned_kernel, ns4_repack.cu): aligned-SoA
 // artifact -> raw block_iq2_xxs byte stream (66B = [half d][8 x uint2
 // codes]).  Device->device fill of a raw-layout scratch so the batched/mmq
 // consumers keep their layout while the raw spans stay excluded from the
@@ -3744,7 +3742,7 @@ extern "C" int ns4_mmq_iq2_xxs_aligned_derepack(
 // with nblk = M * (K/32), block order equal to the raw tensor byte order.
 // Unlike the IQ2 expert repack, the raw spans stay SERVED (dense tensors are
 // ~6 GiB total, affordable to duplicate), so every other consumer is
-// unchanged.  proto_q8_aligned.cu A/B (GB10, L2-defeating rotation, double-ref
+// unchanged.  ds4 proto_q8_aligned.cu A/B (GB10, L2-defeating rotation, double-ref
 // parity): attn_q_b 217->235, mid 2048x4096 172->218, out_a 8192x4096
 // 199->230, head 224->243 GB/s; the warp-per-row accumulation is also ~1000x
 // closer to the double reference than the mmvq tile order at K>=4096.
@@ -3941,7 +3939,7 @@ extern "C" int ns4_mmq_q8_0_aligned_dense_vec(
 //
 // Lane mapping, scale-byte values, q8 side and the float accumulation order
 // are copied verbatim from mul_mat_vec_q_moe/vec_dot_q2_K_q8_1 -> outputs are
-// bit-identical to the raw path (proto_m2_q2k.cu: 240/240 parity + graph
+// bit-identical to the raw path (ds4 proto_m2_q2k.cu: 240/240 parity + graph
 // capture/replay, and 214 GB/s vs 154 raw on the same rotating rig).
 // ---------------------------------------------------------------------------
 
@@ -4047,8 +4045,8 @@ __global__ static void q2_k_aligned_moe_vec_kernel(
     }
 }
 
-// Exact inverse of the weight-server repack (repack_q2_k_aligned_kernel,
-// tools/ns4_weight_server.cu): pair-SoA -> raw block_q2_K byte stream.  One
+// Exact inverse of the aligned repack (repack_q2_k_aligned_kernel,
+// ns4_repack.cu): pair-SoA -> raw block_q2_K byte stream.  One
 // thread per (raw block, qs int); p < 4 additionally restores a scales word,
 // p == 0 the dm word.
 __global__ static void q2_k_aligned_derepack_kernel(

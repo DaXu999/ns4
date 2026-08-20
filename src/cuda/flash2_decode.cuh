@@ -18,16 +18,13 @@
  * Fragment/swizzle conventions are the ones already used by the token-tile
  * prefill kernel in ns4_cuda.cu.
  *
- * NOT WIRED IN YET.  This header expects `fd_row_geom` / `fd_compute_geom`
- * from ns4_cuda.cu to be in scope, and is exercised by
- * bench/decode-profiling/fd2_bench.cu.  It is not on the live decode path:
- * for this model the decode attention that actually runs is
- * attention_decode_score_split_* (the shipped attention_flash_decode_kernel
- * is gated behind a topk != NULL caller and never fires), and attention is
- * only ~5.7% of a decode token, so wiring it is worth ~2-3% end to end
- * against the ~5.5us/launch floor documented in
- * bench/DECODE_LAUNCH_BUDGET.md.  Measured: 12.5us kernel + 7.1us combine vs
- * 25us for the shipped path, rel_l2 2.7e-4 against the fp32 reference.
+ * Included by ns4_cuda.cu after `fd_row_geom` / `fd_compute_geom` (which it
+ * expects in scope) and launched from attention_flash_decode_launch for every
+ * decode caller; on by default, NS4_CUDA_FLASH2_ATTN=0 falls back to the
+ * CUDA-core flash kernel.  bench/decode-profiling/fd2_bench.cu exercises it
+ * standalone.  Measured: 12.5us kernel + 7.1us combine vs 25us for the
+ * score-split path it replaced, rel_l2 2.7e-4 against the fp32 reference
+ * (bench/DECODE_LAUNCH_BUDGET.md section 4).
  */
 
 #include <cuda_fp16.h>

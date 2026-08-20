@@ -21,8 +21,8 @@
  * The baseline kernels are #included verbatim from ns4_cuda.cu so the
  * comparison cannot drift:
  *
- *   { sed -n '14052,14054p' ../../ns4_cuda.cu; echo;
- *     sed -n '14495,14686p' ../../ns4_cuda.cu; } > topk_baseline.inc
+ *   { sed -n '14052,14054p' ../../src/ns4_cuda.cu; echo;
+ *     sed -n '14495,14686p' ../../src/ns4_cuda.cu; } > topk_baseline.inc
  *
  * (line numbers as of the radix-select commit's parent; re-extract if they
  * move). Each row is timed graph-amortised -- reps captured as one graph, so

@@ -197,11 +197,7 @@ int ns4_gpu_tensor_device(const ns4_gpu_tensor *t);
  * multi-tier execution path. The caller passes a logical tier index;
  * the shim internally indexes g_gpu[tier].device_id and calls
  * cudaSetDevice. Returns 0 on success, nonzero on error or if the
- * tier index is out of range.
- *
- * Wave-2 multi-GPU placement scaffolding adds this shim but does not
- * exercise the multi-tier execution path; multi-GPU execution
- * (follow-up) is its first caller. */
+ * tier index is out of range. */
 int ns4_gpu_set_current_device(int logical_tier);
 int ns4_gpu_set_current_device_fenced(int logical_tier);
 

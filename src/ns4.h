@@ -153,19 +153,17 @@ typedef struct {
 
 int ns4_engine_open(ns4_engine **out, const ns4_engine_options *opt);
 
-/* Multi-GPU pipeline-parallel entry point (wave 2).
+/* Multi-GPU entry point.
  *
  * Accepts an optional ns4_gpu_config (defined in ns4_gpu_mgpu.h) that
  * lets callers describe a multi-GPU placement target. Passing NULL is
  * back-compatible with ns4_engine_open and produces identical engine
  * state — bit-equivalent execution at runtime.
  *
- * When a non-NULL config is supplied AND the computed placement spans
- * more than one tier (either multiple GPUs or any CPU-spill), this
- * wave-2 implementation prints the layout and refuses to open: full
- * multi-tier execution wiring lands in a follow-up task
- * (mgpu-graph-session-execution). Callers receive a non-zero return
- * and a documented stderr notice. */
+ * With a non-NULL config the computed layout is printed first. Multi-GPU
+ * placements open and run; a placement that spills layers to the CPU is
+ * refused with a non-zero return and a stderr notice, because CPU-tier
+ * execution is not wired. */
 /* ns4_gpu_config is declared in ns4_gpu_mgpu.h, which callers should
  * include separately. We forward-declare it here so this header can be
  * used as-is (callers passing NULL don't need the struct definition). */

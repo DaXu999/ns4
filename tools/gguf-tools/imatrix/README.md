@@ -18,11 +18,13 @@ more heavily by the actual NS4 inference graph.
 
 ## 1. Build The Calibration Dataset
 
-The tracked dataset is in `tools/gguf-tools/imatrix/dataset/`.  Regenerate it from
-the repository root with:
+The tracked dataset is in `tools/gguf-tools/imatrix/dataset/`.  It was generated
+by `dataset/build_ds4_imatrix_dataset.py`, which walks the ds4 source tree
+(`ds4.c`, `metal/`) for its source-review prompts and therefore runs from a ds4
+checkout, not from this repository:
 
 ```sh
-python3 tools/gguf-tools/imatrix/dataset/build_ds4_imatrix_dataset.py
+python3 gguf-tools/imatrix/dataset/build_ds4_imatrix_dataset.py   # in a ds4 checkout
 ```
 
 The important output is:
@@ -32,7 +34,7 @@ tools/gguf-tools/imatrix/dataset/rendered_prompts.txt
 ```
 
 It contains NS4-rendered chat prompts, separated by visible
-`NS4_IMATRIX_PROMPT` markers.  The prompts include:
+`DS4_IMATRIX_PROMPT` markers (the frozen data keeps the ds4 spelling).  The prompts include:
 
 - C/CUDA source-review prompts from this repository.
 - Long-context snippets.
@@ -41,7 +43,7 @@ It contains NS4-rendered chat prompts, separated by visible
 - `ns4-eval` GPQA Diamond, SuperGPQA, and AIME2025 benchmark prompts.
 - Both thinking and non-thinking assistant prefixes.
 
-The current tracked dataset has 4682 rendered prompts and roughly 2.91M tokens
+The current tracked dataset has 4690 rendered prompts and roughly 2.91M tokens
 by the coarse bytes/4 estimate.  Check
 `tools/gguf-tools/imatrix/dataset/manifest.json` for the exact generated-file
 summary.

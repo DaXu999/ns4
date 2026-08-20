@@ -22,7 +22,7 @@ codebase with CUDA kernels in `src/ns4_cuda.cu`.
 - Keep comments instructive and compact: explain why a shape, ordering, cache boundary, or memory choice exists.
 - Keep public APIs narrow. CLI/server code should not know tensor internals.
 - Do not add permanent semantic variants behind flags. Diagnostic switches are fine when they validate the one release path.
-- Do not introduce C++.
+- Do not introduce C++ outside the CUDA translation units (`.cu`/`.cuh`, which nvcc compiles as C++).
 
 ## Safety
 

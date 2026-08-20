@@ -24,7 +24,7 @@ new QA pass; earlier permission does not carry over.
 - Start from a clean tree except intentional release notes:
   `git status --short`.
 - Build the normal local target:
-  `make clean && make`.
+  `make clean && make cuda CUDA_ARCH=sm_NN` (or `make cuda-generic`).
 - Build CPU-only binaries as a compile check only:
   `make clean && make cpu`.
 - Treat compiler warnings as build failures. Save each release and test build's
@@ -203,8 +203,9 @@ producing a different greedy continuation.
   for both 32-token and 64-token runs.  A faster run with lower proposal
   quality is a regression unless it was an intentional scheduler change.
 - If verifier MoE kernels changed, run one diagnostic `c_add` profile with
-  `NS4_DSPARK_VERIFY_SELECTED_PROFILE=1` or the MoE stage profiler and
-  record the selected-expert footprint or stage timing in the DSpark log.
+  `NS4_DSPARK_VERIFY_SELECTED_PROFILE` set (any value enables it) or the MoE
+  stage profiler and record the selected-expert footprint or stage timing in
+  the DSpark log.
 
 ### Session Microbatching
 
@@ -289,12 +290,16 @@ Do not claim a CUDA target is release-ready without this pass on that target.
   is a failure for the multi-GPU TP/EP topology. Under CUDA TP attention, the
   native mixed step must use the same exact grouped decode stages when their
   capability checks pass; record correctness and speedup separately. Also
-  force an 800-row prefill quantum with
-  `NS4_TEST_ALLOW_FALLBACK=1`; it must report the serialized safety fallback.
+  run with `NS4_TEST_MIXED_QUANTUM=800 NS4_TEST_ALLOW_FALLBACK=1`: the 800-row
+  prefill quantum must report the serialized safety fallback, which
+  `NS4_TEST_ALLOW_FALLBACK` tolerates instead of failing the round.
 - On the multi-GPU host, start `ns4-server` with 8
   and 16 batched sessions and issue at least that many simultaneous requests
   with mixed prompt lengths. Verify no session mix-up, deadlock, or starvation
   and record aggregate generation throughput.
+  `tests/test_server_batching.py --url http://HOST:PORT --pairs 8` drives this:
+  it submits seeded duplicate pairs in one concurrent wave and requires
+  identical outputs per pair.
 - On DGX Spark, verify the same public batch API and server concurrency use the
   single-GPU fallback without creating peer-only TP/EP state. The multi-GPU
   native oracle is not a valid Spark test because its topology is intentionally
@@ -358,8 +363,8 @@ clients.
 
 - Run `ns4-bench` on the release machine and compare with tracked CSV baselines.
 - Test `--power 100` is not throttled.
-- Test `--power 50` visibly reduces duty cycle in CLI, server, agent, eval, and
-  bench where practical.
+- Test `--power 50` visibly reduces duty cycle in CLI, server, eval, and bench
+  where practical.
 - Confirm context buffer size, raw KV rows, compressed KV rows, and mmap behavior
   match expectations for 32k, 100k, and any release-advertised context size.
 
@@ -390,7 +395,7 @@ claims across different models or contexts.
 
 | System and backend | Model and workload | Prefill | Decode |
 | --- | --- | ---: | ---: |
-| RTX PRO 6000 Blackwell, CUDA | Flash q2 imatrix 0731, ctx 131,072, tuned serving config | ~3,400 t/s | 74.9 t/s |
+| RTX PRO 6000 Blackwell, CUDA | Flash q2 imatrix 0731, ctx 131,072, tuned serving config | ~3,150 t/s | 74.9 t/s |
 
 The RTX PRO 6000 row uses the tuned launcher configuration in
 `scripts/run-cuda-436k-server.sh`; compare against it with the same

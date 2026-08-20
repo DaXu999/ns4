@@ -1867,7 +1867,7 @@ int ns4_gpu_matmul_q8_0_hc_expand_tensor(
         uint32_t                n_hc);
 
 /* Decode-island CUDA graph capture (CUDA backend; the CPU build stubs it
- * out and stays eager).  Design ported from the Entrpi/ns4 batched-serving
+ * out and stays eager).  Design ported from the Entrpi/ds4 batched-serving
  * fork's per-layer decode graph capture.  The key identifies a captured
  * island: layer, island index, and the activation buffers whose addresses
  * the captured kernels bake in.  ns4_cuda.cu mirrors this struct

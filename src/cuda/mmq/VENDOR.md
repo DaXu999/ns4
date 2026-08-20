@@ -2,9 +2,9 @@
 
 This directory contains source files copied verbatim from
 [llama.cpp's `ggml-cuda` backend](https://github.com/ggml-org/llama.cpp/tree/master/ggml/src/ggml-cuda),
-plus a thin ns4-side adapter (`ns4_ggml_stubs.{h,cu}` and `ns4_mmq.{h,cu}`)
-that lets the templated CUDA kernels compile and link without the full ggml
-runtime.
+plus the ns4-side adapter and kernels (`ns4_ggml_stubs.{h,cu}`,
+`ns4_mmq.{h,cu}`, `ns4_mmq_d2r.{cu,cuh}`, `ns4_repack.{cu,h}`) that let the
+templated CUDA kernels compile and link without the full ggml runtime.
 
 ## Why these files are vendored, not submoduled
 
@@ -25,30 +25,32 @@ keeps ns4 self-contained at the cost of a periodic re-sync.
 
 ## File inventory
 
-| File                  | Origin in llama.cpp                          | Status                                                                   | Lines |
-|-----------------------|----------------------------------------------|--------------------------------------------------------------------------|-------|
-| `mmq.cuh`             | `ggml/src/ggml-cuda/mmq.cuh`                 | verbatim                                                                 |  4176 |
-| `mma.cuh`             | `ggml/src/ggml-cuda/mma.cuh`                 | verbatim                                                                 |  1456 |
-| `vecdotq.cuh`         | `ggml/src/ggml-cuda/vecdotq.cuh`             | verbatim                                                                 |  1317 |
-| `quantize.cuh`        | `ggml/src/ggml-cuda/quantize.cuh`            | verbatim                                                                 |    41 |
-| `quantize.cu`         | `ggml/src/ggml-cuda/quantize.cu`             | verbatim                                                                 |   443 |
-| `mmid.cuh`            | `ggml/src/ggml-cuda/mmid.cuh`                | verbatim                                                                 |     5 |
-| `mmid.cu`             | `ggml/src/ggml-cuda/mmid.cu`                 | verbatim                                                                 |   164 |
-| `mmvq.cuh`            | `ggml/src/ggml-cuda/mmvq.cuh`                | patched (Step 6): `mul_mat_vec_q_switch_type` proto exposed; ggml-tensor entries gated on `NS4_MMVQ_INCLUDE_GGML_ENTRIES` | ~36 |
-| `mmvq.cu`             | `ggml/src/ggml-cuda/mmvq.cu`                 | patched: `mul_mat_vec_q_switch_type` promoted from `static`; `ggml_cuda_mul_mat_vec_q` + `ggml_cuda_op_mul_mat_vec_q` gated on `NS4_MMVQ_INCLUDE_GGML_ENTRIES` | 1163 |
-| `unary.cuh`           | `ggml/src/ggml-cuda/unary.cuh`               | verbatim (needed by `mmvq.cu` for inline GLU epilogues)                  |   114 |
-| `common.cuh`          | `ggml/src/ggml-cuda/common.cuh`              | verbatim                                                                 |  1489 |
-| `ggml-common.h`       | `ggml/src/ggml-common.h`                     | verbatim                                                                 |  1900 |
-| `vendors/cuda.h`      | `ggml/src/ggml-cuda/vendors/cuda.h`          | verbatim                                                                 |    28 |
-| `ggml.h`              | (new)                                        | redirect to `ns4_ggml_stubs.h`                                           |     5 |
-| `ggml-impl.h`         | (new)                                        | redirect to `ns4_ggml_stubs.h`                                           |     5 |
-| `ggml-cuda.h`         | (new)                                        | redirect to `ns4_ggml_stubs.h`                                           |     5 |
-| `ns4_ggml_stubs.h`    | (new)                                        | shim: ggml_type enum, macros, info struct, type_size lookups             | ~280 |
-| `ns4_ggml_stubs.cu`   | (new)                                        | shim impls: `ggml_cuda_info`, naive pool, `ggml_backend_cuda_context::*` | ~110 |
-| `ns4_mmq.h`           | (new)                                        | public C ABI for ns4 to call                                             |  ~70 |
-| `ns4_mmq.cu`          | (new)                                        | host wrappers; Phase 0 instantiates `mul_mat_q_case<Q8_0>` only          | ~120 |
+| File                    | Origin in llama.cpp                          | Status                                                                   | Lines |
+|-------------------------|----------------------------------------------|--------------------------------------------------------------------------|------:|
+| `mmq.cuh`               | `ggml/src/ggml-cuda/mmq.cuh`                 | patched: `NS4_CUDA_MMQ_X_MAX` tile hook, aligned-SoA `load_tiles_*` twins, partial last-tile clamps | 4415 |
+| `mma.cuh`               | `ggml/src/ggml-cuda/mma.cuh`                 | verbatim                                                                 |  1456 |
+| `vecdotq.cuh`           | `ggml/src/ggml-cuda/vecdotq.cuh`             | verbatim                                                                 |  1317 |
+| `quantize.cuh`          | `ggml/src/ggml-cuda/quantize.cuh`            | verbatim                                                                 |    41 |
+| `quantize.cu`           | `ggml/src/ggml-cuda/quantize.cu`             | verbatim                                                                 |   443 |
+| `mmid.cuh`              | `ggml/src/ggml-cuda/mmid.cuh`                | patched: `ns4_mmid_large_enabled` prototype                              |     9 |
+| `mmid.cu`               | `ggml/src/ggml-cuda/mmid.cu`                 | patched: large-n global path and case-1 fast path (`NS4_MMID_LARGE`, `NS4_MMID_CASE1`) | 339 |
+| `mmvq.cuh`              | `ggml/src/ggml-cuda/mmvq.cuh`                | patched: `mul_mat_vec_q_switch_type` proto exposed; ggml-tensor entries gated on `NS4_MMVQ_INCLUDE_GGML_ENTRIES` | 34 |
+| `mmvq.cu`               | `ggml/src/ggml-cuda/mmvq.cu`                 | patched: `mul_mat_vec_q_switch_type` promoted from `static`; -1 router id guards; `ggml_cuda_mul_mat_vec_q` + `ggml_cuda_op_mul_mat_vec_q` gated on `NS4_MMVQ_INCLUDE_GGML_ENTRIES` | 1183 |
+| `unary.cuh`             | `ggml/src/ggml-cuda/unary.cuh`               | verbatim (needed by `mmvq.cu` for inline GLU epilogues)                  |   114 |
+| `common.cuh`            | `ggml/src/ggml-cuda/common.cuh`              | verbatim                                                                 |  1489 |
+| `ggml-common.h`         | `ggml/src/ggml-common.h`                     | verbatim                                                                 |  1900 |
+| `vendors/cuda.h`        | `ggml/src/ggml-cuda/vendors/cuda.h`          | verbatim                                                                 |    28 |
+| `ggml.h`                | (new)                                        | redirect to `ns4_ggml_stubs.h`                                           |     5 |
+| `ggml-impl.h`           | (new)                                        | redirect to `ns4_ggml_stubs.h`                                           |     4 |
+| `ggml-cuda.h`           | (new)                                        | redirect to `ns4_ggml_stubs.h`                                           |     4 |
+| `ns4_ggml_stubs.h`      | (new)                                        | shim: ggml_type enum, macros, info struct, type_size lookups             |   303 |
+| `ns4_ggml_stubs.cu`     | (new)                                        | shim impls: `ggml_cuda_info`, naive pool, `ggml_backend_cuda_context::*` |   160 |
+| `ns4_mmq.h`             | (new)                                        | public C ABI for ns4 to call                                             |   857 |
+| `ns4_mmq.cu`            | (new)                                        | host entries and ns4 kernels: dense Q8_0 (plain / aligned / D2R dispatch), routed-MoE entries, aligned-SoA decode matvecs | 4588 |
+| `ns4_mmq_d2r.cu`/`.cuh` | (new)                                        | D2R (dequant-to-registers) MoE-down and dense Q8_0 GEMMs                 | 3370 / 91 |
+| `ns4_repack.cu`/`.h`    | (new)                                        | aligned-artifact builders (IQ2_XXS gate/up, Q2_K down, Q8_0 dense) run at load | 1122 / 126 |
 
-**Total vendored:** ~11,000 lines of CUDA. **Total shim/adapter:** ~600 lines.
+**Upstream (verbatim + patched):** ~12,800 lines of CUDA. **ns4-side:** ~10,600 lines.
 
 ## What llama.cpp's `mmq.cu` does that we don't vendor
 
@@ -117,7 +119,7 @@ upstream adds a new helper), extend `ns4_ggml_stubs.h`.
 
 | Test                                          | Status                       | Phase     |
 |-----------------------------------------------|------------------------------|-----------|
-| `nvcc -c cuda/mmq/ns4_mmq.cu` builds cleanly  | **passes** (sm_120, nvcc 13) | Phase 0   |
+| `nvcc -c src/cuda/mmq/ns4_mmq.cu` builds cleanly | **passes** (sm_120, nvcc 13) | Phase 0   |
 | Q8_0 dense parity vs CPU reference            | **passes** (4 shapes)        | Phase 2   |
 | Q2_K dense parity                             | **passes** (4 shapes)        | Phase 3   |
 | IQ2_XXS dense parity                          | **passes** (4 shapes)        | Phase 3   |
@@ -129,8 +131,9 @@ upstream adds a new helper), extend `ns4_ggml_stubs.h`.
 
 ## Validated performance
 
-PRO 6000 Blackwell (sm_120), CUDA 13.0, V4 Flash IQ2_XXS GGUF (86.7 GB),
-default `NS4_CUDA_MMQ_MOE_MIN_TOKENS=2` (legacy decode preserved):
+Fork-era baseline on a PRO 6000 Blackwell (sm_120), CUDA 13.0, V4 Flash
+IQ2_XXS GGUF (86.7 GB), mmq on the prefill tier only (decode on the legacy
+paths); current numbers are in the top-level README:
 
 | ctx    | baseline pf t/s | mmq pf t/s | speedup    | baseline gen t/s | mmq gen t/s | gen ratio |
 |--------|-----------------|------------|------------|------------------|-------------|-----------|

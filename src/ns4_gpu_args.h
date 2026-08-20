@@ -1,6 +1,6 @@
 /* ns4_gpu_args.h — shared CLI argument parser for --gpu-vram and
- * --gpu-devices flags. Used by ns4_cli, ns4_server, ns4_agent,
- * ns4_bench, and ns4_eval. See mgpu-cli-wiring task (wave 2) for design.
+ * --gpu-devices flags. Used by ns4_cli, ns4_server, ns4_bench, ns4_eval,
+ * score_official, and ns4_agent (deferred).
  *
  * The parser does not link CUDA headers directly. On CUDA builds the
  * "auto" path is gated and dispatches to ns4_gpu_args_probe_auto_cuda,
@@ -66,7 +66,7 @@ int format_gpu_layout_line(const ns4_gpu_config *cfg,
  * length filter_len (use only those device indices).
  *
  * Declared here for the parser's use; not called by application code
- * directly. The Mac/CPU builds skip this branch via the
+ * directly. CPU builds skip this branch via the
  * #if !defined(NS4_NO_GPU) gate in the parser. */
 #if !defined(NS4_NO_GPU)
 int ns4_gpu_args_probe_auto_cuda(const int      *device_filter,

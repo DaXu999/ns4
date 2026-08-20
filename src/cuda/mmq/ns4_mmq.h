@@ -5,12 +5,10 @@
 // without C++ compilation. Functions return 0 on success and non-zero on
 // failure (with stderr error message). Device pointers are caller-owned.
 //
-// Phase 0: skeleton only. Q8_0 dense entry compiles and instantiates
-// mul_mat_q_case<Q8_0> but is not yet wired into ns4_cuda.cu.
-// Phase 1: Q8_1 activation quantizer wrapper added.
-// Phase 2: Q8_0 dense entry verified against cublas+dequant baseline.
-// Phase 3: Q2_K + IQ2_XXS dense entries.
-// Phase 4: MoE _id variants of all three.
+// Entries: the Q8_1 activation quantizer, dense GEMMs (plain, aligned-SoA
+// and D2R), routed-MoE _id variants in raw and aligned-SoA layouts, and the
+// aligned decode matvecs.  ns4_cuda.cu wires a subset (see its mmq section);
+// the rest are the fork's unwired alternates, kept compiled.
 
 #pragma once
 

@@ -93,7 +93,8 @@ export NS4_CUDA_WEIGHT_ARENA_CHUNK_MB="${NS4_CUDA_WEIGHT_ARENA_CHUNK_MB:-5184}"
 export NS4_CUDA_WEIGHT_PRELOAD_SPAN_MB="${NS4_CUDA_WEIGHT_PRELOAD_SPAN_MB:-512}"
 
 # Decode levers from the fp4-mirror build, validated with the summation-order
-# NLL protocol (see the memory notes).  Quality-neutral and deterministic, but
+# NLL protocol (an NLL delta inside the spread between equally valid summation
+# orders is noise, not a quality change).  Quality-neutral and deterministic, but
 # every one except SCAN_INT is numerically different from the bit-exact
 # default paths, so greedy continuations eventually diverge from a run with
 # them unset.  Unset any of them to fall back; note SCAN_INT is presence-gated,

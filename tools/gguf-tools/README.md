@@ -26,11 +26,9 @@ and Q4 recipes live in this directory.
 
 ## Generate An Imatrix
 
-First regenerate or inspect the calibration dataset:
-
-```sh
-python3 tools/gguf-tools/imatrix/dataset/build_ds4_imatrix_dataset.py
-```
+First inspect the tracked calibration dataset in
+`tools/gguf-tools/imatrix/dataset/` (regenerating it needs a ds4 checkout; see
+`tools/gguf-tools/imatrix/README.md`).
 
 Then collect activation statistics with the NS4 runtime:
 

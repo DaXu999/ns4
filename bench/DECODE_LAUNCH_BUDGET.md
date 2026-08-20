@@ -7,8 +7,8 @@ Commit hashes cited below (`8890139`, `a71fc64`, `acf4a5e`, `4a5a6e7`,
 `12072a0`) refer to the ancestor ds4 history and are not reachable from this
 repository; the measurements and conclusions carry over unchanged.
 
-Originally measured 2026-08-06 at `8890139`; sections 1, 3 and 6 were
-re-measured 2026-08-12 at `a71fc64` and several of the original conclusions
+Originally measured at `8890139`; sections 1, 3 and 6 were re-measured at
+`a71fc64` and several of the original conclusions
 turned out to be wrong. Where that happened the old claim is kept and marked,
 because the reason it was wrong is usually the useful part.
 
@@ -29,7 +29,7 @@ Per token, from the GGUF tensor table:
 | hyper-connection `hc_*_fn` (F16, 43x)                     |       68 MB |
 | **total**                                                 | **9191 MB** |
 
-**Corrected 2026-08-12.** This table used to read 195 MB/layer x 43 = 8.4 GB,
+**Corrected at `a71fc64`.** This table used to read 195 MB/layer x 43 = 8.4 GB,
 which was wrong twice. It took layer 3 as representative, but layer 3 is a
 ratio-128 layer and the compressors alternate -- the 21 ratio-4 layers carry
 `attn_compressor_kv/gate` at (4096,1024) rather than (4096,512), and 21 layers
@@ -113,7 +113,7 @@ capture may not, so replaying there keeps decode on one stream. Fixed in
 | 4096 |               **57.29**  |                46.00  |     49.12  |
 | 8192 |               **54.93**  |                47.34  |     47.64  |
 
-**Superseded (2026-08-07).** This section used to end by calling wider island
+**Superseded.** This section used to end by calling wider island
 coverage "the next lever, worth more than any single kernel". That was
 implemented and measured, and it is only true below sequence position 4096:
 **+7.7% at ctx 2048 but -11 to -13% at 4096 and above**. Past the full-attention
@@ -186,7 +186,7 @@ stream does. **So no version of these kernels can approach 90% of 1642**, and
 the "% of 1642" column in section 5 understates the small kernels. Judge them
 against the size-appropriate ceiling.
 
-## 7. What moved on 2026-08-12
+## 7. What moved between `8890139` and `a71fc64`
 
 Three kernel changes, all bit-identical (teacher-forced NLL unchanged in every
 printed digit on two corpora: 4045.607689345 and 2121.782793653).
@@ -240,7 +240,7 @@ and all three widths.
 Harnesses under `bench/decode-profiling/`, none built by the Makefile:
 
 * `kprof.c` -- `LD_PRELOAD` launch interposer, per-kernel GPU time. Read its
-  four traps in the README before trusting a report.
+  traps in the README before trusting a report.
 * `bw_probe.cu` -- achievable bandwidth vs block count, and the strided penalty.
 * `launch_floor.cu`, `graph_floor.cu`, `graph_update.cu` -- the launch floor,
   what a graph buys, and what each capture strategy costs.

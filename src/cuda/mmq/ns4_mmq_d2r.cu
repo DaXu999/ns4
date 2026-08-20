@@ -3028,12 +3028,11 @@ int ns4_mmq_iq2_xxs_moe_d2r_fused_launch(
 }
 
 // ============================================================================
-// Dense Q8_0 D2R (2026-07-09, proto_gemm_dense_q8_d2r.cu passes 0-5; arc
-// record in local/docs/ns4_d2r_decomposition_analysis_2026-07-08.md "DENSE-Q8
-// D2R PROTO ARC").
+// Dense Q8_0 D2R (ds4 cuda/mmq/test/proto_gemm_dense_q8_d2r.cu passes 0-5,
+// not imported).
 //
-// Reads the kind-5 aligned artifact (CUDA_DERIVED_Q8_0_ALIGNED_DENSE, weight
-// server --repack-q8-aligned, ADDITIVE) in place: [half dq[nblk]][pad to 64B]
+// Reads the kind-5 aligned artifact (CUDA_DERIVED_Q8_0_ALIGNED_DENSE from
+// ns4_repack_build_q8_aligned, ADDITIVE) in place: [half dq[nblk]][pad to 64B]
 // [int8 qs[nblk*32]], nblk = M*K/32, raw (row-major) block order.  m128n128
 // CTA, 16 warps (8 row x 2 col, one CTA/SM), 3-stage rings at k64 cadence
 // with a single barrier per iter (wait -> sync -> issue), split q8 staging

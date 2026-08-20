@@ -22,8 +22,8 @@ The speed numbers in the top-level README are for the tuned serving
 configuration on an RTX PRO 6000 (`scripts/run-cuda-436k-server.sh`). The
 default sweep above does not reproduce them: the table needs the same
 `NS4_CUDA_*` environment stack that launcher exports, the served
-`--ctx-alloc 436000` (prefill depends on the allocated context, not just
-the sequence position), and `--prefill-chunk 2048`.
+`--ctx-alloc 436000` (so context buffers and free VRAM match serving; prefill
+speed itself is flat across allocations), and `--prefill-chunk 2048`.
 
 `scripts/ctx-sweep.sh` runs the whole protocol: the tuned environment
 stack, a 4096 -> 262144 frontier ladder (x2 steps), four runs with the
@@ -39,7 +39,7 @@ header documents the details.
 ```
 
 The current reference results are `bench/rtx_pro_6000.csv` (per-frontier
-medians of that protocol's measured runs, 2026-08-19) with the chart in
+medians of that protocol's measured runs at `4ef8515`) with the chart in
 `bench/rtx_pro_6000_ts.svg`. Prefill throughput is sensitive to host and
 clock state, so treat cross-machine or cross-boot prefill deltas of a few
 percent as environment, not code, unless measured back-to-back.
@@ -56,6 +56,8 @@ python3 bench/plot_speed.py bench/rtx_pro_6000.csv --title "RTX PRO 6000 t/s"
 
 The script uses only the Python standard library. By default it writes a file
 next to the CSV using the `_ts.svg` suffix, such as `bench/rtx_pro_6000_ts.svg`.
+It plots `gen_tps`, the whole-run decode average (first token included), where
+the README table quotes `gen_steady_tps`.
 
 `decode-profiling/` contains the standalone kernel-level harnesses used to
 produce `DECODE_LAUNCH_BUDGET.md`; see its README before trusting or

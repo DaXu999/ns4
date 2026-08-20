@@ -14,7 +14,7 @@ The best mixed Flash experiment so far keeps the fixed-imatrix 2-bit GGUF as the
 base, then replaces only the routed experts in layers `37-42` with the same
 tensors from the fixed-imatrix Q4 GGUF.
 
-This produces a file around 91 GB instead of the full Q4 file around 153 GB. In
+This produces a file around 98 GB (91 GiB) instead of the full Q4 file around 153 GB. In
 the local output-agreement checks, this last-six-layers file was statistically
 closer to the full Q4 GGUF than the plain 2-bit GGUF. This is not the same as a
 benchmark score, but it is a useful signal that the mixed file behaves more like
