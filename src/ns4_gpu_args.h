@@ -27,7 +27,7 @@ extern "C" {
  *     NULL       -- flag unset
  *     "0"        -- skip CUDA entirely; sets *out_skip_cuda = true
  *     "auto"     -- query free VRAM via CUDA (CUDA build only)
- *     "N[,N...]" -- explicit GB budgets per device
+ *     "N[,N...]" -- explicit GiB budgets per device
  *
  *   devices_arg may be:
  *     NULL       -- 0..n-1 of visible devices (or 0..vram_count-1)
@@ -50,7 +50,7 @@ int parse_gpu_vram_arg(
  * ns4_engine_create_with_gpu_config is called.
  *
  * Example output:
- *   ns4: GPU config: 2 devices [0,1] requested, budgets 40,12 GB; auto=true
+ *   ns4: GPU config: 2 devices [0,1] requested, budgets 40,12 GiB; auto=true
  *
  * Returns the number of bytes written (excluding the trailing NUL), or
  * -1 if out is NULL/outlen is 0.

@@ -37467,8 +37467,10 @@ const int *ns4_test_engine_placement(const ns4_engine *e) {
 }
 #endif /* NS4_TEST_HOOKS */
 
+#ifndef NS4_NO_GPU
 static int engine_install_dspark_support_cache(ns4_engine *e);
 static int engine_install_gpu_placement(ns4_engine *e);
+#endif
 static int ns4_engine_open_internal(ns4_engine **out,
                                     const ns4_engine_options *opt,
                                     const ns4_gpu_config *gpu_cfg);
@@ -37699,8 +37701,8 @@ static int ns4_engine_open_internal(ns4_engine **out,
                     (double)engine_per_tier_graph_overhead_bytes(e) /
                         (1024.0 * 1024.0 * 1024.0));
             fprintf(stderr,
-                    "ns4: CPU-spill placement detected; CPU-tier execution wiring "
-                    "is the wave-3b mgpu-graph-session-cpu-spill follow-up.\n");
+                    "ns4: CPU-spill placement detected; CPU-tier execution is not "
+                    "wired.\n");
             fprintf(stderr,
                     "ns4: --gpu-vram placement does not fit at the requested "
                     "context (ctx hint = %d):\n"

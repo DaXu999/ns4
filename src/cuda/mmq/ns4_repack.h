@@ -1,11 +1,11 @@
-/* ns4_repack: the aligned-SoA derived-weight layout library shared by the
- * weight server (tools/ns4_weight_server.cu) and the engine's in-process
- * self-load build (ns4_cuda.cu).  The GGUF tensor catalog walk, the repack
- * candidate predicates, the S5 parallel repack driver, the FNV-1a artifact
- * hash, and the three aligned repack builds (IQ2_XXS gate/up, Q2_K down,
- * Q8_0 dense) live here so both producers emit bit-identical artifacts
- * (gate: --repack-hash / NS4_WS_REPACK_HASH FNV lines).  Layout contracts
- * are shared with the consuming kernels in cuda/mmq/ns4_mmq.h. */
+/* ns4_repack: the aligned-SoA derived-weight layout library behind the
+ * engine's in-process self-load build (ns4_cuda.cu), extracted from the
+ * fork's weight server (tools/ds4_weight_server.cu there).  The GGUF tensor
+ * catalog walk, the repack candidate predicates, the S5 parallel repack
+ * driver, the FNV-1a artifact hash, and the three aligned repack builds
+ * (IQ2_XXS gate/up, Q2_K down, Q8_0 dense) live here so the artifacts stay
+ * bit-identical to that producer's (gate: the NS4_REPACK_HASH=1 FNV lines).
+ * Layout contracts are shared with the consuming kernels in ns4_mmq.h. */
 #ifndef NS4_REPACK_H
 #define NS4_REPACK_H
 
@@ -58,7 +58,7 @@ struct ns4_repack_artifact {
     void *dev = nullptr;                  /* device artifact buffer */
 };
 
-/* Optional device-allocation hooks (weight server VMM backend).  alloc must
+/* Optional device-allocation hooks (e.g. a VMM backend).  alloc must
  * fill art->dev with at least art->bytes of device memory and return true;
  * free releases an allocation made by alloc.  Leave both NULL for plain
  * cudaMalloc/cudaFree. */
@@ -66,12 +66,12 @@ typedef bool (*ns4_repack_alloc_fn)(void *ctx, ns4_repack_artifact *art);
 typedef void (*ns4_repack_free_fn)(void *ctx, ns4_repack_artifact *art);
 
 struct ns4_repack_build_args {
-    const char *log_prefix = "ns4";  /* stderr line prefix ("ns4_weight_server" | "ns4") */
+    const char *log_prefix = "ns4";  /* stderr line prefix */
     const char *model_id = "base";   /* log label */
     const char *path = nullptr;      /* GGUF path (each builder re-maps it) */
     const std::vector<ns4_repack_tensor> *records = nullptr;
     int device = 0;
-    uint64_t copy_chunk_bytes = 0;   /* staged read chunk (weight server --copy-chunk-mb) */
+    uint64_t copy_chunk_bytes = 0;   /* staged read chunk bytes (0 = default) */
     ns4_repack_alloc_fn alloc_fn = nullptr;
     ns4_repack_free_fn free_fn = nullptr;
     void *alloc_ctx = nullptr;
@@ -100,7 +100,7 @@ bool ns4_repack_q8_candidate(const ns4_repack_tensor &t);
 bool ns4_repack_q8_f16_candidate(const ns4_repack_tensor &t);
 
 /* S5 driver configuration.  Unset (0 / false) defers to the env knobs
- * NS4_WS_REPACK_THREADS and NS4_WS_REPACK_HASH. */
+ * NS4_REPACK_THREADS and NS4_REPACK_HASH. */
 void ns4_repack_set_threads(int n);
 void ns4_repack_set_hash(bool on);
 

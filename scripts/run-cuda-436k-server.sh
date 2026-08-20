@@ -97,8 +97,8 @@ export NS4_CUDA_WEIGHT_PRELOAD_SPAN_MB="${NS4_CUDA_WEIGHT_PRELOAD_SPAN_MB:-512}"
 # orders is noise, not a quality change).  Quality-neutral and deterministic, but
 # every one except SCAN_INT is numerically different from the bit-exact
 # default paths, so greedy continuations eventually diverge from a run with
-# them unset.  Unset any of them to fall back; note SCAN_INT is presence-gated,
-# so NS4_CUDA_INDEXER_SCAN_INT=0 still ENABLES it -- unset it to disable:
+# them off.  Export any of them as 0 to fall back (the threshold only takes
+# 64..4096: export it empty to keep the engine default):
 #   SCAN_INT      bit-exact.  Exact-integer dp4a indexer scan over the fp4
 #                 mirrors; matches the default f32 tree, short and long
 #   F16_ONE_WIDE  NOT bit-exact.  Replaces the cuBLAS one-token f16 GEMVs
@@ -116,7 +116,7 @@ export NS4_CUDA_Q8_PAIR_WIDE="${NS4_CUDA_Q8_PAIR_WIDE:-256}"
 # at 4096; the dense path cannot reach long context -- shared-memory bound).
 # NOT bit-exact: identical to the default path on short prompts, but it
 # changes results once the sequence reaches its 4k-8k band.
-export NS4_CUDA_DECODE_INDEXER_SPARSE_THRESHOLD="${NS4_CUDA_DECODE_INDEXER_SPARSE_THRESHOLD:-4096}"
+export NS4_CUDA_DECODE_INDEXER_SPARSE_THRESHOLD="${NS4_CUDA_DECODE_INDEXER_SPARSE_THRESHOLD-4096}"
 
 printf 'run-cuda-436k-server: ctx=%s prefill-chunk=%s gpu-vram=%s -> %s:%s\n' \
     "$CTX" "$PREFILL_CHUNK" "$GPU_VRAM" "$SERVER_HOST" "$SERVER_PORT"

@@ -1,9 +1,8 @@
 /* ns4_repack: shared aligned-artifact layout library.  See ns4_repack.h for
- * the API surface and tools/ns4_weight_server.cu for the original home of
- * this code (extracted 2026-07 so self-load boots build the same artifacts
- * in-process).  Every byte-movement and kernel here must stay bit-identical
- * between the weight-server and in-process producers — the FNV repack-hash
- * lines are the gate. */
+ * the API surface; the code was extracted from the fork's weight server
+ * (tools/ds4_weight_server.cu there) so self-load boots build the same
+ * artifacts in-process.  Every byte-movement and kernel here must stay
+ * bit-identical to that producer — the FNV repack-hash lines are the gate. */
 #include "ns4_repack.h"
 
 #include <cuda_runtime.h>
@@ -510,10 +509,9 @@ bool ns4_repack_q8_f16_candidate(const ns4_repack_tensor &t) {
  * the NVMe at queue depth = nthreads while uploads/kernels overlap other
  * workers' reads.  Allocation (VMM reservation order) and artifact push stay
  * on the caller thread so range layout is thread-count-invariant; only the
- * byte movement fans out.  --repack-threads N / NS4_WS_REPACK_THREADS
- * overrides (1 = the old serial order through the new plumbing);
- * --repack-hash / NS4_WS_REPACK_HASH=1 prints a per-artifact FNV-1a for the
- * bit-identity gate. */
+ * byte movement fans out.  NS4_REPACK_THREADS overrides (1 = the old serial
+ * order through the new plumbing); NS4_REPACK_HASH=1 prints a per-artifact
+ * FNV-1a for the bit-identity gate. */
 static int g_repack_threads = 0;   /* 0 = auto (min(6, hw)) */
 static int g_repack_hash = -1;     /* -1 = read env on first use */
 
@@ -527,7 +525,7 @@ void ns4_repack_set_hash(bool on) {
 
 static bool repack_hash_enabled(void) {
     if (g_repack_hash < 0) {
-        const char *rh = getenv("NS4_WS_REPACK_HASH");
+        const char *rh = getenv("NS4_REPACK_HASH");
         g_repack_hash = (rh && rh[0] == '1' && rh[1] == '\0') ? 1 : 0;
     }
     return g_repack_hash == 1;
@@ -536,7 +534,7 @@ static bool repack_hash_enabled(void) {
 static int repack_thread_count(size_t njobs) {
     int n = g_repack_threads;
     if (n <= 0) {
-        const char *e = getenv("NS4_WS_REPACK_THREADS");
+        const char *e = getenv("NS4_REPACK_THREADS");
         n = e && e[0] ? atoi(e) : 0;
     }
     if (n <= 0) {

@@ -132,6 +132,8 @@ src/ns4_eval.o: src/ns4_eval.c src/ns4.h src/ns4_ssd.h src/ns4_distributed.h src
 src/ns4_kvstore.o: src/ns4_kvstore.c src/ns4_kvstore.h src/ns4.h src/ns4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ src/ns4_kvstore.c
 
+# ns4_test.c #includes ns4_server.c whole, so the server's main-path statics
+# are unused there; the NS4_NO_GPU objects leave the CUDA-only helpers unused.
 ns4_test.o: tests/ns4_test.c src/ns4_server.c src/ns4.h src/ns4_ssd.h src/ns4_distributed.h src/ns4_help.h src/ns4_kvstore.h vendor/rax.h
 	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ tests/ns4_test.c
 
@@ -232,7 +234,7 @@ tests/test_gpu_lookup_cache_strict: tests/test_gpu_lookup_cache_strict.o src/ns4
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 src/ns4_cuda_test_hooks.o: src/ns4.c src/ns4.h src/ns4_gpu.h src/ns4_gpu_mgpu.h src/ns4_layer_pack.h
-	$(CC) $(CFLAGS) -Wno-unused-function -DNS4_TEST_HOOKS -I$(CUDA_HOME)/include -c -o $@ src/ns4.c
+	$(CC) $(CFLAGS) -DNS4_TEST_HOOKS -I$(CUDA_HOME)/include -c -o $@ src/ns4.c
 
 tests/test_engine_mgpu_refusal.o: tests/test_engine_mgpu_refusal.c src/ns4.h src/ns4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -I$(CUDA_HOME)/include -c -o $@ $<
@@ -324,4 +326,4 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	./tests/test_mxfp4_dot
 
 clean:
-	rm -f ns4 ns4-server ns4-bench ns4-eval ns4_cpu ns4_native ns4_server_test ns4_test tools/gguf-tools/quality-testing/score_official tools/gguf-tools/quality-testing/score_official.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_cuda tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o src/*.o src/cuda/mmq/*.o vendor/*.o tests/cuda_long_context_smoke
+	rm -f ns4 ns4-server ns4-bench ns4-eval ns4_test tools/gguf-tools/quality-testing/score_official tools/gguf-tools/quality-testing/score_official.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_cuda tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o src/*.o src/cuda/mmq/*.o vendor/*.o tests/cuda_long_context_smoke

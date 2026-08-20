@@ -31,8 +31,8 @@ assert_not_grep() {
 }
 
 # Binaries to check
-BINS=(./ns4 ./ns4-server ./ns4-bench)
-NAMES=(ns4 ns4-server ns4-bench)
+BINS=(./ns4 ./ns4-server ./ns4-bench ./ns4-eval)
+NAMES=(ns4 ns4-server ns4-bench ns4-eval)
 
 # 1: each binary's --help mentions both flags.
 for i in "${!BINS[@]}"; do
@@ -44,7 +44,9 @@ for i in "${!BINS[@]}"; do
     "$bin" --help > "$LOG" 2>&1 || true
     assert_grep "$name --help mentions --gpu-vram" "gpu-vram" "$LOG"
     assert_grep "$name --help mentions --gpu-devices" "gpu-devices" "$LOG"
-    assert_grep "$name --help mentions --cuda-tensor-parallel" "cuda-tensor-parallel" "$LOG"
+    if [ "$name" != "ns4-eval" ]; then   # eval has no tensor-parallel mode
+        assert_grep "$name --help mentions --cuda-tensor-parallel" "cuda-tensor-parallel" "$LOG"
+    fi
     if [ "$name" = "ns4" ]; then
         "$bin" --help distributed > "$LOG" 2>&1 || true
         assert_grep "$name --help distributed mentions --dist-activation-bits" \
@@ -182,7 +184,7 @@ fi
 if [ -x ./ns4 ]; then
     ./ns4 --gpu-vram 40,12 -m /dev/null > "$LOG" 2>&1
     rc=$?
-    if grep -q "GPU config: 2 devices \[0,1\] requested, budgets 40,12 GB" "$LOG"; then
+    if grep -q "GPU config: 2 devices \[0,1\] requested, budgets 40,12 GiB" "$LOG"; then
         ok "ns4 --gpu-vram 40,12 prints expected layout line"
     else
         fail "ns4 --gpu-vram 40,12 missing or malformed layout line"

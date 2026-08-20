@@ -118,8 +118,6 @@ typedef struct {
     int placement_ctx_hint;
     /* Server batch mode serializes execution and can share prefill scratch. */
     bool share_session_prefill_workspace;
-    bool first_token_test;
-    bool graph_test;
     bool load_slice;
     uint32_t load_layer_start;
     uint32_t load_layer_end;
@@ -334,11 +332,6 @@ int ns4_session_eval_speculative_argmax(ns4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen);
-/* TP worker side of a mirrored speculative-verify block: run its half of the
- * batch verify for KV side effects, then obey the leader's commit frame
- * (keep, or roll back and replay). Only called from ns4_tp_worker_run. */
-int ns4_session_tp_spec_cycle(ns4_session *s, const int *drafts, int draft_n,
-                              char *err, size_t errlen);
 void ns4_session_invalidate(ns4_session *s);
 void ns4_session_rewind(ns4_session *s, int pos);
 int ns4_session_pos(ns4_session *s);

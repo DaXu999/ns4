@@ -73,7 +73,11 @@ tools/gguf-tools/quality-testing/score_official \
 
 Use `data/flash/manifest.tsv` for Flash GGUFs.  The scorer and comparator do not care
 which model produced the manifest; the manifest path selects the continuation
-set.
+set.  Manifest rows resolve relative to the manifest's own directory when they
+do not exist as written, so the frozen fixture works from any checkout layout.
+On a single 96 GB card export `NS4_CUDA_NO_Q8_F16_CACHE=1` first, as the serving
+launcher does; otherwise the q8->f16 weight cache leaves no VRAM for the
+session.
 
 Add `--quality` to disable NS4's speed-oriented numerical shortcuts. For an
 independent llama.cpp comparison of a DeepSeek V4 GGUF, use the same manifest

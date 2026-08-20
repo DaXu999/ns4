@@ -262,6 +262,13 @@ static inline int ns4_tensor_device_idx(const ns4_gpu_tensor *t) {
     return d;
 }
 
+/* Value-gated switch: unset or empty -> fallback, "0" -> off, else on. */
+static int cuda_env_flag_enabled(const char *name, int fallback) {
+    const char *env = getenv(name);
+    if (!env || !env[0]) return fallback;
+    return strcmp(env, "0") != 0;
+}
+
 /* Debug/override flags are read once per CUDA init. The hot decode path calls
  * the xdev helpers many times per token, so they must not re-enter getenv(). */
 static void cuda_xdev_env_refresh(void) {
@@ -279,8 +286,7 @@ static void cuda_decode_dispatch_env_refresh(void) {
     g_cuda_no_decode_value512 = getenv("NS4_CUDA_NO_DECODE_VALUE512") != NULL;
     g_cuda_no_top1 = getenv("NS4_CUDA_NO_TOP1") != NULL;
     g_cuda_no_topk_radix = getenv("NS4_CUDA_NO_TOPK_RADIX") != NULL;
-    g_cuda_indexer_scan_int =
-        getenv("NS4_CUDA_INDEXER_SCAN_INT") != NULL;
+    g_cuda_indexer_scan_int = cuda_env_flag_enabled("NS4_CUDA_INDEXER_SCAN_INT", 0);
     g_cuda_end_stream_sync = getenv("NS4_CUDA_END_STREAM_SYNC") != NULL;
     g_cuda_no_setdevice_cache = getenv("NS4_CUDA_NO_SETDEVICE_CACHE") != NULL;
     g_cuda_exact_score_split_graph =
@@ -1431,12 +1437,6 @@ static uint32_t cuda_parse_u32_env_clamped(const char *name, uint32_t fallback,
     return (uint32_t)v;
 }
 
-static int cuda_env_flag_enabled(const char *name, int fallback) {
-    const char *env = getenv(name);
-    if (!env || !env[0]) return fallback;
-    return strcmp(env, "0") != 0;
-}
-
 extern "C" int ns4_gpu_set_decode_fast_attention(int enabled) {
     const int old = g_decode_fast_attention;
     g_decode_fast_attention = enabled != 0;
@@ -1595,7 +1595,7 @@ static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_
     if (g_quality_mode) return 0;
     if (g_q8_cache_suppressed) return 0;
     if (g_q8_f16_disabled_after_oom) return 0;
-    if (getenv("NS4_CUDA_NO_Q8_F16_CACHE") != NULL) return 0;
+    if (cuda_env_flag_enabled("NS4_CUDA_NO_Q8_F16_CACHE", 0)) return 0;
     if (cuda_q8_f16_cache_limit_bytes() == 0) return 0;
     if (getenv("NS4_CUDA_Q8_F16_ALL") != NULL) return 1;
     if (!label) return 0;
@@ -14896,25 +14896,6 @@ __device__ __forceinline__ static bool topk_score_better(float av, uint32_t ai, 
     return av > bv || (av == bv && ai < bi);
 }
 
-__device__ __forceinline__ static void top2_insert_candidate(
-        float     v,
-        uint32_t  i,
-        float    *v0,
-        uint32_t *i0,
-        float    *v1,
-        uint32_t *i1) {
-    if (i == *i0 || i == *i1) return;
-    if (topk_score_better(v, i, *v0, *i0)) {
-        *v1 = *v0;
-        *i1 = *i0;
-        *v0 = v;
-        *i0 = i;
-    } else if (topk_score_better(v, i, *v1, *i1)) {
-        *v1 = v;
-        *i1 = i;
-    }
-}
-
 /* DSpark markov chain step: out = argmax_i(logits[i] + dot(w2[i], w1[prev]))
  * over the vocab, entirely on-device (logits row stays resident; the chain
  * loop only reads back 4 bytes per draft). w1/w2 are q8_0 with 272-byte rows
@@ -15072,59 +15053,6 @@ __global__ static void indexer_top1_value_kernel(
     if (tid == 0u) {
         selected[t] = index_offset + idxs[0];
         values[t] = vals[0];
-    }
-}
-
-__global__ static void indexer_top2_value_kernel(
-        uint32_t *selected,
-        float *values,
-        const float *scores,
-        uint32_t n_comp,
-        uint32_t n_tokens,
-        uint32_t index_offset) {
-    const uint32_t t = blockIdx.x;
-    const uint32_t tid = threadIdx.x;
-    if (t >= n_tokens || tid >= 1024u) return;
-
-    const float *row = scores + (uint64_t)t * n_comp;
-    float best0_v = -INFINITY;
-    float best1_v = -INFINITY;
-    uint32_t best0_i = UINT32_MAX;
-    uint32_t best1_i = UINT32_MAX;
-    for (uint32_t i = tid; i < n_comp; i += 1024u) {
-        const uint32_t gi = index_offset + i;
-        top2_insert_candidate(row[i], gi,
-                              &best0_v, &best0_i,
-                              &best1_v, &best1_i);
-    }
-
-    __shared__ float vals0[1024];
-    __shared__ float vals1[1024];
-    __shared__ uint32_t idxs0[1024];
-    __shared__ uint32_t idxs1[1024];
-    vals0[tid] = best0_v;
-    vals1[tid] = best1_v;
-    idxs0[tid] = best0_i;
-    idxs1[tid] = best1_i;
-    __syncthreads();
-
-    for (uint32_t stride = 512u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            top2_insert_candidate(vals0[tid + stride], idxs0[tid + stride],
-                                  &vals0[tid], &idxs0[tid],
-                                  &vals1[tid], &idxs1[tid]);
-            top2_insert_candidate(vals1[tid + stride], idxs1[tid + stride],
-                                  &vals0[tid], &idxs0[tid],
-                                  &vals1[tid], &idxs1[tid]);
-        }
-        __syncthreads();
-    }
-
-    if (tid == 0u) {
-        selected[(uint64_t)t * 2u + 0u] = idxs0[0];
-        selected[(uint64_t)t * 2u + 1u] = idxs1[0];
-        values[(uint64_t)t * 2u + 0u] = vals0[0];
-        values[(uint64_t)t * 2u + 1u] = vals1[0];
     }
 }
 
@@ -16509,28 +16437,6 @@ extern "C" int ns4_gpu_indexer_top1_value_tensor(
     return cuda_ok(cudaGetLastError(), "indexer top1 value launch");
 }
 
-extern "C" int ns4_gpu_indexer_top2_value_tensor(
-        ns4_gpu_tensor       *selected,
-        ns4_gpu_tensor       *values,
-        const ns4_gpu_tensor *scores,
-        uint32_t                n_comp,
-        uint32_t                n_tokens,
-        uint32_t                index_offset) {
-    if (!selected || !values || !scores || n_comp < 2u || n_tokens == 0 ||
-        scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(float) ||
-        selected->bytes < (uint64_t)n_tokens * 2u * sizeof(uint32_t) ||
-        values->bytes < (uint64_t)n_tokens * 2u * sizeof(float)) {
-        return 0;
-    }
-    indexer_top2_value_kernel<<<n_tokens, 1024, 0, cuda_decode_stream()>>>((uint32_t *)selected->ptr,
-                                                  (float *)values->ptr,
-                                                  (const float *)scores->ptr,
-                                                  n_comp,
-                                                  n_tokens,
-                                                  index_offset);
-    return cuda_ok(cudaGetLastError(), "indexer top2 value launch");
-}
-
 extern "C" int ns4_gpu_dsv4_topk_mask_tensor(
         ns4_gpu_tensor       *mask,
         const ns4_gpu_tensor *topk,
@@ -17840,14 +17746,14 @@ extern "C" int ns4_gpu_matmul_f16_pair_tensor(
         (((uintptr_t)w0 | (uintptr_t)w1) & 15u) == 0u &&
         getenv("NS4_CUDA_NO_F16_PAIR_VEC4") == NULL;
     const char *wide_env = vec4_ok ? getenv("NS4_CUDA_F16_PAIR_WIDE") : NULL;
-    if (wide_env) {
-        /* The value picks NT, so the three widths can be A/B'd inside one
-         * binary.  They are all equally valid reorderings of the same sum and
-         * sit the same ~2.5e-7 relative L2 from each other, so their spread in
-         * any end-to-end metric *is* this projection's summation-order noise
-         * band -- the control that says whether a change against the ordered
-         * form means anything.  Same reason NS4_CUDA_FLASH_ATTN_SPLIT is a
-         * number rather than a flag. */
+    if (wide_env && atoi(wide_env) != 0) {
+        /* The value picks NT (0 keeps the ordered path), so the three widths
+         * can be A/B'd inside one binary.  They are all equally valid
+         * reorderings of the same sum and sit the same ~2.5e-7 relative L2
+         * from each other, so their spread in any end-to-end metric *is* this
+         * projection's summation-order noise band -- the control that says
+         * whether a change against the ordered form means anything.  Same
+         * reason NS4_CUDA_FLASH_ATTN_SPLIT is a number rather than a flag. */
         const int nt = atoi(wide_env);
         if (nt == 128) {
             matmul_f16_pair_wide_kernel<128><<<(unsigned)out_dim, 128, 0,
@@ -29573,43 +29479,6 @@ extern "C" int ns4_gpu_tensor_copy_f32_to_f16(ns4_gpu_tensor *dst, uint64_t dst_
     return cuda_ok(cudaGetLastError(), "tensor f32-to-f16 copy launch");
 }
 
-extern "C" int ns4_gpu_tensor_read_after_selected_event(const ns4_gpu_tensor *tensor,
-                                             uint64_t offset,
-                                             void *data,
-                                             uint64_t bytes,
-                                             uint64_t event_value,
-                                             const char *label) {
-    (void)event_value;
-    if (!tensor || !data || offset > tensor->bytes ||
-        bytes > tensor->bytes - offset) {
-        return 0;
-    }
-    if (!cuda_ok(cudaDeviceSynchronize(),
-                 label ? label : "selected readback wait")) {
-        return 0;
-    }
-    return cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset,
-                              (size_t)bytes, cudaMemcpyDeviceToHost),
-                   "selected tensor read");
-}
-
-extern "C" int ns4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
-                               const ns4_gpu_tensor *out_t,
-                               ns4_gpu_tensor *in_t,
-                               uint64_t bytes) {
-    fprintf(stderr, "ns4: CUDA stub called: ns4_gpu_tp_big_gate_encode\n");
-    return 0;
-}
-
-extern "C" int ns4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
-    fprintf(stderr, "ns4: CUDA stub called: ns4_gpu_tp_gate_encode\n");
-    return 0;
-}
-
-extern "C" void ns4_gpu_tp_set_attn_head_split(int enabled) {
-    (void)enabled;   /* Mac network-TP head split: no-op on CUDA */
-}
-
 extern "C" int ns4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label) {
     (void)event_value;
     return cuda_ok(cudaDeviceSynchronize(),
@@ -29847,32 +29716,8 @@ extern "C" int ns4_gpu_hc_expand_add_split_half_add_tensor(
     return 0;
 }
 
-extern "C" void ns4_gpu_tp_suspend_expert_sharding(int suspend) {
-    (void)suspend;
-}
-
-extern "C" void ns4_gpu_tp_keepalive_pause(int paused) {
-    (void)paused;
-}
-
 extern "C" void ns4_gpu_model_residency_skip(int skip) {
     (void)skip;
 }
 
-extern "C" uint64_t ns4_gpu_tp_big_gate_kick(
-        uint32_t layer, uint32_t rows, const ns4_gpu_tensor *out_t,
-        ns4_gpu_tensor *in_t, uint64_t bytes) {
-    (void)layer; (void)rows; (void)out_t; (void)in_t; (void)bytes;
-    return 0;
-}
-
-extern "C" int ns4_gpu_tp_big_gate_wait(uint64_t seq) {
-    (void)seq;
-    return 0;
-}
-
-extern "C" int ns4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
-    (void)layer; (void)rows;
-    return 0;
-}
 #pragma GCC diagnostic pop

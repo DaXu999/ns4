@@ -66,7 +66,7 @@ headroom, not for speed: prefill holds full speed at every allocation through
 near 538k and the free-VRAM floor). Prefill decay with sequence position is
 per-token attention and DSA indexer cost, not memory pressure. The tuned decode
 levers it enables are deterministic but not bit-exact against the default
-paths; unset them to fall back.
+paths; export them as 0 to fall back (its header has the details).
 
 See [bench/README.md](bench/README.md) for how numbers are collected and how
 to contribute results for other CUDA hardware.
@@ -147,9 +147,10 @@ to select another supported GGUF from `./gguf/`. Run `./ns4 --help` and
 
 CUDA builds accept `--gpu-vram N[,N,...]` and `--gpu-devices N[,N,...]` in
 the CLI, server, benchmark, and eval. VRAM values are per-device GiB budgets;
-`--gpu-vram auto` uses the free memory reported by CUDA. Placement reserves
-graph and KV memory for the requested context and refuses to start if model
-layers would spill to the CPU. Do not treat the CPU path as a production
+`--gpu-vram auto` uses the free memory reported by CUDA, `--gpu-vram 0` selects
+the CPU backend, and combining the flags with `--cpu` is an error. Placement
+reserves graph and KV memory for the requested context and refuses to start if
+model layers would spill to the CPU. Do not treat the CPU path as a production
 target: it shares the same KV session and snapshot format as CUDA, but exists
 for reference and debugging.
 

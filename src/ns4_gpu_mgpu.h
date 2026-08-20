@@ -117,7 +117,6 @@ void ns4_gpu_tensor_free_in_place(ns4_gpu_tensor *t);
  * ns4_gpu_tensor_alloc_ptr_on(0, bytes). */
 ns4_gpu_tensor *ns4_gpu_tensor_alloc_ptr_on(int tier, uint64_t bytes);
 int ns4_gpu_tensor_copy_async(ns4_gpu_tensor *dst, const ns4_gpu_tensor *src, uint64_t bytes);
-void ns4_gpu_enable_q8_dequant_gemm(void);
 
 /* Heap-allocated MANAGED-memory tensor on a specific logical tier. Used
  * for the KV-cache pool. Stamps tier on the tensor so subsequent

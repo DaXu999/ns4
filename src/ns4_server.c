@@ -2777,8 +2777,28 @@ static bool parse_chat_request(ns4_engine *e, server *s, const char *body, int d
                     free(key);
                     goto bad;
                 }
-                tool_choice_none = !strcmp(choice, "none");
+                /* "none" and "auto" are honoured; "required" needs constrained
+                 * decoding we don't implement -- reject, as /v1/responses does,
+                 * instead of silently downgrading to auto. */
+                if (!strcmp(choice, "none")) {
+                    tool_choice_none = true;
+                } else if (strcmp(choice, "auto") != 0) {
+                    snprintf(err, errlen, "tool_choice=%s not supported", choice);
+                    free(choice);
+                    free(key);
+                    chat_msgs_free(&msgs);
+                    free(tool_schemas);
+                    request_free(r);
+                    return false;
+                }
                 free(choice);
+            } else if (*p == '{') {
+                snprintf(err, errlen, "forced tool_choice not supported");
+                free(key);
+                chat_msgs_free(&msgs);
+                free(tool_schemas);
+                request_free(r);
+                return false;
             } else if (!json_skip_value(&p)) {
                 free(key);
                 goto bad;
@@ -2980,7 +3000,22 @@ static bool parse_anthropic_request(ns4_engine *e, server *s, const char *body, 
                             free(key);
                             goto bad;
                         }
-                        tool_choice_none = !strcmp(choice, "none");
+                        /* "none" and "auto" are honoured; "any" and "tool"
+                         * need constrained decoding -- reject instead of
+                         * silently running as auto. */
+                        if (!strcmp(choice, "none")) {
+                            tool_choice_none = true;
+                        } else if (strcmp(choice, "auto") != 0) {
+                            snprintf(err, errlen, "tool_choice type=%s not supported", choice);
+                            free(choice);
+                            free(ckey);
+                            free(key);
+                            chat_msgs_free(&msgs);
+                            free(system);
+                            free(tool_schemas);
+                            request_free(r);
+                            return false;
+                        }
                         free(choice);
                     } else if (!json_skip_value(&p)) {
                         free(ckey);
@@ -12544,6 +12579,11 @@ int main(int argc, char **argv) {
                                &gpu_cfg, &skip_cuda,
                                gpu_err, sizeof(gpu_err)) != 0) {
             fprintf(stderr, "ns4-server: %s\n", gpu_err);
+            return 2;
+        }
+        if (!skip_cuda && cfg.engine.backend == NS4_BACKEND_CPU) {
+            fprintf(stderr, "ns4-server: --gpu-vram/--gpu-devices need the CUDA backend "
+                            "(use --gpu-vram 0 for CPU)\n");
             return 2;
         }
         cfg.engine.backend = skip_cuda ? NS4_BACKEND_CPU : NS4_BACKEND_CUDA;

@@ -66,9 +66,6 @@ typedef struct {
     float temperature;
     float top_p;
     float min_p;
-    bool temperature_set;
-    bool top_p_set;
-    bool min_p_set;
     uint64_t seed;
     bool dump_tokens;
     const char *dump_logits_path;
@@ -1799,13 +1796,10 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.ctx_size = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--temp")) {
             c.gen.temperature = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
-            c.gen.temperature_set = true;
         } else if (!strcmp(arg, "--top-p")) {
             c.gen.top_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
-            c.gen.top_p_set = true;
         } else if (!strcmp(arg, "--min-p")) {
             c.gen.min_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
-            c.gen.min_p_set = true;
         } else if (!strcmp(arg, "--seed")) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
@@ -1946,8 +1940,6 @@ int main(int argc, char **argv) {
         return rc;
     }
     cfg.engine.inspect_only = cfg.inspect;
-    cfg.engine.first_token_test = cfg.gen.first_token_test;
-    cfg.engine.graph_test = cfg.gen.graph_test;
     cfg.engine.context_size = cfg.gen.ctx_size;
     cfg.engine.placement_ctx_hint = cfg.gen.ctx_size;
     ns4_engine *engine = NULL;
@@ -1959,6 +1951,13 @@ int main(int argc, char **argv) {
                                &gpu_cfg, &skip_cuda,
                                errbuf, sizeof(errbuf)) != 0) {
             fprintf(stderr, "ns4: %s\n", errbuf);
+            ns4_dist_options_free(cfg.dist);
+            free(cfg.prompt_owned);
+            return 2;
+        }
+        if (!skip_cuda && cfg.engine.backend == NS4_BACKEND_CPU) {
+            fprintf(stderr, "ns4: --gpu-vram/--gpu-devices need the CUDA backend "
+                            "(use --gpu-vram 0 for CPU)\n");
             ns4_dist_options_free(cfg.dist);
             free(cfg.prompt_owned);
             return 2;

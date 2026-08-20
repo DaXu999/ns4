@@ -214,8 +214,8 @@ def fetch_with_retry(
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="gguf-tools/quality-testing/data")
-    ap.add_argument("--prompts", default="gguf-tools/quality-testing/prompts.jsonl")
+    ap.add_argument("--out", default="tools/gguf-tools/quality-testing/data")
+    ap.add_argument("--prompts", default="tools/gguf-tools/quality-testing/prompts.jsonl")
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--endpoint", default=ENDPOINT)
     ap.add_argument("--api-key-env", default=None)

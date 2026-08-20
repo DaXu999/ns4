@@ -2,8 +2,6 @@
 /ns4-server
 /ns4-bench
 /ns4-eval
-/ns4_native
-/ns4_server_test
 /ns4_test
 /ns4flash.gguf
 /TODO.md

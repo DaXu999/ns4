@@ -523,6 +523,11 @@ int main(int argc, char **argv) {
             fprintf(stderr, "ns4-bench: %s\n", gpu_err);
             return 2;
         }
+        if (!skip_cuda && cfg.backend == NS4_BACKEND_CPU) {
+            fprintf(stderr, "ns4-bench: --gpu-vram/--gpu-devices need the CUDA backend "
+                            "(use --gpu-vram 0 for CPU)\n");
+            return 2;
+        }
         cfg.backend = skip_cuda ? NS4_BACKEND_CPU : NS4_BACKEND_CUDA;
     }
 
@@ -531,6 +536,7 @@ int main(int argc, char **argv) {
         .backend = cfg.backend,
         .n_threads = cfg.threads,
         .context_size = cfg.ctx_alloc,
+        .placement_ctx_hint = placement_ctx_hint,
         .prefill_chunk = cfg.prefill_chunk,
         .simulate_used_memory_bytes = cfg.simulate_used_memory_bytes,
         .power_percent = cfg.power_percent,

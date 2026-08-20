@@ -1658,18 +1658,15 @@ static void test_local_golden_vectors(void) {
 
     char *saved_prefill_chunk = test_save_env("NS4_CUDA_PREFILL_CHUNK");
     test_decode_stack_env saved_stack = test_save_decode_stack();
-    char *saved_moe_tile_max = test_save_env("NS4_CUDA_MOE_TILE_MAX");
     test_streaming_prefill_env saved_canonical_streaming_prefill =
         test_force_canonical_streaming_prefill();
     setenv("NS4_CUDA_PREFILL_CHUNK", "4096", 1);
     /* Bit-exact golden vectors were captured on the default paths. */
     test_set_decode_stack(false);
-    unsetenv("NS4_CUDA_MOE_TILE_MAX");
 
     ns4_engine *engine = test_open_engine(false);
     if (!engine) {
         test_restore_canonical_streaming_prefill(saved_canonical_streaming_prefill);
-        test_restore_env("NS4_CUDA_MOE_TILE_MAX", saved_moe_tile_max);
         test_restore_decode_stack(saved_stack);
         test_restore_env("NS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
         fclose(fp);
@@ -1684,7 +1681,6 @@ static void test_local_golden_vectors(void) {
 
     ns4_engine_close(engine);
     test_restore_canonical_streaming_prefill(saved_canonical_streaming_prefill);
-    test_restore_env("NS4_CUDA_MOE_TILE_MAX", saved_moe_tile_max);
     test_restore_decode_stack(saved_stack);
     test_restore_env("NS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
     fclose(fp);
@@ -2636,10 +2632,10 @@ static void test_print_help(const char *prog) {
     puts("\nEnvironment:");
     puts("  NS4_TEST_MODEL=FILE        Model path. Default: ns4flash.gguf");
     puts("  NS4_TEST_SSD_STREAMING=1   Run model tests through SSD streaming.");
-    puts("  NS4_CUDA_DISABLE_STREAMING_COLD_DECODE_PREFILL=1  Force canonical streamed cold prefill.");
+    puts("  NS4_CUDA_DISABLE_STREAMING_COLD_DECODE_PREFILL  Set (any value) to force canonical streamed cold prefill.");
     puts("  NS4_TEST_LONG_PROMPT=FILE  Rendered long-context story fact prompt.");
-    puts("  NS4_TEST_VECTOR_FILE=FILE  Official fixture. Default: flash-0731/official.vec.");
-    puts("  NS4_TEST_LOCAL_GOLDEN_FILE=FILE  Local fixture. Default: flash-0731/local-golden.vec.");
+    puts("  NS4_TEST_VECTOR_FILE=FILE  Official fixture. Default: tests/test-vectors/flash-0731/official.vec.");
+    puts("  NS4_TEST_LOCAL_GOLDEN_FILE=FILE  Local fixture. Default: tests/test-vectors/flash-0731/local-golden.vec.");
     puts("  NS4_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");
     puts("  NS4_TEST_ALLOW_Q8_F16_CACHE=1  Keep the q8->f16 weight cache on (disabled by default here).");
     puts("  NS4_TEST_MTP=FILE         Legacy MTP support GGUF for --mtp-verify-depth.");

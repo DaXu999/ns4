@@ -8296,7 +8296,7 @@ static int dist_validate_options(const ns4_dist_options *opt, char *err, size_t 
         if (opt->layers.set || opt->listen_host || opt->listen_port ||
             opt->coordinator_host || opt->coordinator_port ||
             opt->prefill_chunk != 0 || opt->prefill_window != 0 ||
-            opt->activation_bits != 0) {
+            opt->activation_bits != 0 || opt->replay_check || opt->debug) {
             if (errlen) snprintf(err, errlen, "distributed options require --role coordinator or --role worker");
             return 1;
         }

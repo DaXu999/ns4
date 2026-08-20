@@ -400,36 +400,6 @@ int ns4_gpu_matmul_q8_0_tensor(
         const ns4_gpu_tensor *x,
         uint64_t                n_tok);
 
-int ns4_gpu_matmul_q8_0_decode_mpp_tensor(
-        ns4_gpu_tensor       *out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ns4_gpu_tensor *x,
-        uint64_t                n_tok);
-
-int ns4_gpu_matmul_q8_0_decode_mpp_model_view_tensor(
-        ns4_gpu_tensor       *out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ns4_gpu_tensor *x,
-        uint64_t                n_tok);
-
-int ns4_gpu_matmul_q8_0_rows_scalar_tensor(
-        ns4_gpu_tensor       *out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ns4_gpu_tensor *x,
-        uint64_t                n_tok);
-
 int ns4_gpu_matmul_quant_tensor(
         ns4_gpu_tensor       *out,
         const void             *model_map,
@@ -897,12 +867,6 @@ int ns4_gpu_rope_tail_decode_rows_tensor(
         float                               beta_fast,
         float                               beta_slow);
 
-int ns4_gpu_sort_i32_rows_asc_tensor(
-        ns4_gpu_tensor       *dst,
-        const ns4_gpu_tensor *src,
-        uint32_t              row_width,
-        uint32_t              n_rows);
-
 /* Release decode fused KV finalizer: after the standalone RoPE kernel, this
  * performs NS4's FP8 non-RoPE KV round trip and writes the F16-rounded raw
  * attention cache row in one dispatch. */
@@ -1125,19 +1089,6 @@ int ns4_gpu_attention_decode_rows_rope_tensor(
         float                                 attn_factor,
         float                                 beta_fast,
         float                                 beta_slow);
-/* Diagnostic/public form of the dk=512 gathered decode-attention KV staging
- * step. The compressed source must be F16; dst writes chronological raw-ring
- * rows followed by compressed rows and must not overlap either source. */
-int ns4_gpu_flash_kv_stage_f16_tensor(
-        ns4_gpu_tensor       *dst,
-        const ns4_gpu_tensor *raw,
-        uint32_t                raw_cap,
-        uint32_t                raw_start,
-        uint32_t                n_raw,
-        const ns4_gpu_tensor *comp,
-        uint32_t                comp_is_f16,
-        uint32_t                n_comp,
-        uint32_t                head_dim);
 
 int ns4_gpu_attention_prefill_raw_heads_tensor(
         ns4_gpu_tensor       *heads,
@@ -1663,18 +1614,6 @@ int ns4_gpu_hc_weighted_sum_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
-int ns4_gpu_hc_weighted_sum_norm_tensor(
-        ns4_gpu_tensor       *out,
-        ns4_gpu_tensor       *norm_out,
-        const ns4_gpu_tensor *residual_hc,
-        const ns4_gpu_tensor *weights,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                norm_weight_offset,
-        uint32_t                n_embd,
-        uint32_t                n_hc,
-        float                   norm_eps);
-
 int ns4_gpu_hc_weighted_sum_split_tensor(
         ns4_gpu_tensor       *out,
         const ns4_gpu_tensor *residual_hc,
@@ -1714,21 +1653,6 @@ int ns4_gpu_hc_split_weighted_sum_norm_tensor(
         uint32_t                sinkhorn_iters,
         float                   eps,
         float                   norm_eps);
-
-/* Batched HC RMSNorm followed by its narrow F16 mixer projection. On the
- * tuned path, scale_scratch stores one float per row instead of the
- * full normalized HC tensor; other shapes retain the established fallback. */
-int ns4_gpu_hc_rms_scale_project_f16_tensor(
-        ns4_gpu_tensor       *out,
-        ns4_gpu_tensor       *scale_scratch,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint32_t                in_dim,
-        uint32_t                out_dim,
-        const ns4_gpu_tensor *x,
-        uint32_t                n_rows,
-        float                   eps);
 
 int ns4_gpu_output_hc_weights_tensor(
         ns4_gpu_tensor       *out,

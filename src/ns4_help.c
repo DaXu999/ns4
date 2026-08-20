@@ -130,9 +130,9 @@ static const char *tool_usage(ns4_help_tool tool) {
 static const char *tool_summary(ns4_help_tool tool) {
     switch (tool) {
     case NS4_HELP_NS4:
-        return "Chat with a local DwarfStar model, run one-shot prompts, inspect models, or coordinate distributed inference.";
+        return "Chat with a local DeepSeek V4 Flash model, run one-shot prompts, inspect models, or coordinate distributed inference.";
     case NS4_HELP_SERVER:
-        return "Serve one loaded DwarfStar model through OpenAI, Responses, Anthropic, and completion-compatible HTTP APIs.";
+        return "Serve one loaded DeepSeek V4 Flash model through OpenAI, Responses, Anthropic, and completion-compatible HTTP APIs.";
     case NS4_HELP_AGENT:
         return "Run the native terminal coding agent with live tools, session save/restore, and a responsive prompt while the model works.";
     case NS4_HELP_BENCH:
@@ -149,7 +149,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "-m, --model FILE", "GGUF model path. Default: ns4flash.gguf");
     opt(fp, c, "--cuda | --cpu", "Select the backend explicitly.");
     opt(fp, c, "--backend NAME", "Backend name: cuda or cpu.");
-    opt(fp, c, "--gpu-vram N[,N,...]|auto", "CUDA VRAM budgets per device, in GiB, or auto-detect free VRAM.");
+    opt(fp, c, "--gpu-vram N[,N,...]|auto|0", "CUDA VRAM budgets per device in GiB, auto for free VRAM, 0 for the CPU backend.");
     opt(fp, c, "--gpu-devices N[,N,...]", "CUDA device indices used by multi-GPU placement.");
     if (tool != NS4_HELP_EVAL) {
         opt(fp, c, "--cuda-tensor-parallel", "Enable the paired DeepSeek tensor/expert path on an even multi-GPU CUDA placement.");
@@ -166,7 +166,9 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");
     opt(fp, c, "--prefill-chunk N", "Graph prefill chunk size. Default: CUDA TP 2048; others 4096.");
     if (full) {
-        if (tool != NS4_HELP_BENCH) {
+        if (tool == NS4_HELP_EVAL) {
+            opt(fp, c, "--mtp FILE", "Accepted for parity; ns4-eval does not use MTP drafts yet.");
+        } else if (tool != NS4_HELP_BENCH) {
             opt(fp, c, "--mtp FILE", "Optional MTP support GGUF used for draft-token probes.");
         }
         if (tool == NS4_HELP_NS4 || tool == NS4_HELP_AGENT || tool == NS4_HELP_SERVER) {
@@ -203,7 +205,7 @@ static void print_sampling(FILE *fp, const help_colors *c,
         if (tool != NS4_HELP_EVAL) {
             opt(fp, c, "-p, --prompt TEXT", "One-shot prompt text.");
             opt(fp, c, "--prompt-file FILE", "Read one-shot prompt text from FILE.");
-            opt(fp, c, "--raw-prompt", "Tokenize the one-shot prompt without chat markers.");
+            opt(fp, c, "--raw, --raw-prompt", "Tokenize the one-shot prompt without chat markers.");
         }
     }
     fputc('\n', fp);
@@ -222,7 +224,7 @@ static void print_distributed(FILE *fp, const help_colors *c) {
     fputc('\n', fp);
     para(fp, c, "Distributed mode runs one logical session across several machines by assigning contiguous model layer ranges to workers. Workers own their layer slice and KV-cache shard; the coordinator owns the prompt, sampling loop, and client/API flow. Start workers first, then start the coordinator. The coordinator waits for a complete route and streams hidden states through the workers.");
     fputc('\n', fp);
-    opt(fp, c, "--role ROLE", "Distributed role: coordinator or worker.");
+    opt(fp, c, "--role ROLE", "Distributed role: coordinator, worker, or none (default).");
     opt(fp, c, "--layers A:B", "Inclusive layer slice, e.g. 0:20 or 21:output.");
     opt(fp, c, "--listen HOST PORT", "Coordinator listen address; workers may use it for their data listener.");
     opt(fp, c, "--coordinator HOST PORT", "Coordinator address for --role worker.");
@@ -313,6 +315,7 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--port N", "Bind port. Default: 8000");
     opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
+    opt(fp, c, "--chdir DIR", "Change working directory before loading runtime assets.");
     opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
     opt(fp, c, "--mixed-prefill-quantum N", "Prefill chunk while generations are active. Default: 128");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
@@ -357,9 +360,10 @@ static void print_bench_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--ctx-alloc N", "Allocated context. Default: ctx-max + gen-tokens + 1");
     opt(fp, c, "--step-mul F", "Multiplicative step. Default: 1");
     opt(fp, c, "--step-incr N", "Linear step when --step-mul is 1. Default: 2048");
-    opt(fp, c, "--gen-tokens N", "Greedy decode tokens per frontier. 0 for pure prefill. Default: 128");
+    opt(fp, c, "-n, --tokens, --gen-tokens N", "Greedy decode tokens per frontier. 0 for pure prefill. Default: 128");
     opt(fp, c, "--csv FILE", "Write CSV there instead of stdout.");
     opt(fp, c, "--dump-frontier-logits-dir DIR", "Write one full-logit JSON file per frontier.");
+    opt(fp, c, "--show-output", "Print each frontier's greedy decode text.");
     fputc('\n', fp);
 }
 

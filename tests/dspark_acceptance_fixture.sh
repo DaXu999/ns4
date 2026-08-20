@@ -73,8 +73,8 @@ git_commit_label() {
 
 print_metadata() {
     hw_os=$(uname -sm 2>/dev/null || echo unknown)
-    hw_model=$(sysctl -n hw.model 2>/dev/null || true)
-    hw_cpu=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || true)
+    hw_model=$(cat /sys/devices/virtual/dmi/id/product_name 2>/dev/null || true)
+    hw_cpu=$(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo 2>/dev/null | head -n 1)
     confidence=${CONFIDENCE:-default}
     scheduler=${NS4_DSPARK_SCHEDULER:-default}
     no_draft_skip=${NS4_DSPARK_SCHEDULER_NO_DRAFT_SKIP:-default}

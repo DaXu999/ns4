@@ -200,7 +200,7 @@ int format_gpu_layout_line(const ns4_gpu_config *cfg,
                            char                 *out,
                            size_t                outlen) {
     if (!out || outlen == 0 || !cfg) return -1;
-    /* "ns4: GPU config: N devices [d0,d1,...] requested, budgets G0,G1,... GB; auto=<bool>" */
+    /* "ns4: GPU config: N devices [d0,d1,...] requested, budgets G0,G1,... GiB; auto=<bool>" */
     int written = snprintf(out, outlen,
                            "ns4: GPU config: %d device%s [",
                            cfg->n_gpus, cfg->n_gpus == 1 ? "" : "s");
@@ -223,7 +223,7 @@ int format_gpu_layout_line(const ns4_gpu_config *cfg,
         written += m;
     }
     int t = snprintf(out + written, outlen - (size_t)written,
-                     " GB; auto=%s", was_auto ? "true" : "false");
+                     " GiB; auto=%s", was_auto ? "true" : "false");
     if (t < 0) return t;
     written += t;
     return written;

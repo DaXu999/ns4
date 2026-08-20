@@ -1,6 +1,5 @@
 #include "ns4.h"
 #include "ns4_gpu_args.h"
-#include "ns4_ssd.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -11,6 +10,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+
+#define MANIFEST_PATH_CAP 4096
 
 static void die(const char *msg) {
     fprintf(stderr, "%s\n", msg);
@@ -22,10 +24,7 @@ static void usage(const char *prog) {
             "usage: %s MODEL manifest.tsv OUT.tsv [ctx] "
             "[--quality] "
             "[--gpu-vram N[,N,...]|auto] [--gpu-devices N[,N,...]] "
-            "[--cuda-tensor-parallel] "
-            "[--ssd-streaming] [--ssd-streaming-cold] "
-            "[--ssd-streaming-cache-experts N|NGB] "
-            "[--ssd-streaming-preload-experts N]\n",
+            "[--cuda-tensor-parallel] [--ssd-streaming]\n",
             prog);
 }
 
@@ -46,6 +45,22 @@ static int parse_positive_int(const char *s, const char *opt) {
         exit(2);
     }
     return (int)v;
+}
+
+/* Manifest rows name their files relative to the checkout the fixture was
+ * collected in (the frozen Flash manifest keeps ds4's gguf-tools/... layout).
+ * Take the path as given when it exists; otherwise try each shorter suffix of
+ * it under the manifest's own directory, so the rows resolve from any layout
+ * without rewriting the fixture. */
+static void resolve_manifest_path(const char *manifest_dir, const char *path,
+                                  char *buf, size_t buflen) {
+    snprintf(buf, buflen, "%s", path);
+    if (access(buf, R_OK) == 0) return;
+    for (const char *p = path; p; p = strchr(p, '/'), p = p ? p + 1 : NULL) {
+        snprintf(buf, buflen, "%s/%s", manifest_dir, p);
+        if (access(buf, R_OK) == 0) return;
+    }
+    snprintf(buf, buflen, "%s", path);   /* let the open report the miss */
 }
 
 static char *read_file(const char *path) {
@@ -526,10 +541,6 @@ int main(int argc, char **argv) {
     const char *gpu_devices_arg = NULL;
     bool cuda_tensor_parallel = false;
     bool ssd_streaming = false;
-    bool ssd_streaming_cold = false;
-    uint32_t ssd_streaming_cache_experts = 0;
-    uint64_t ssd_streaming_cache_bytes = 0;
-    uint32_t ssd_streaming_preload_experts = 0;
 
     for (int i = 4; i < argc; i++) {
         const char *arg = argv[i];
@@ -543,21 +554,6 @@ int main(int argc, char **argv) {
             cuda_tensor_parallel = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
             ssd_streaming = true;
-        } else if (!strcmp(arg, "--ssd-streaming-cold")) {
-            ssd_streaming_cold = true;
-        } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
-            if (!ns4_parse_streaming_cache_experts_arg(
-                    need_arg(&i, argc, argv, arg),
-                    &ssd_streaming_cache_experts,
-                    &ssd_streaming_cache_bytes)) {
-                fprintf(stderr,
-                        "score_official: --ssd-streaming-cache-experts must be "
-                        "a positive count or <number>GB\n");
-                return 2;
-            }
-        } else if (!strcmp(arg, "--ssd-streaming-preload-experts")) {
-            ssd_streaming_preload_experts =
-                (uint32_t)parse_positive_int(need_arg(&i, argc, argv, arg), arg);
         } else if (arg[0] != '-' && !ctx_set) {
             ctx_size = parse_positive_int(arg, "ctx");
             ctx_set = true;
@@ -570,29 +566,18 @@ int main(int argc, char **argv) {
 
     ns4_engine_options opt = {
         .model_path = model_path,
-#ifdef __APPLE__
         .backend = NS4_BACKEND_CUDA,
-#else
-        .backend = NS4_BACKEND_CUDA,
-#endif
         .n_threads = 0,
         .context_size = ctx_size,
         .placement_ctx_hint = ctx_size,
-        .ssd_streaming_cache_experts = ssd_streaming_cache_experts,
-        .ssd_streaming_cache_bytes = ssd_streaming_cache_bytes,
-        .ssd_streaming_preload_experts = ssd_streaming_preload_experts,
         .warm_weights = false,
         .quality = quality,
         .cuda_tensor_parallel = cuda_tensor_parallel,
         .ssd_streaming = ssd_streaming,
-        .ssd_streaming_cold = ssd_streaming_cold,
     };
 
     ns4_engine *engine = NULL;
     if (gpu_vram_arg || gpu_devices_arg) {
-#ifdef __APPLE__
-        die("score_official: CUDA GPU placement is unavailable on macOS");
-#else
         ns4_gpu_config gpu_cfg = {0};
         bool skip_cuda = false;
         char gpu_err[256];
@@ -608,7 +593,6 @@ int main(int argc, char **argv) {
         if (ns4_engine_create_with_gpu_config(&engine, &opt, &gpu_cfg) != 0) {
             die("failed to open model");
         }
-#endif
     } else {
         if (cuda_tensor_parallel) {
             die("score_official: --cuda-tensor-parallel requires --gpu-vram or --gpu-devices");
@@ -628,6 +612,11 @@ int main(int argc, char **argv) {
         fprintf(stderr, "open %s: %s\n", manifest_path, strerror(errno));
         return 1;
     }
+    char manifest_dir[MANIFEST_PATH_CAP];
+    snprintf(manifest_dir, sizeof(manifest_dir), "%s", manifest_path);
+    char *manifest_slash = strrchr(manifest_dir, '/');
+    if (manifest_slash) *manifest_slash = '\0';
+    else snprintf(manifest_dir, sizeof(manifest_dir), ".");
     FILE *out = fopen(out_path, "wb");
     if (!out) {
         fprintf(stderr, "open %s: %s\n", out_path, strerror(errno));
@@ -661,6 +650,15 @@ int main(int argc, char **argv) {
         char *cont_path = strtok(NULL, "\t");
         char *resp_path = strtok(NULL, "\t");
         if (!id || !prompt_path || !cont_path) die("bad manifest row");
+        char prompt_file[MANIFEST_PATH_CAP], cont_file[MANIFEST_PATH_CAP], resp_file[MANIFEST_PATH_CAP];
+        resolve_manifest_path(manifest_dir, prompt_path, prompt_file, sizeof(prompt_file));
+        resolve_manifest_path(manifest_dir, cont_path, cont_file, sizeof(cont_file));
+        prompt_path = prompt_file;
+        cont_path = cont_file;
+        if (resp_path && resp_path[0]) {
+            resolve_manifest_path(manifest_dir, resp_path, resp_file, sizeof(resp_file));
+            resp_path = resp_file;
+        }
 
         char *prompt_text = read_file(prompt_path);
         char *cont_text = read_file(cont_path);

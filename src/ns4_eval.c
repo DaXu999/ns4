@@ -4123,6 +4123,13 @@ int main(int argc, char **argv) {
             free(case_sequence);
             return 2;
         }
+        if (!skip_cuda && cfg.backend == NS4_BACKEND_CPU) {
+            fprintf(stderr, "ns4-eval: --gpu-vram/--gpu-devices need the CUDA backend "
+                            "(use --gpu-vram 0 for CPU)\n");
+            if (trace) fclose(trace);
+            free(case_sequence);
+            return 2;
+        }
         cfg.backend = skip_cuda ? NS4_BACKEND_CPU : NS4_BACKEND_CUDA;
     }
 
@@ -4132,6 +4139,7 @@ int main(int argc, char **argv) {
         .backend = cfg.backend,
         .n_threads = cfg.threads,
         .context_size = cfg.ctx_size > 0 ? cfg.ctx_size : 0,
+        .placement_ctx_hint = cfg.ctx_size > 0 ? cfg.ctx_size : 0,
         .mtp_draft_tokens = 1,
         .mtp_margin = 3.0f,
         .power_percent = cfg.power_percent,

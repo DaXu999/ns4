@@ -151,7 +151,7 @@ int main(void) {
         int n = format_gpu_layout_line(&cfg, true, out, sizeof(out));
         PASS_FAIL("format_gpu_layout_line", n > 0 &&
                   strstr(out, "2 devices [0,1]") != NULL &&
-                  strstr(out, "budgets 40,12 GB") != NULL &&
+                  strstr(out, "budgets 40,12 GiB") != NULL &&
                   strstr(out, "auto=true") != NULL);
     }
 

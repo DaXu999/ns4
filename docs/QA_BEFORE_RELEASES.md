@@ -136,7 +136,9 @@ top-logprob slices, so do not replace them with one sampled chat answer.
   This covers short prompts and long-prompt attention cases. The runner defaults
   to this fixture, but release logs should keep the path explicit.
 - Run the 100-case DeepSeek V4 Flash fixture for every released Flash GGUF:
-  `tools/gguf-tools/quality-testing/score_official /path/to/deepseek-v4-flash.gguf tools/gguf-tools/quality-testing/data/flash/manifest.tsv /tmp/flash.tsv 4096`.
+  `NS4_CUDA_NO_Q8_F16_CACHE=1 tools/gguf-tools/quality-testing/score_official /path/to/deepseek-v4-flash.gguf tools/gguf-tools/quality-testing/data/flash/manifest.tsv /tmp/flash.tsv 4096`.
+  The env export matters on a single 96 GB card: without it the q8->f16 weight
+  cache leaves no VRAM for the session (the launcher exports the same).
   This manifest is also for the 0731 checkpoint. A later checkpoint needs a
   separately named 100-case fixture and must not be scored against this one.
 - Treat the native MXFP4 Flash GGUF as a separate release artifact. Run the

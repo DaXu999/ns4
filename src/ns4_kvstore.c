@@ -4,10 +4,11 @@
  *
  * The low-level file layout and payload helpers are intentionally shared.  The
  * ns4-server still owns the automatic byte-prefix cache policy built on top of
- * this file; ns4-agent uses only the same durable format for explicit sessions,
- * with its own policy in ns4_agent.c.  Protocol-specific extras, such as the
- * server's tool-id -> exact DSML trailer, are attached through trailer hooks and
- * still live with the protocol code that owns those mappings. */
+ * this file; ns4-agent (deferred) uses only the same durable format for
+ * explicit sessions, with its own policy in ns4_agent.c.  Protocol-specific
+ * extras, such as the server's tool-id -> exact DSML trailer, are attached
+ * through trailer hooks and still live with the protocol code that owns those
+ * mappings. */
 
 #include <ctype.h>
 #include <dirent.h>

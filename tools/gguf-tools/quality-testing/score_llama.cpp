@@ -67,11 +67,6 @@ static std::vector<llama_token> tokenize(
     return tokens;
 }
 
-static std::string render_glm_ns4_prompt(const std::string &prompt) {
-    return std::string("[gMASK]<sop><|user|>") + prompt +
-           "<|assistant|><think></think>";
-}
-
 static std::string render_deepseek_ns4_prompt(const std::string &prompt) {
     return std::string(u8"<\uFF5Cbegin\u2581of\u2581sentence\uFF5C>"
                        u8"<\uFF5CUser\uFF5C>") + prompt +
@@ -163,7 +158,7 @@ int main(int argc, char **argv) {
     if (argc != 4 && argc != 5 && argc != 6) {
         std::fprintf(stderr,
                      "usage: %s MODEL manifest.tsv OUT.tsv [ctx] "
-                     "[auto|deepseek-ns4|glm-ns4]\n",
+                     "[auto|deepseek-ns4]\n",
                      argv[0]);
         return 2;
     }
@@ -174,9 +169,8 @@ int main(int argc, char **argv) {
     int ctx_size = argc >= 5 ? std::atoi(argv[4]) : 4096;
     if (ctx_size < 1024) ctx_size = 1024;
     const std::string template_mode = argc == 6 ? argv[5] : "auto";
-    if (template_mode != "auto" && template_mode != "deepseek-ns4" &&
-        template_mode != "glm-ns4") {
-        die("template mode must be auto, deepseek-ns4, or glm-ns4");
+    if (template_mode != "auto" && template_mode != "deepseek-ns4") {
+        die("template mode must be auto or deepseek-ns4");
     }
 
     ggml_backend_load_all();
@@ -245,18 +239,15 @@ int main(int argc, char **argv) {
         if (template_mode == "deepseek-ns4") {
             rendered = render_deepseek_ns4_prompt(prompt_text);
             used_template = true;
-        } else if (template_mode == "glm-ns4") {
-            rendered = render_glm_ns4_prompt(prompt_text);
-            used_template = true;
         }
         if (!used_template) {
             if (template_mode == "auto" && !warned_template_fallback) {
                 std::fprintf(stderr,
                              "score_llama: llama.cpp chat template unavailable; "
-                             "using NS4 GLM prompt fallback\n");
+                             "using the NS4 DeepSeek prompt fallback\n");
                 warned_template_fallback = true;
             }
-            rendered = render_glm_ns4_prompt(prompt_text);
+            rendered = render_deepseek_ns4_prompt(prompt_text);
         }
 
         std::vector<llama_token> prompt =
