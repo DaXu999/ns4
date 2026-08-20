@@ -116,7 +116,6 @@ void ns4_gpu_tensor_free_in_place(ns4_gpu_tensor *t);
  * legacy ns4_gpu_tensor_alloc(bytes) which is equivalent to
  * ns4_gpu_tensor_alloc_ptr_on(0, bytes). */
 ns4_gpu_tensor *ns4_gpu_tensor_alloc_ptr_on(int tier, uint64_t bytes);
-int ns4_gpu_tensor_copy_async(ns4_gpu_tensor *dst, const ns4_gpu_tensor *src, uint64_t bytes);
 
 /* Heap-allocated MANAGED-memory tensor on a specific logical tier. Used
  * for the KV-cache pool. Stamps tier on the tensor so subsequent
@@ -198,7 +197,6 @@ int ns4_gpu_tensor_device(const ns4_gpu_tensor *t);
  * cudaSetDevice. Returns 0 on success, nonzero on error or if the
  * tier index is out of range. */
 int ns4_gpu_set_current_device(int logical_tier);
-int ns4_gpu_set_current_device_fenced(int logical_tier);
 
 /* Register the mmap'd host model pointer for selective-cache lookups
  * WITHOUT triggering any device-side copy. This bypasses the
