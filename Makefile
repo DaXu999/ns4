@@ -78,7 +78,7 @@ ns4-server: src/ns4_server.o src/ns4_help.o src/ns4_kvstore.o vendor/rax.o src/n
 ns4-bench: src/ns4_bench.o src/ns4_help.o src/ns4_gpu_args.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-ns4-eval: src/ns4_eval.o src/ns4_help.o $(CORE_OBJS)
+ns4-eval: src/ns4_eval.o src/ns4_help.o src/ns4_gpu_args.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tools/gguf-tools/quality-testing/score_official.o: tools/gguf-tools/quality-testing/score_official.c src/ns4.h
@@ -91,7 +91,7 @@ cpu: src/ns4_cli_cpu.o src/ns4_server_cpu.o src/ns4_bench_cpu.o src/ns4_eval_cpu
 	$(CC) $(CFLAGS) -o ns4 src/ns4_cli_cpu.o src/ns4_help.o vendor/linenoise.o src/ns4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ns4-server src/ns4_server_cpu.o src/ns4_help.o src/ns4_kvstore.o vendor/rax.o src/ns4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ns4-bench src/ns4_bench_cpu.o src/ns4_help.o src/ns4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
-	$(CC) $(CFLAGS) -o ns4-eval src/ns4_eval_cpu.o src/ns4_help.o $(CPU_CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o ns4-eval src/ns4_eval_cpu.o src/ns4_help.o src/ns4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 
 cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke

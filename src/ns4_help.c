@@ -185,7 +185,8 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     fputc('\n', fp);
 }
 
-static void print_sampling(FILE *fp, const help_colors *c, bool full) {
+static void print_sampling(FILE *fp, const help_colors *c,
+                           ns4_help_tool tool, bool full) {
     title(fp, c, "Prompt And Sampling");
     opt(fp, c, "-n, --tokens N", "Maximum generated tokens.");
     opt(fp, c, "--temp F", "Sampling temperature. 0 is greedy/deterministic.");
@@ -197,9 +198,13 @@ static void print_sampling(FILE *fp, const help_colors *c, bool full) {
     opt(fp, c, "--nothink", "Disable thinking and ask for direct replies.");
     if (full) {
         opt(fp, c, "-sys, --system TEXT", "System prompt. Empty string disables the default where supported.");
-        opt(fp, c, "-p, --prompt TEXT", "One-shot prompt text.");
-        opt(fp, c, "--prompt-file FILE", "Read one-shot prompt text from FILE.");
-        opt(fp, c, "--raw-prompt", "Tokenize the one-shot prompt without chat markers.");
+        /* ns4-eval runs its embedded, graded question set; it has no
+         * one-shot prompt mode, so it must not advertise these. */
+        if (tool != NS4_HELP_EVAL) {
+            opt(fp, c, "-p, --prompt TEXT", "One-shot prompt text.");
+            opt(fp, c, "--prompt-file FILE", "Read one-shot prompt text from FILE.");
+            opt(fp, c, "--raw-prompt", "Tokenize the one-shot prompt without chat markers.");
+        }
     }
     fputc('\n', fp);
 }
@@ -482,7 +487,7 @@ static void print_examples(FILE *fp, const help_colors *c, ns4_help_tool tool, c
 static void print_topic(FILE *fp, const help_colors *c, ns4_help_tool tool, const char *topic) {
     if (streq(topic, "all")) {
         print_model_runtime(fp, c, tool, true);
-        if (tool_has_topic(tool, "sampling")) print_sampling(fp, c, true);
+        if (tool_has_topic(tool, "sampling")) print_sampling(fp, c, tool, true);
         if (tool_has_topic(tool, "steering")) print_steering(fp, c);
         print_distributed(fp, c);
         if (tool == NS4_HELP_NS4) {
@@ -504,7 +509,7 @@ static void print_topic(FILE *fp, const help_colors *c, ns4_help_tool tool, cons
     }
 
     if (streq(topic, "runtime")) print_model_runtime(fp, c, tool, true);
-    else if (streq(topic, "sampling")) print_sampling(fp, c, true);
+    else if (streq(topic, "sampling")) print_sampling(fp, c, tool, true);
     else if (streq(topic, "steering")) print_steering(fp, c);
     else if (streq(topic, "distributed")) print_distributed(fp, c);
     else if (tool == NS4_HELP_NS4 && streq(topic, "diagnostics")) print_cli_diagnostics(fp, c);
@@ -529,7 +534,7 @@ static void print_default(FILE *fp, const help_colors *c, ns4_help_tool tool) {
 
     if (tool == NS4_HELP_NS4) {
         print_cli_specific(fp, c, true);
-        print_sampling(fp, c, false);
+        print_sampling(fp, c, tool, false);
     } else if (tool == NS4_HELP_SERVER) {
         print_server_api(fp, c);
         print_kv_cache(fp, c);

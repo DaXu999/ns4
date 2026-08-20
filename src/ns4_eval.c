@@ -1,5 +1,6 @@
 #include "ns4.h"
 #include "ns4_distributed.h"
+#include "ns4_gpu_args.h"
 #include "ns4_help.h"
 
 /* ns4-eval: small built-in benchmark integration test.
@@ -1196,6 +1197,9 @@ typedef struct {
     const char *trace_path;
     const char *regrade_trace_path;
     const char *case_sequence;
+    const char *gpu_vram_arg;
+    const char *gpu_devices_arg;
+    const char *system_prompt;
     ns4_backend backend;
     int threads;
     int ctx_size;
@@ -1563,6 +1567,12 @@ static eval_config parse_options(int argc, char **argv) {
             c.backend = NS4_BACKEND_CUDA;
         } else if (!strcmp(arg, "--cpu")) {
             c.backend = NS4_BACKEND_CPU;
+        } else if (!strcmp(arg, "--gpu-vram")) {
+            c.gpu_vram_arg = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--gpu-devices")) {
+            c.gpu_devices_arg = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
+            c.system_prompt = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--quality")) {
             c.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
@@ -2313,7 +2323,13 @@ static void plain_reset_color(bool use_color) {
     if (use_color) fputs(ANSI_RESET, stdout);
 }
 
+/* Set from -sys/--system. NULL keeps the built-in benchmark system prompt;
+ * an empty string runs the cases with no system prompt at all. The effective
+ * text is recorded in --trace, so a run stays auditable either way. */
+static const char *g_system_prompt_override = NULL;
+
 static const char *eval_system_prompt(void) {
+    if (g_system_prompt_override) return g_system_prompt_override;
     return "You are solving a hard benchmark question. Reason carefully. "
            "The final answer must follow the requested format exactly.";
 }
@@ -4062,6 +4078,7 @@ int main(int argc, char **argv) {
     eval_config cfg = parse_options(argc, argv);
     if (cfg.self_test_extractors) return run_extractor_self_tests();
     if (cfg.regrade_trace_path) return regrade_trace_file(cfg.regrade_trace_path);
+    g_system_prompt_override = cfg.system_prompt;
 
     int ncases = (int)(sizeof(eval_cases) / sizeof(eval_cases[0]));
     if (cfg.question_limit > 0 && cfg.question_limit < ncases) ncases = cfg.question_limit;
@@ -4093,6 +4110,22 @@ int main(int argc, char **argv) {
         }
     }
 
+    ns4_gpu_config gpu_cfg = {0};
+    bool skip_cuda = false;
+    const bool have_gpu_config = cfg.gpu_vram_arg || cfg.gpu_devices_arg;
+    if (have_gpu_config) {
+        char gpu_err[256];
+        if (parse_gpu_vram_arg(cfg.gpu_vram_arg, cfg.gpu_devices_arg,
+                               &gpu_cfg, &skip_cuda,
+                               gpu_err, sizeof(gpu_err)) != 0) {
+            fprintf(stderr, "ns4-eval: %s\n", gpu_err);
+            if (trace) fclose(trace);
+            free(case_sequence);
+            return 2;
+        }
+        cfg.backend = skip_cuda ? NS4_BACKEND_CPU : NS4_BACKEND_CUDA;
+    }
+
     ns4_engine_options opt = {
         .model_path = cfg.model_path,
         .mtp_path = cfg.mtp_path,
@@ -4118,7 +4151,22 @@ int main(int argc, char **argv) {
     }
 
     ns4_engine *engine = NULL;
-    if (ns4_engine_open(&engine, &opt) != 0) {
+    if (have_gpu_config && !skip_cuda) {
+        const bool was_auto =
+            (cfg.gpu_vram_arg && !strcmp(cfg.gpu_vram_arg, "auto")) ||
+            (!cfg.gpu_vram_arg && cfg.gpu_devices_arg);
+        char layout[256];
+        if (format_gpu_layout_line(&gpu_cfg, was_auto,
+                                   layout, sizeof(layout)) > 0) {
+            fprintf(stdout, "%s\n", layout);
+            fflush(stdout);
+        }
+        if (ns4_engine_create_with_gpu_config(&engine, &opt, &gpu_cfg) != 0) {
+            if (trace) fclose(trace);
+            free(case_sequence);
+            return 1;
+        }
+    } else if (ns4_engine_open(&engine, &opt) != 0) {
         if (trace) fclose(trace);
         free(case_sequence);
         return 1;
