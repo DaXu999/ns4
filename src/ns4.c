@@ -167,6 +167,7 @@ static bool ns4_backend_supports_ssd_streaming(ns4_backend backend) {
 
 /* Graph diagnostics: the switches gate shared graph behavior (including the
  * CPU-reference comparisons), not only device code. */
+#ifndef NS4_NO_GPU
 static bool graph_env_present(const char *name) {
     return name && getenv(name) != NULL;
 }
@@ -175,6 +176,7 @@ static const char *graph_env_value(const char *name) {
     const char *v = name ? getenv(name) : NULL;
     return (v && v[0]) ? v : NULL;
 }
+#endif
 
 /* =========================================================================
  * Model Shape Profiles.
@@ -947,6 +949,7 @@ static void ns4_expert_profile_init(const char *path, const char *hotlist_path) 
             g_expert_profile.hotlist_path ? g_expert_profile.hotlist_path : "disabled");
 }
 
+#ifndef NS4_NO_GPU
 static void ns4_expert_profile_cache_use(
         uint32_t ci,
         uint32_t il,
@@ -1033,6 +1036,7 @@ static void ns4_expert_profile_record(
         }
     }
 }
+#endif
 
 static void ns4_expert_profile_write_cache_summary(FILE *fp) {
     ns4_expert_profile *p = &g_expert_profile;
@@ -1266,6 +1270,7 @@ static void ns4_expert_profile_close(void) {
     memset(p, 0, sizeof(*p));
 }
 
+#ifndef NS4_NO_GPU
 static void sleep_sec(double sec) {
     if (sec <= 0.0 || !isfinite(sec)) return;
     struct timespec req;
@@ -1279,6 +1284,7 @@ static void sleep_sec(double sec) {
     /* Do not resume after EINTR: Ctrl+C should cut through throttling sleeps. */
     (void)nanosleep(&req, &req);
 }
+#endif
 
 static const char *ns4_log_color_code(ns4_log_type type) {
     switch (type) {
@@ -4120,6 +4126,7 @@ static bool weights_layers_bound(const ns4_weights *w, uint32_t layer_start, uin
     return true;
 }
 
+#ifndef NS4_NO_GPU
 static const ns4_layer_weights *weights_first_bound_layer(const ns4_weights *w) {
     if (!w) return NULL;
     for (uint32_t il = 0; il < NS4_N_LAYER; il++) {
@@ -4127,6 +4134,7 @@ static const ns4_layer_weights *weights_first_bound_layer(const ns4_weights *w) 
     }
     return NULL;
 }
+#endif
 
 static void weights_validate_layout(
         const ns4_weights *w,
@@ -38522,9 +38530,11 @@ static bool ns4_session_cancelled(ns4_session *s) {
     return s && s->cancel && s->cancel(s->cancel_ud);
 }
 
+#ifndef NS4_NO_GPU
 static bool ns4_session_cancelled_cb(void *ud) {
     return ns4_session_cancelled(ud);
 }
+#endif
 
 void ns4_session_report_progress(ns4_session *s, const char *event, int current, int total) {
     if (!s || !s->progress || !event) return;
@@ -40233,8 +40243,6 @@ int ns4_session_eval(ns4_session *s, int token, char *err, size_t errlen) {
 }
 
 #ifndef NS4_NO_GPU
-#endif
-
 static int ns4_sessions_eval_batch_cuda(ns4_decode_item *items, int count,
                                         char *err, size_t errlen);
 static int ns4_sessions_eval_batch_with_prefill_cuda(
@@ -40244,6 +40252,7 @@ static int ns4_sessions_eval_batch_with_prefill_cuda(
         const ns4_tokens *prefill_prompt,
         char *err,
         size_t errlen);
+#endif
 
 int ns4_sessions_eval_batch(ns4_decode_item *items, int count,
                             char *err, size_t errlen) {
@@ -43179,6 +43188,7 @@ static bool graph_eval_mixed_prefill_decode(
 }
 #endif
 
+#ifndef NS4_NO_GPU
 static int ns4_sessions_eval_batch_cuda(ns4_decode_item *items, int count,
                             char *err, size_t errlen) {
     if (!items || count <= 0) {
@@ -43303,6 +43313,7 @@ static int ns4_sessions_eval_batch_cuda(ns4_decode_item *items, int count,
     }
     return 0;
 }
+#endif
 
 #ifdef NS4_TEST_HOOKS
 static uint64_t ns4_test_mixed_native_evals = 0;
@@ -43312,6 +43323,7 @@ uint64_t ns4_test_mixed_native_count(void) {
 }
 #endif
 
+#ifndef NS4_NO_GPU
 static int ns4_sessions_eval_batch_with_prefill_cuda(
         ns4_decode_item *items,
         int count,
@@ -43415,6 +43427,7 @@ static int ns4_sessions_eval_batch_with_prefill_cuda(
     if (rc != 0) ns4_session_invalidate(prefill_session);
     return rc;
 }
+#endif
 
 int ns4_session_eval_speculative_argmax(ns4_session *s, int first_token,
                                         int max_tokens, int eos_token,

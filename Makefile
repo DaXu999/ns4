@@ -133,7 +133,7 @@ src/ns4_kvstore.o: src/ns4_kvstore.c src/ns4_kvstore.h src/ns4.h src/ns4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ src/ns4_kvstore.c
 
 # ns4_test.c #includes ns4_server.c whole, so the server's main-path statics
-# are unused there; the NS4_NO_GPU objects leave the CUDA-only helpers unused.
+# are unused there.
 ns4_test.o: tests/ns4_test.c src/ns4_server.c src/ns4.h src/ns4_ssd.h src/ns4_distributed.h src/ns4_help.h src/ns4_kvstore.h vendor/rax.h
 	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ tests/ns4_test.c
 
@@ -147,7 +147,7 @@ vendor/linenoise.o: vendor/linenoise.c vendor/linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ vendor/linenoise.c
 
 src/ns4_cpu.o: src/ns4.c src/ns4.h src/ns4_ssd.h src/ns4_distributed.h src/ns4_gpu.h
-	$(CC) $(CFLAGS) -Wno-unused-function -DNS4_NO_GPU -c -o $@ src/ns4.c
+	$(CC) $(CFLAGS) -DNS4_NO_GPU -c -o $@ src/ns4.c
 
 src/ns4_cli_cpu.o: src/ns4_cli.c src/ns4.h src/ns4_ssd.h src/ns4_distributed.h src/ns4_help.h vendor/linenoise.h
 	$(CC) $(CFLAGS) -DNS4_NO_GPU -c -o $@ src/ns4_cli.c
@@ -207,7 +207,7 @@ tests/test_gpu_args: tests/test_gpu_args.o src/ns4_gpu_args_cpu.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 src/ns4_cpu_test_hooks.o: src/ns4.c src/ns4.h src/ns4_gpu.h src/ns4_gpu_mgpu.h src/ns4_layer_pack.h
-	$(CC) $(CFLAGS) -Wno-unused-function -DNS4_NO_GPU -DNS4_TEST_HOOKS -c -o $@ src/ns4.c
+	$(CC) $(CFLAGS) -DNS4_NO_GPU -DNS4_TEST_HOOKS -c -o $@ src/ns4.c
 
 tests/test_engine_mgpu_placement.o: tests/test_engine_mgpu_placement.c src/ns4.h src/ns4_gpu_mgpu.h src/ns4_layer_pack.h
 	$(CC) $(CFLAGS) -c -o $@ $<
