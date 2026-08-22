@@ -65,9 +65,14 @@ int ns4_gpu_moe_handoff_pack_tensor(
         const ns4_gpu_tensor *weights,
         uint32_t              n_embd,
         uint32_t              n_expert);
+/* Gather `n_rows` rows starting at `row0` from every slot of a
+ * [n_slots][slot_cap][width] buffer into contiguous [row][slot * width] rows.
+ * `row0` lets a caller pack a window that does not start at the slot base,
+ * which is how a speculative block's verified rows are read back. */
 int ns4_gpu_pack_slot_rows_f32_tensor(
         ns4_gpu_tensor       *out,
         const ns4_gpu_tensor *slots,
+        uint32_t                row0,
         uint32_t                n_rows,
         uint32_t                width,
         uint32_t                n_slots,

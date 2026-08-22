@@ -3735,11 +3735,12 @@ extern "C" void ns4_gpu_set_q8_cache_suppressed(int suppressed) {
     g_q8_cache_suppressed = suppressed ? 1 : 0;
 }
 
-__global__ static void pack_slot_rows_f32_kernel(float *out, const float *slots, uint32_t n_rows, uint32_t width, uint32_t n_slots, uint32_t slot_cap);
+__global__ static void pack_slot_rows_f32_kernel(float *out, const float *slots, uint32_t row0, uint32_t n_rows, uint32_t width, uint32_t n_slots, uint32_t slot_cap);
 
 extern "C" int ns4_gpu_pack_slot_rows_f32_tensor(
         ns4_gpu_tensor       *out,
         const ns4_gpu_tensor *slots,
+        uint32_t                row0,
         uint32_t                n_rows,
         uint32_t                width,
         uint32_t                n_slots,
@@ -3749,7 +3750,7 @@ extern "C" int ns4_gpu_pack_slot_rows_f32_tensor(
     uint64_t out_rows = 0;
     uint64_t out_elems = 0;
     if (!out || !slots || n_rows == 0 || width == 0 || n_slots == 0 ||
-        slot_cap == 0 || n_rows > slot_cap ||
+        slot_cap == 0 || row0 > slot_cap || n_rows > slot_cap - row0 ||
         (uint64_t)n_slots > UINT64_MAX / slot_cap ||
         (slot_rows = (uint64_t)n_slots * slot_cap) > UINT64_MAX / width ||
         (slot_elems = slot_rows * width) > UINT64_MAX / sizeof(float) ||
@@ -3765,6 +3766,7 @@ extern "C" int ns4_gpu_pack_slot_rows_f32_tensor(
     pack_slot_rows_f32_kernel<<<(unsigned)blocks, 256, 0, cuda_decode_stream()>>>(
             (float *)out->ptr,
             (const float *)slots->ptr,
+            row0,
             n_rows,
             width,
             n_slots,
@@ -5176,7 +5178,7 @@ __global__ static void repeat_hc_rows_kernel(float *out, const float *rows, uint
     out[i] = rows[tok * n_embd + embd];
 }
 
-__global__ static void pack_slot_rows_f32_kernel(float *out, const float *slots, uint32_t n_rows, uint32_t width, uint32_t n_slots, uint32_t slot_cap) {
+__global__ static void pack_slot_rows_f32_kernel(float *out, const float *slots, uint32_t row0, uint32_t n_rows, uint32_t width, uint32_t n_slots, uint32_t slot_cap) {
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_rows * n_slots * width;
     if (i >= n) return;
@@ -5184,7 +5186,7 @@ __global__ static void pack_slot_rows_f32_kernel(float *out, const float *slots,
     uint64_t col = i % width;
     uint64_t slot = (i / width) % n_slots;
     uint64_t row = i / ((uint64_t)n_slots * width);
-    out[i] = slots[((slot * slot_cap) + row) * width + col];
+    out[i] = slots[((slot * slot_cap) + row0 + row) * width + col];
 }
 
 __global__ static void f32_to_f16_kernel(__half *out, const float *x, uint64_t n) {
@@ -5467,6 +5469,73 @@ __global__ static void matmul_q8_0_preq_warp8_kernel(
     }
     acc = warp_sum_f32(acc);
     if (lane == 0) out[tok * out_dim + row] = acc;
+}
+
+/* Weight-shared form of the decode GEMV for a handful of rows.
+ *
+ * The per-row kernel above is launched with one grid row per token, so a block
+ * re-reads its eight weight rows once per token -- at decode shapes the weight
+ * read *is* the cost, so verifying a k-token speculative block costs k times a
+ * decode and speculation cannot pay for itself.  Here the token loop sits
+ * inside the K-block loop: the weight bytes are read once and every row
+ * accumulates from them.  Each (row, token) accumulation keeps the same
+ * lane-strided order and the same expression as the per-row kernel, so results
+ * are bit-identical to single-token decode -- which is the whole point, since
+ * the caller commits this state instead of replaying it. */
+template<uint32_t MAXR>
+__global__ static void matmul_q8_0_preq_warp8_rows_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks,
+        uint32_t n_rows,
+        int use_dp4a) {
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    __shared__ int8_t sxq[16384];
+    __shared__ float sxs[512];
+    const uint64_t row_elems = (uint64_t)n_rows * blocks;
+    const int stage = row_elems * 32u <= sizeof(sxq) && row_elems <= 512u;
+    if (stage) {
+        const uint64_t nbytes = row_elems * 32u;
+        for (uint64_t i = threadIdx.x * 16u; i < nbytes; i += 256u * 16u) {
+            *(uint4 *)(sxq + i) = *(const uint4 *)(xq + i);
+        }
+        for (uint64_t i = threadIdx.x; i < row_elems; i += 256u) {
+            sxs[i] = xscale[i];
+        }
+        __syncthreads();
+    }
+    if (row >= out_dim) return;
+    const unsigned char *wr = w + row * blocks * 34;
+    const int8_t *xqb0 = stage ? sxq : xq;
+    const float *xsb0 = stage ? sxs : xscale;
+    float acc[MAXR];
+#pragma unroll
+    for (uint32_t r = 0; r < MAXR; r++) acc[r] = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const uint64_t i0 = b * 32;
+        const uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
+        const __half *scale_h = (const __half *)(wr + b * 34);
+        const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
+        const float ws = __half2float(*scale_h);
+#pragma unroll
+        for (uint32_t r = 0; r < MAXR; r++) {
+            if (r >= n_rows) break;
+            const uint64_t off = (uint64_t)r * blocks + b;
+            const int dot = dot_i8_block(qs, xqb0 + off * 32, bn, use_dp4a);
+            acc[r] += ws * xsb0[off] * (float)dot;
+        }
+    }
+#pragma unroll
+    for (uint32_t r = 0; r < MAXR; r++) {
+        if (r >= n_rows) break;
+        const float sum = warp_sum_f32(acc[r]);
+        if (lane == 0) out[(uint64_t)r * out_dim + row] = sum;
+    }
 }
 
 __device__ __forceinline__ static uint32_t q8_top1_float_ordered_key(float v) {
@@ -6781,6 +6850,59 @@ __global__ static void dequant_q8_0_to_f32_kernel(
     const float scale = __half2float(*(const __half *)blk);
     const int8_t q = *(const int8_t *)(blk + 2 + j);
     out[gid] = scale * (float)q;
+}
+
+/* Weight-shared form of grouped_q8_0_a_preq_warp8_kernel: one block covers
+ * every row of a small batch for the same eight output elements, so the Q8
+ * weight rows are read once instead of once per row.  Each (row, output)
+ * accumulation keeps the per-lane block stride and the warp reduction of the
+ * one-row kernel, so the result is bit-identical to running it n_rows times. */
+template<uint32_t MAXR>
+__global__ static void grouped_q8_0_a_preq_warp8_rows_kernel(
+        float *low,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t group_dim,
+        uint64_t rank,
+        uint32_t n_groups,
+        uint32_t n_rows,
+        uint64_t blocks,
+        int use_dp4a) {
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    if (row >= low_dim) return;
+
+    const uint64_t group = row / rank;
+    const uint64_t row_in_group = row - group * rank;
+    const unsigned char *wr = w + (group * rank + row_in_group) * blocks * 34;
+
+    float acc[MAXR];
+#pragma unroll
+    for (uint32_t r = 0; r < MAXR; r++) acc[r] = 0.0f;
+
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const uint64_t i0 = b * 32;
+        const uint64_t bn = group_dim - i0 < 32 ? group_dim - i0 : 32;
+        const __half *scale_h = (const __half *)(wr + b * 34);
+        const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
+        const float ws = __half2float(*scale_h);
+#pragma unroll
+        for (uint32_t r = 0; r < MAXR; r++) {
+            if (r >= n_rows) break;
+            const uint64_t xrow = (uint64_t)r * n_groups + group;
+            const int dot = dot_i8_block(qs, xq + xrow * blocks * 32 + b * 32,
+                                         bn, use_dp4a);
+            acc[r] += ws * xscale[xrow * blocks + b] * (float)dot;
+        }
+    }
+#pragma unroll
+    for (uint32_t r = 0; r < MAXR; r++) {
+        if (r >= n_rows) break;
+        const float sum = warp_sum_f32(acc[r]);
+        if (lane == 0) low[(uint64_t)r * low_dim + row] = sum;
+    }
 }
 
 __global__ static void grouped_q8_0_a_preq_warp8_kernel(
@@ -17156,6 +17278,20 @@ extern "C" int ns4_gpu_matmul_q8_0_decode_rows_exact_tensor(
                  "q8_0 decode rows exact quantize launch")) {
         return 0;
     }
+    /* Small row counts share the weight read across rows; wider batches keep
+     * the one-grid-row-per-token form, whose per-row weight re-read is already
+     * amortised by having enough blocks in flight. */
+    if (n_rows > 1u && n_rows <= 8u &&
+        getenv("NS4_CUDA_NO_Q8_ROWS_SHARED") == NULL) {
+        matmul_q8_0_preq_warp8_rows_kernel<8>
+            <<<((unsigned)out_dim + 7u) / 8u, 256, 0, cuda_decode_stream()>>>(
+                (float *)out->ptr,
+                reinterpret_cast<const unsigned char *>(wptr),
+                xq, xscale, in_dim, out_dim, blocks, n_rows,
+                cuda_q8_use_dp4a());
+        return cuda_ok(cudaGetLastError(),
+                       "q8_0 decode rows shared warp launch");
+    }
     dim3 grid(((unsigned)out_dim + 7u) / 8u, n_rows, 1u);
     matmul_q8_0_preq_warp8_kernel<<<grid, 256, 0, cuda_decode_stream()>>>(
             (float *)out->ptr,
@@ -20356,6 +20492,16 @@ extern "C" int ns4_gpu_attention_output_low_q8_rows_exact_tensor(
             group_cnt);
     if (!cuda_ok(cudaGetLastError(),
                  "attention_output_low_q8 rows prequant launch")) return 0;
+    if (n_rows > 1u && n_rows <= 8u &&
+        getenv("NS4_CUDA_NO_ATTN_OUT_A_ROWS_SHARED") == NULL) {
+        dim3 grid_s(((unsigned)low_dim + 7u) / 8u, 1u, 1u);
+        grouped_q8_0_a_preq_warp8_rows_kernel<8>
+                <<<grid_s, 256, 0, cuda_decode_stream()>>>(
+                (float *)low->ptr, out_a, xq, xscale, group_dim, rank,
+                group_cnt, n_rows, blocks_a, use_dp4a);
+        return cuda_ok(cudaGetLastError(),
+                       "attention_output_low_q8 rows shared launch");
+    }
     dim3 grid_a(((unsigned)low_dim + 7u) / 8u, n_rows, 1u);
     grouped_q8_0_a_preq_warp8_kernel<<<grid_a, 256, 0, cuda_decode_stream()>>>((float *)low->ptr,
                                                       out_a,

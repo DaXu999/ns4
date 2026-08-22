@@ -618,25 +618,42 @@ static void test_gpu_pack_slot_rows_f32(void) {
 
     TEST_ASSERT(ns4_gpu_tensor_write(slots, 0, slot_host, slot_bytes) != 0);
     TEST_ASSERT(ns4_gpu_tensor_write(out, 0, out_host, out_bytes) != 0);
-    TEST_ASSERT(ns4_gpu_pack_slot_rows_f32_tensor(out,
-                                                  slots,
-                                                  n_rows,
-                                                  width,
-                                                  n_slots,
-                                                  slot_cap) != 0);
-    TEST_ASSERT(ns4_gpu_tensor_read(out, 0, out_host, out_bytes) != 0);
+    /* row0 == 0 packs from the slot base; row0 > 0 packs a window that starts
+     * partway in, which is how a speculative block reads its verified rows
+     * back.  Both are checked against the same reference. */
+    const uint32_t row0s[2] = { 0u, slot_cap - n_rows };
+    for (uint32_t i = 0; i < 2u; i++) {
+        const uint32_t row0 = row0s[i];
+        for (uint64_t j = 0; j < out_count; j++) out_host[j] = -1.0f;
+        TEST_ASSERT(ns4_gpu_tensor_write(out, 0, out_host, out_bytes) != 0);
+        TEST_ASSERT(ns4_gpu_pack_slot_rows_f32_tensor(out,
+                                                      slots,
+                                                      row0,
+                                                      n_rows,
+                                                      width,
+                                                      n_slots,
+                                                      slot_cap) != 0);
+        TEST_ASSERT(ns4_gpu_tensor_read(out, 0, out_host, out_bytes) != 0);
 
-    for (uint32_t row = 0; row < n_rows; row++) {
-        for (uint32_t slot = 0; slot < n_slots; slot++) {
-            for (uint32_t col = 0; col < width; col++) {
-                const float ref =
-                    slot_host[((uint64_t)slot * slot_cap + row) * width + col];
-                const float got =
-                    out_host[((uint64_t)row * n_slots + slot) * width + col];
-                TEST_ASSERT(got == ref);
+        for (uint32_t row = 0; row < n_rows; row++) {
+            for (uint32_t slot = 0; slot < n_slots; slot++) {
+                for (uint32_t col = 0; col < width; col++) {
+                    const float ref =
+                        slot_host[((uint64_t)slot * slot_cap + row0 + row) *
+                                  width + col];
+                    const float got =
+                        out_host[((uint64_t)row * n_slots + slot) * width + col];
+                    TEST_ASSERT(got == ref);
+                }
             }
         }
     }
+
+    /* A window running past the slot end must be refused, not clamped. */
+    TEST_ASSERT(ns4_gpu_pack_slot_rows_f32_tensor(out, slots,
+                                                  slot_cap - n_rows + 1u,
+                                                  n_rows, width, n_slots,
+                                                  slot_cap) == 0);
 
     free(slot_host);
     free(out_host);

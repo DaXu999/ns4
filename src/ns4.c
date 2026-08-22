@@ -13044,6 +13044,10 @@ typedef struct {
     uint32_t spec_prefix_n_comp[NS4_SPEC_PREFIX_SLOTS][NS4_MAX_LAYER];
     uint32_t spec_prefix_n_index_comp[NS4_SPEC_PREFIX_SLOTS][NS4_MAX_LAYER];
     bool spec_capture_prefixes;
+    /* Set while a speculative row block is encoding.  Its per-row HC tensors
+     * are transient views, so the decode-island cache -- which keys on tensor
+     * addresses and replays captured device pointers -- must not record them. */
+    bool spec_rows_active;
     uint32_t raw_cap;
     /* Maximum compressed-row capacity across layers.  Shared work buffers use
      * this worst-case size because ratio-4 indexer layers can still reach it. */
@@ -18464,6 +18468,14 @@ typedef enum {
     METAL_DECODE_LAYER_FROM_QA_KV_RAW_TO_SHARED_MID,
     METAL_DECODE_LAYER_FROM_KV_STORE_TO_ATTN,
     METAL_DECODE_LAYER_FROM_ATTN_TO_FFN,
+    /* Resume with graph_after_attn_hc() already written: the caller has run
+     * the attention output projection and the HC post-add itself, which is
+     * how a speculative block shares one weight read across its rows. */
+    METAL_DECODE_LAYER_FROM_ATTN_HC_TO_FFN,
+    /* Resume at the router with graph_ffn_cur()/graph_ffn_norm() and the
+     * shared expert's graph_shared_mid() already written by the caller: the
+     * FFN pre-norm and the shared gate/up are the block-shared half. */
+    METAL_DECODE_LAYER_FROM_FFN_NORM_SHARED_MID,
     METAL_DECODE_LAYER_TO_ROUTER,
     METAL_DECODE_LAYER_TO_SHARED_MID,
     METAL_DECODE_LAYER_FROM_ROUTER,
@@ -18551,6 +18563,7 @@ static bool graph_encode_decode_layer_phase(
         ns4_gpu_decode_graphs_supported() != 0;
     const bool island_a_ok =
         decode_graphs_common_ok &&
+        !g->spec_rows_active &&
         phase == METAL_DECODE_LAYER_FULL &&
         !tp_ablate_hcpre &&
         NS4_N_HC == 4 &&
@@ -18596,6 +18609,8 @@ static bool graph_encode_decode_layer_phase(
             break;      /* eager: disabled, warm pass, or retired entry */
         }
     }
+    const bool resume_from_ffn_norm =
+        phase == METAL_DECODE_LAYER_FROM_FFN_NORM_SHARED_MID;
     if (phase != METAL_DECODE_LAYER_FROM_ROUTER) {
     const bool fuse_hc_norm =
         NS4_N_HC == 4 &&
@@ -18612,8 +18627,10 @@ static bool graph_encode_decode_layer_phase(
         phase == METAL_DECODE_LAYER_FROM_QA_KV_RAW_TO_SHARED_MID;
     const bool resume_after_kv_store =
         phase == METAL_DECODE_LAYER_FROM_KV_STORE_TO_ATTN;
+    const bool resume_after_attn_hc =
+        phase == METAL_DECODE_LAYER_FROM_ATTN_HC_TO_FFN || resume_from_ffn_norm;
     const bool resume_after_attn =
-        phase == METAL_DECODE_LAYER_FROM_ATTN_TO_FFN;
+        phase == METAL_DECODE_LAYER_FROM_ATTN_TO_FFN || resume_after_attn_hc;
     bool cuda_tp_attn_heads_active = false;
     bool attn_inv_rope_done = resume_after_attn;
     if (phase != METAL_DECODE_LAYER_FROM_ATTN_PRE_TO_FFN &&
@@ -19460,6 +19477,7 @@ static bool graph_encode_decode_layer_phase(
         }
     }
     }
+    if (!resume_after_attn_hc) {
     if (ok && !cuda_tp_attn_heads_active && !attn_inv_rope_done) {
         ok = ns4_gpu_rope_tail_tensor(graph_heads(g),
                                       1, tp_heads, NS4_N_HEAD_DIM,
@@ -19742,10 +19760,12 @@ static bool graph_encode_decode_layer_phase(
                                             graph_hc_post(g), graph_hc_comb(g), NS4_N_EMBD, NS4_N_HC) != 0;
         }
     }
+    }
     NS4_CUDA_PROFILE_DECODE_STAGE("attn_hc_post");
     if (ok) {
         graph_debug_dump_tensor("hc_attn_post", graph_after_attn_hc(g), hc_dim, il, pos);
     }
+    if (!resume_from_ffn_norm) {
     if (ok && !tp_ablate_hcpre) {
         ok = ns4_gpu_rms_norm_plain_tensor(graph_flat_hc(g), graph_after_attn_hc(g), (uint32_t)hc_dim, NS4_RMS_EPS) != 0;
         if (ok) ok = graph_matmul_plain_tensor(graph_hc_mix(g), model, layer->hc_ffn_fn,
@@ -19806,6 +19826,7 @@ static bool graph_encode_decode_layer_phase(
     NS4_CUDA_PROFILE_DECODE_STAGE("ffn_norm");
     if (ok) {
         graph_debug_dump_tensor("ffn_norm", graph_ffn_norm(g), NS4_N_EMBD, il, pos);
+    }
     }
     const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
     const uint64_t gate_expert_bytes NS4_MAYBE_UNUSED = expert_mid_dim * gate_row_bytes;
@@ -20346,7 +20367,9 @@ static bool graph_encode_decode_layer_phase(
                                                                 gate_expert_bytes,
                                                                 down_expert_bytes);
         }
-        if (ok && fuse_shared_gate_up) {
+        if (resume_from_ffn_norm) {
+            /* graph_shared_mid() arrived precomputed for this row. */
+        } else if (ok && fuse_shared_gate_up) {
             ok = ns4_gpu_shared_gate_up_swiglu_q8_0_tensor(graph_shared_gate(g),
                                                              graph_shared_up(g),
                                                              graph_shared_mid(g),
@@ -20493,7 +20516,9 @@ static bool graph_encode_decode_layer_phase(
         if (ok && async_early_commit) {
             ok = ns4_gpu_flush_commands() != 0;
         }
-        if (ok && fuse_shared_gate_up) {
+        if (resume_from_ffn_norm) {
+            /* graph_shared_mid() arrived precomputed for this row. */
+        } else if (ok && fuse_shared_gate_up) {
             ok = ns4_gpu_shared_gate_up_swiglu_q8_0_tensor(graph_shared_gate(g),
                                                              graph_shared_up(g),
                                                              graph_shared_mid(g),
@@ -20713,7 +20738,9 @@ static bool graph_encode_decode_layer_phase(
         phase == METAL_DECODE_LAYER_FROM_QA_KV_RAW_TO_SHARED_MID) {
         return ok;
     }
-    if (ok && fuse_shared_gate_up) {
+    if (resume_from_ffn_norm) {
+        /* graph_shared_mid() arrived precomputed for this row. */
+    } else if (ok && fuse_shared_gate_up) {
         ok = ns4_gpu_shared_gate_up_swiglu_q8_0_tensor(graph_shared_gate(g),
                                                          graph_shared_up(g),
                                                          graph_shared_mid(g),
@@ -20928,11 +20955,15 @@ static bool graph_output_logits_head_matmul(
         uint64_t              vocab_dim);
 
 /* Encode the final HC collapse, output norm, and vocab projection on the GPU. */
-static bool graph_encode_output_head(
+/* `skip_logits` stops after graph_output_norm() is written, which lets a
+ * speculative block run the cheap per-row prologue for each of its rows and
+ * then read the one large vocab weight once for all of them. */
+static bool graph_encode_output_head_ex(
         ns4_gpu_graph *g,
         const ns4_model       *model,
         const ns4_weights     *weights,
-        uint64_t               vocab_dim) {
+        uint64_t               vocab_dim,
+        bool                   skip_logits) {
     /* switch to head_tier before the output-head pipeline.
      * Single-tier (placement == NULL): no-op (head_tier == 0 == active_tier).
      * Note: head_tier was captured in graph_alloc_raw_cap; this
@@ -21001,6 +21032,9 @@ static bool graph_encode_output_head(
     if (ok) {
         graph_debug_dump_tensor("result_norm", graph_output_norm(g), NS4_N_EMBD, NS4_N_LAYER, 0);
     }
+    if (skip_logits) {
+        return ok;
+    }
     if (ok && g->cuda_tp_ep && g->cuda_tp_output) {
         ok = graph_output_logits_head_matmul(
                 g, model, weights, graph_output_norm(g),
@@ -21019,6 +21053,14 @@ static bool graph_encode_output_head(
     }
 #undef NS4_CUDA_PROFILE_OUTPUT_STAGE
     return ok;
+}
+
+static bool graph_encode_output_head(
+        ns4_gpu_graph *g,
+        const ns4_model       *model,
+        const ns4_weights     *weights,
+        uint64_t               vocab_dim) {
+    return graph_encode_output_head_ex(g, model, weights, vocab_dim, false);
 }
 
 /* Greedy-only output head: compute one local top-1 candidate per output TP
@@ -22601,19 +22643,34 @@ static bool graph_dspark_cache_ends_at(const ns4_gpu_graph *g,
            g->dspark_cache_token_start + g->dspark_cache_len == pos;
 }
 
-static bool graph_dspark_cache_claim_appended_row(ns4_gpu_graph *g,
-                                                        uint32_t pos) {
-    if (!g || g->dspark_cache_len == 0 ||
-        !graph_dspark_cache_ends_at(g, pos)) return false;
-    g->dspark_cache_len += 1u;
+/* Take ownership of `n` support rows the caller has just written at
+ * `pos`..`pos+n-1`.  A cold window (len 0) adopts them as its whole extent;
+ * otherwise the window must already end exactly at `pos`, because the ring is
+ * a contiguous span of positions and a gap would make later rows attend to
+ * stale neighbours.  Overflow drops the oldest positions, which is what the
+ * ring is for. */
+static bool graph_dspark_cache_claim_appended_rows(ns4_gpu_graph *g,
+                                                         uint32_t pos,
+                                                         uint32_t n) {
+    if (!g || n == 0 || n > g->dspark_cache_cap) return false;
+    if (g->dspark_cache_len == 0) {
+        return graph_dspark_cache_set_window(g, pos, n);
+    }
+    if (!graph_dspark_cache_ends_at(g, pos)) return false;
+    g->dspark_cache_len += n;
     if (g->dspark_cache_len > g->dspark_cache_cap) {
         const uint32_t excess = g->dspark_cache_len - g->dspark_cache_cap;
         g->dspark_cache_token_start += excess;
         g->dspark_cache_len = g->dspark_cache_cap;
-        g->dspark_cache_start =
-            g->dspark_cache_token_start % g->dspark_cache_cap;
     }
+    g->dspark_cache_start =
+        g->dspark_cache_token_start % g->dspark_cache_cap;
     return true;
+}
+
+static bool graph_dspark_cache_claim_appended_row(ns4_gpu_graph *g,
+                                                        uint32_t pos) {
+    return graph_dspark_cache_claim_appended_rows(g, pos, 1u);
 }
 
 bool ns4_test_dspark_cache_window_crop(void) {
@@ -26132,9 +26189,11 @@ static bool graph_pack_dspark_target_hidden_batch(
         ns4_gpu_graph     *g,
         const ns4_dspark_weights *dw,
         ns4_gpu_tensor    *packed,
+        uint32_t           row0,
         uint32_t           n_tokens) {
     if (!g || !dw || !packed || n_tokens == 0 ||
-        n_tokens > g->prefill_cap ||
+        row0 > g->prefill_cap ||
+        n_tokens > g->prefill_cap - row0 ||
         dw->target_layer_count != g->dspark_target_layer_count) {
         return false;
     }
@@ -26147,6 +26206,7 @@ static bool graph_pack_dspark_target_hidden_batch(
     }
     return ns4_gpu_pack_slot_rows_f32_tensor(packed,
                                              g->dspark_target_hidden_batch,
+                                             row0,
                                              n_tokens,
                                              NS4_N_EMBD,
                                              dw->target_layer_count,
@@ -26157,10 +26217,13 @@ static bool graph_eval_dspark_stage0_batch(
         ns4_gpu_graph            *g,
         const ns4_model          *dspark_model,
         const ns4_dspark_weights *dw,
+        uint32_t                  row0,
         uint32_t                  n_tokens,
         bool                      commands_open) {
     if (!g || !dspark_model || !dw ||
-        !dspark_stage0_batch_ready(g, dw, n_tokens)) {
+        !dspark_stage0_batch_ready(g, dw, n_tokens) ||
+        row0 > g->prefill_cap ||
+        n_tokens > g->prefill_cap - row0) {
         return false;
     }
 
@@ -26178,7 +26241,8 @@ static bool graph_eval_dspark_stage0_batch(
     }
     if (!packed) return false;
 
-    bool ok = graph_pack_dspark_target_hidden_batch(g, dw, packed, n_tokens);
+    bool ok = graph_pack_dspark_target_hidden_batch(g, dw, packed, row0,
+                                                          n_tokens);
     if (ok && !commands_open) ok = ns4_gpu_begin_commands() != 0;
     if (ok) {
         ok = graph_matmul_plain_tensor(graph_batch_ffn_cur(g),
@@ -26844,6 +26908,7 @@ static bool graph_seed_dspark_initial_cache_from_prefill(
         ok = graph_eval_dspark_stage0_batch(g,
                                                   dspark_model,
                                                   dw,
+                                                  0u,
                                                   n_tokens,
                                                   true);
     }
@@ -26873,6 +26938,69 @@ static bool graph_seed_dspark_initial_cache_from_prefill(
     }
     if (seeded_rows) *seeded_rows = n_tokens;
     return true;
+}
+
+/* Append the support-model KV rows for a run of positions the target model has
+ * just committed, reading their hidden states out of the verifier's capture
+ * buffer at `batch_row0`.
+ *
+ * The support ring must stay a contiguous span ending at the live position or
+ * the draft blocks lose their context: the proposer keeps only the rows this
+ * window covers, and a hole would silently attend across it.  A speculative
+ * cycle commits 1..block_size positions at once, so the single-row maintainer
+ * cannot keep up on its own -- without this the window is cropped away on the
+ * next proposal and every draft is generated cold. */
+static bool graph_dspark_ring_extend_from_batch(
+        ns4_gpu_graph            *g,
+        const ns4_model          *dspark_model,
+        const ns4_dspark_weights *dw,
+        uint32_t                  batch_row0,
+        uint32_t                  pos0,
+        uint32_t                  n_rows) {
+    if (!g || !dspark_model || !dw ||
+        n_rows == 0 ||
+        n_rows > g->dspark_cache_cap ||
+        batch_row0 > g->prefill_cap ||
+        n_rows > g->prefill_cap - batch_row0 ||
+        dw->n_stages == 0 ||
+        dw->n_stages > NS4_DSPARK_MAX_STAGES ||
+        !dspark_stage0_batch_ready(g, dw, n_rows) ||
+        !dspark_stage_cache_ready(g, dw) ||
+        !graph_dspark_cache_ends_at(g, pos0)) {
+        return false;
+    }
+
+    bool ok = ns4_gpu_begin_commands() != 0;
+    if (ok) {
+        ok = graph_eval_dspark_stage0_batch(g,
+                                                  dspark_model,
+                                                  dw,
+                                                  batch_row0,
+                                                  n_rows,
+                                                  true);
+    }
+    if (ok) {
+        ok = ns4_gpu_repeat_hc_rows_tensor(graph_batch_cur_hc(g),
+                                           graph_batch_ffn_norm(g),
+                                           n_rows,
+                                           NS4_N_EMBD,
+                                           NS4_N_HC) != 0;
+    }
+    for (uint32_t stage = 0; ok && stage < dw->n_stages; stage++) {
+        ok = graph_seed_dspark_stage_target_cache(g,
+                                                        dspark_model,
+                                                        dw,
+                                                        stage,
+                                                        pos0,
+                                                        n_rows,
+                                                        true);
+    }
+    if (ok) ok = ns4_gpu_end_commands() != 0;
+    if (!ok) {
+        (void)ns4_gpu_synchronize();
+        return false;
+    }
+    return graph_dspark_cache_claim_appended_rows(g, pos0, n_rows);
 }
 
 static bool graph_encode_dspark_next_stage_draft_input_from(
@@ -27365,104 +27493,53 @@ static bool graph_eval_dspark_stage_chain(
     return true;
 }
 
-/* Keep the support KV ring aligned while the scheduler skips proposals. */
+/* Stage the last committed position's target hidden state into row 0 of the
+ * verifier capture buffer so the ring append can read it like any other
+ * verified row. */
+static bool graph_dspark_stage_target_hidden_row0(ns4_gpu_graph *g) {
+    if (!g || !g->dspark_target_hidden || !g->dspark_target_hidden_batch ||
+        g->dspark_target_layer_count == 0 || g->prefill_cap == 0) {
+        return false;
+    }
+    const uint64_t embd_bytes = (uint64_t)NS4_N_EMBD * sizeof(float);
+    bool ok = ns4_gpu_begin_commands() != 0;
+    for (uint32_t slot = 0; ok && slot < g->dspark_target_layer_count; slot++) {
+        ns4_gpu_tensor *dst =
+            ns4_gpu_tensor_view(g->dspark_target_hidden_batch,
+                                ((uint64_t)slot * g->prefill_cap *
+                                 NS4_N_EMBD) * sizeof(float),
+                                embd_bytes);
+        ns4_gpu_tensor *src =
+            ns4_gpu_tensor_view(g->dspark_target_hidden,
+                                (uint64_t)slot * embd_bytes,
+                                embd_bytes);
+        ok = dst && src &&
+             ns4_gpu_tensor_copy(dst, 0, src, 0, embd_bytes) != 0;
+        ns4_gpu_tensor_free(src);
+        ns4_gpu_tensor_free(dst);
+    }
+    if (ok) ok = ns4_gpu_end_commands() != 0;
+    else (void)ns4_gpu_synchronize();
+    if (ok) graph_dspark_capture_batch_invalidate(g);
+    return ok;
+}
+
+/* Keep the support KV ring aligned while the scheduler skips proposals.
+ *
+ * This shares the append arithmetic with the verified-block path on purpose:
+ * a ring row is an attention key for the draft blocks, so it has to be built
+ * by the same HC-mix/attn-norm/KV chain the blocks build their own rows with.
+ * A shortcut that projects the hidden state straight through the stage KV
+ * weights produces keys the draft attention never sees during a block. */
 static bool graph_dspark_ring_maintain(
         ns4_gpu_graph            *g,
         const ns4_model          *dspark_model,
         const ns4_dspark_weights *dw,
         uint32_t                  pos) {
-    if (!g || !dspark_model || !dw ||
-        !g->dspark_capture_valid ||
-        g->dspark_cache_len == 0 ||
-        !graph_dspark_cache_ends_at(g, pos) ||
-        !dspark_stage0_weights_ready(g, dw) ||
-        !dspark_stage_cache_ready(g, dw) ||
-        !graph_batch_kv_raw(g) || !graph_batch_kv(g)) {
-        return false;
-    }
-    for (uint32_t stage = 0; stage < dw->n_stages; stage++) {
-        if (!dspark_stage_block_ready(g, dw, stage)) return false;
-    }
-
-    const ns4_dspark_stage_weights *stage0 = &dw->stage[0];
-    const uint64_t in_dim = (uint64_t)dw->target_layer_count * NS4_N_EMBD;
-    ns4_gpu_tensor *kv_raw_view =
-        ns4_gpu_tensor_view(graph_batch_kv_raw(g),
-                            0,
-                            (uint64_t)NS4_N_HEAD_DIM * sizeof(float));
-    ns4_gpu_tensor *kv_view =
-        ns4_gpu_tensor_view(graph_batch_kv(g),
-                            0,
-                            (uint64_t)NS4_N_HEAD_DIM * sizeof(float));
-    bool ok = kv_raw_view && kv_view && ns4_gpu_begin_commands() != 0;
-    if (ok) {
-        ok = graph_matmul_plain_tensor(g->dspark_stage0_proj,
-                                             dspark_model,
-                                             stage0->main_proj,
-                                             in_dim,
-                                             NS4_N_EMBD,
-                                             g->dspark_target_hidden,
-                                             1);
-    }
-    if (ok) {
-        ok = ns4_gpu_rms_norm_weight_tensor(g->dspark_main_x,
-                                            g->dspark_stage0_proj,
-                                            dspark_model->map,
-                                            dspark_model->size,
-                                            stage0->main_norm->abs_offset,
-                                            NS4_N_EMBD,
-                                            NS4_RMS_EPS) != 0;
-    }
-    for (uint32_t stage = 0; ok && stage < dw->n_stages; stage++) {
-        const ns4_layer_weights *block = &dw->stage[stage].block;
-        ok = graph_matmul_plain_tensor(kv_raw_view,
-                                             dspark_model,
-                                             block->attn_kv,
-                                             NS4_N_EMBD,
-                                             NS4_N_HEAD_DIM,
-                                             g->dspark_main_x,
-                                             1);
-        if (ok) ok = ns4_gpu_rms_norm_weight_rows_tensor(
-                         kv_view,
-                         kv_raw_view,
-                         dspark_model->map,
-                         dspark_model->size,
-                         block->attn_kv_a_norm->abs_offset,
-                         NS4_N_HEAD_DIM,
-                         1,
-                         NS4_RMS_EPS) != 0;
-        if (ok) ok = ns4_gpu_rope_tail_tensor(kv_view,
-                                               1,
-                                               1,
-                                               NS4_N_HEAD_DIM,
-                                               NS4_N_ROT,
-                                               pos,
-                                               0,
-                                               false,
-                                               NS4_ROPE_FREQ_BASE,
-                                               1.0f,
-                                               0.0f,
-                                               1.0f,
-                                               NS4_ROPE_YARN_BETA_FAST,
-                                               NS4_ROPE_YARN_BETA_SLOW) != 0;
-        if (ok) ok = ns4_gpu_dsv4_fp8_kv_quantize_tensor(kv_view,
-                                                          1,
-                                                          NS4_N_HEAD_DIM,
-                                                          NS4_N_ROT) != 0;
-        if (ok) ok = ns4_gpu_store_raw_kv_batch_tensor(
-                         g->dspark_raw_cache[stage],
-                         kv_view,
-                         g->dspark_cache_cap,
-                         pos,
-                         1,
-                         NS4_N_HEAD_DIM) != 0;
-    }
-    if (ok) ok = ns4_gpu_end_commands() != 0;
-    else (void)ns4_gpu_synchronize();
-    ns4_gpu_tensor_free(kv_view);
-    ns4_gpu_tensor_free(kv_raw_view);
-    if (ok) (void)graph_dspark_cache_claim_appended_row(g, pos);
-    return ok;
+    if (!g || !dspark_model || !dw || !g->dspark_capture_valid) return false;
+    if (!graph_dspark_stage_target_hidden_row0(g)) return false;
+    return graph_dspark_ring_extend_from_batch(g, dspark_model, dw,
+                                                     0u, pos, 1u);
 }
 
 static ns4_gpu_tensor *graph_dspark_final_output_hc(const ns4_gpu_graph *g) {
@@ -39891,6 +39968,13 @@ static bool ns4_session_prepare_dspark_draft_impl(ns4_session *s,
                                                 &stage_cache_rows);
         }
         NS4_DSPARK_PROP_ADD(propose_chain_ms, chain_t0);
+        /* The block wrote a support KV row for `pos` itself -- that row is the
+         * committed token's, not a draft's, so it survives the cycle.  Claiming
+         * it here is what keeps the ring contiguous while proposals run; the
+         * scheduler-skip maintainer only covers cycles that never got here. */
+        if (stage_chain_ok) {
+            (void)graph_dspark_cache_claim_appended_rows(&s->graph, pos, 1u);
+        }
         const bool stage_block_ok = stage_chain_done >= 1u;
         const bool base_logits_ready =
             stage_chain_ok &&
@@ -40502,6 +40586,128 @@ int ns4_sessions_eval_batch_with_prefill(
 }
 
 #ifndef NS4_NO_GPU
+static bool graph_verify_decode_rows_exact(
+        ns4_gpu_graph      *g,
+        const ns4_model    *model,
+        const ns4_weights  *weights,
+        const token_vec    *prompt,
+        uint32_t            start,
+        uint32_t            n_tokens,
+        bool                capture_dspark_hidden,
+        int                *row_tops);
+
+
+
+
+/* Diagnostic: fall back to the rollback+replay commit so a run can be compared
+ * against the verifier-committed path on the same binary. */
+static bool dspark_force_replay(void) {
+    const char *env = getenv("NS4_DSPARK_FORCE_REPLAY");
+    return env && env[0] && strcmp(env, "0") != 0;
+}
+
+/* Diagnostic: run the decode-exact block but still commit through the replay,
+ * which separates "the block computed the wrong rows" from "the block's state
+ * was committed wrongly". */
+static bool dspark_rows_no_commit(void) {
+    const char *env = getenv("NS4_DSPARK_ROWS_NO_COMMIT");
+    return env && env[0] && strcmp(env, "0") != 0;
+}
+
+/* Point the row capture at one row of the verified block, so the proposer's
+ * notion of "the last committed token's hidden state" survives a partial
+ * accept that stopped short of the block's final row. */
+static bool graph_dspark_capture_adopt_batch_row(ns4_gpu_graph *g,
+                                                       uint32_t       row) {
+    if (!g || !g->dspark_target_hidden || !g->dspark_target_hidden_batch ||
+        g->dspark_target_layer_count == 0 || row >= g->prefill_cap) {
+        return false;
+    }
+    const uint64_t embd_bytes = (uint64_t)NS4_N_EMBD * sizeof(float);
+    bool ok = ns4_gpu_begin_commands() != 0;
+    for (uint32_t slot = 0; ok && slot < g->dspark_target_layer_count; slot++) {
+        ns4_gpu_tensor *dst =
+            ns4_gpu_tensor_view(g->dspark_target_hidden,
+                                (uint64_t)slot * embd_bytes,
+                                embd_bytes);
+        ns4_gpu_tensor *src =
+            ns4_gpu_tensor_view(g->dspark_target_hidden_batch,
+                                (((uint64_t)slot * g->prefill_cap) + row) *
+                                    NS4_N_EMBD * sizeof(float),
+                                embd_bytes);
+        ok = dst && src &&
+             ns4_gpu_tensor_copy(dst, 0, src, 0, embd_bytes) != 0;
+        ns4_gpu_tensor_free(src);
+        ns4_gpu_tensor_free(dst);
+    }
+    if (ok) ok = ns4_gpu_end_commands() != 0;
+    else (void)ns4_gpu_synchronize();
+    return ok;
+}
+
+/* Keep the verifier's own cache state for the accepted prefix of a block.
+ *
+ * The verify pass already ran these rows through the target model and left the
+ * KV caches, compressor frontiers and per-row logits behind it; replaying the
+ * same rows through single-token decode only recomputes them, at one full
+ * decode each, which is what made a speculative cycle cost more than the
+ * tokens it saved.  A partial accept rewinds the compressor frontiers to the
+ * prefix slot the block captured on its way through; raw ring rows past the
+ * accepted prefix stay behind as unreachable garbage, because attention spans
+ * are derived from the position and later positions overwrite those rows.
+ *
+ * Returns false with the frontiers untouched (or restorable by the caller's
+ * snapshot) when any step is unavailable, so the caller can fall back. */
+static bool dspark_commit_verified_block(ns4_session *s,
+                                         uint32_t     start,
+                                         int          commit,
+                                         int          draft_n,
+                                         float       *row_logits) {
+    if (!s || commit <= 0 || commit > draft_n || !row_logits) return false;
+    ns4_engine *e = s->engine;
+    ns4_gpu_graph *g = &s->graph;
+
+    /* Read before rewinding: this is the only fallible step that must not run
+     * after the frontiers move. */
+    if (!graph_read_spec_logits_row(g, (uint32_t)(commit - 1), row_logits)) {
+        return false;
+    }
+    if (commit < draft_n &&
+        !spec_frontier_commit_prefix(s, (uint32_t)commit)) {
+        return false;
+    }
+
+    s->checkpoint.len = (int)start + commit;
+    memcpy(s->logits, row_logits, (size_t)NS4_N_VOCAB * sizeof(s->logits[0]));
+    s->checkpoint_valid = true;
+
+    /* The block captured hidden states for [start-1, start+draft_n-1] as batch
+     * rows 0..draft_n; row `commit` is the last committed position. */
+    const bool batch_rows_ok =
+        g->dspark_capture_batch_valid &&
+        g->dspark_capture_batch_start + 1u == start &&
+        g->dspark_capture_batch_tokens == (uint32_t)draft_n + 1u;
+    if (batch_rows_ok) {
+        (void)graph_dspark_capture_adopt_batch_row(g, (uint32_t)commit);
+        if (!graph_dspark_ring_extend_from_batch(g,
+                                                       &e->mtp_model,
+                                                       &e->dspark_weights,
+                                                       1u,
+                                                       start,
+                                                       (uint32_t)commit)) {
+            /* The ring holds draft-derived rows for these positions; drop the
+             * window rather than let the next block attend to them. */
+            graph_dspark_cache_reset(g);
+        }
+        graph_dspark_capture_batch_invalidate(g);
+    } else {
+        graph_dspark_cache_reset(g);
+    }
+
+    ns4_session_dspark_capture_note_checkpoint(s);
+    return true;
+}
+
 static int ns4_session_eval_dspark_speculative_argmax(
         ns4_session *s,
         int          n_accept,
@@ -40635,12 +40841,29 @@ static int ns4_session_eval_dspark_speculative_argmax(
     }
     bool ok = have_frontier && row_logits && (draft_n <= 1 || row_tops);
     bool verifier_may_have_mutated = false;
+    bool exact_rows_verify = false;
     if (ok) {
         for (int i = 0; i < draft_n; i++) token_vec_push(&s->checkpoint, drafts[i]);
         verifier_may_have_mutated = true;
         ns4_verify_suffix_timing verify_timing;
+        memset(&verify_timing, 0, sizeof(verify_timing));
         const double verify_t0 = stats_enabled ? now_sec() : 0.0;
-        ok = graph_verify_suffix_tops(&s->graph,
+        /* Decode-exact block first: its cache state can be committed as is.
+         * The layer-major batch verifier remains for the shapes and
+         * configurations the exact block declines, and pays for them with the
+         * replay below. */
+        exact_rows_verify =
+            !dspark_force_replay() &&
+            graph_verify_decode_rows_exact(&s->graph,
+                                                 &e->model,
+                                                 &e->weights,
+                                                 &s->checkpoint,
+                                                 (uint32_t)start,
+                                                 (uint32_t)draft_n,
+                                                 true,
+                                                 row_tops);
+        ok = exact_rows_verify ||
+             graph_verify_suffix_tops(&s->graph,
                                             &e->model,
                                             &e->weights,
                                             &s->checkpoint,
@@ -40674,12 +40897,36 @@ static int ns4_session_eval_dspark_speculative_argmax(
         }
     }
 
-    /* Batch verification and ordinary decode update compressor state with
-     * different kernels. Restore the pre-verify frontier and replay every
-     * accepted draft through ordinary decode, including partial accepts, so
-     * speculative decoding retains the target model's greedy token stream. */
+    /* Commit budget: the accepted cap and an eos both stop the block early. */
+    int commit_budget = commit_drafts;
+    if (commit_budget > accepted_cap - n_accept) {
+        commit_budget = accepted_cap - n_accept;
+    }
+    if (commit_budget < 0) commit_budget = 0;
+    for (int i = 0; i < commit_budget; i++) {
+        if (drafts[i] == eos_token) { commit_budget = i + 1; break; }
+    }
 
-    if (verifier_may_have_mutated) {
+    /* Preferred commit: adopt the verifier's own state for the accepted rows.
+     * The rollback+replay path below stays as the fallback for the cases the
+     * fast commit cannot serve (no captured prefix slot for a partial accept,
+     * an unreadable logits row) and as a diagnostic comparison arm. */
+    int committed_drafts = 0;
+    bool committed_from_verifier = false;
+    if (ok && commit_budget > 0 && exact_rows_verify && !dspark_rows_no_commit() &&
+        dspark_commit_verified_block(s, (uint32_t)start, commit_budget,
+                                     draft_n, row_logits)) {
+        committed_from_verifier = true;
+        committed_drafts = commit_budget;
+        for (int i = 0; i < commit_budget; i++) {
+            accepted[n_accept++] = drafts[i];
+        }
+    }
+
+    /* Fallback: the block mutated the caches but its state cannot be adopted,
+     * so rewind to the pre-verify frontier and let the replay below rebuild the
+     * accepted rows through ordinary decode. */
+    if (!committed_from_verifier && verifier_may_have_mutated) {
         s->checkpoint.len = start;
         ns4_session_dspark_capture_invalidate(s);
         if (!have_frontier || !spec_frontier_restore(&frontier, s)) {
@@ -40695,7 +40942,7 @@ static int ns4_session_eval_dspark_speculative_argmax(
         }
     }
 
-    if (!ok) {
+    if (!ok && !committed_from_verifier) {
         if (stats_enabled) {
             s->dspark_stats.verifier_unavailable++;
             ns4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
@@ -40713,15 +40960,7 @@ static int ns4_session_eval_dspark_speculative_argmax(
         return n_accept;
     }
 
-    /* Precompute the exact replay count (cap + eos cuts) so the worker can
-     * run the same gated replay evals in lockstep. */
-    int replay_budget = commit_drafts;
-    if (replay_budget > accepted_cap - n_accept)
-        replay_budget = accepted_cap - n_accept;
-    if (replay_budget < 0) replay_budget = 0;
-    for (int i = 0; i < replay_budget; i++) {
-        if (drafts[i] == eos_token) { replay_budget = i + 1; break; }
-    }
+    const int replay_budget = committed_from_verifier ? 0 : commit_budget;
     const double replay_t0 = stats_enabled ? now_sec() : 0.0;
     int replayed_drafts = 0;
     for (int i = 0; i < replay_budget; i++) {
@@ -40748,34 +40987,41 @@ static int ns4_session_eval_dspark_speculative_argmax(
         replayed_drafts++;
         if (drafts[i] == eos_token) break;
     }
-    if (stats_enabled) {
+    if (stats_enabled && !committed_from_verifier) {
         s->dspark_stats.replay_ms += (now_sec() - replay_t0) * 1000.0;
     }
-    if (replayed_drafts > 0) {
-        memcpy(s->logits, row_logits, (size_t)NS4_N_VOCAB * sizeof(s->logits[0]));
-        s->checkpoint_valid = true;
-        ns4_session_dspark_capture_note_checkpoint(s);
-        if (stats_enabled) {
-            if (replayed_drafts == draft_n) s->dspark_stats.full_accepts++;
-            else s->dspark_stats.partial_accepts++;
-            s->dspark_stats.accepted_draft_tokens += (uint64_t)replayed_drafts;
-            ns4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist,
-                                      (uint32_t)replayed_drafts);
+    if (!committed_from_verifier) {
+        committed_drafts = replayed_drafts;
+        if (replayed_drafts > 0) {
+            memcpy(s->logits, row_logits,
+                   (size_t)NS4_N_VOCAB * sizeof(s->logits[0]));
+            s->checkpoint_valid = true;
+            ns4_session_dspark_capture_note_checkpoint(s);
         }
-    } else if (stats_enabled) {
-        ns4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
+    }
+    if (stats_enabled) {
+        if (committed_drafts > 0) {
+            if (committed_drafts == draft_n) s->dspark_stats.full_accepts++;
+            else s->dspark_stats.partial_accepts++;
+            s->dspark_stats.accepted_draft_tokens += (uint64_t)committed_drafts;
+        }
+        ns4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist,
+                                  (uint32_t)committed_drafts);
     }
     ns4_session_dspark_scheduler_note(
             s,
-            (uint32_t)replayed_drafts,
+            (uint32_t)committed_drafts,
             false,
             NS4_DSPARK_SCHED_EXTRA_MS());
     if (spec_log) {
         fprintf(stderr,
-                "ns4: DSpark spec partial drafted=%d verified=%d accepted=%d\n",
+                "ns4: DSpark spec partial drafted=%d verified=%d accepted=%d "
+                "committed=%d path=%s\n",
                 draft_n,
                 commit_drafts,
-                n_accept);
+                n_accept,
+                committed_drafts,
+                committed_from_verifier ? "verifier" : "replay");
     }
     spec_frontier_free(&frontier);
     NS4_DSPARK_STATS_FINISH();
@@ -41615,6 +41861,711 @@ static void graph_unbind_attn_pre_batch_row(
         g->after_attn_hc_by_tier[t] = alias->saved_after_attn_hc;
     }
     alias->active = false;
+}
+
+/* Which parts of a speculative block share work across its rows.  Batching a
+ * stage is only legitimate when the row-batched kernel keeps each row's
+ * accumulation order, so this ladder exists to hold the batched shapes against
+ * the per-row reference on real prompts. */
+typedef enum {
+    NS4_DSPARK_ROWS_PER_ROW = 0,  /* every row an ordinary decode layer */
+    NS4_DSPARK_ROWS_HC      = 1,  /* + HC pre/norm batched */
+    NS4_DSPARK_ROWS_QKV     = 2,  /* + Q/KV projections and RoPE batched */
+    NS4_DSPARK_ROWS_ATTN_OUT = 3, /* + the attention output projection */
+    NS4_DSPARK_ROWS_SHARED  = 4,  /* + the FFN pre-norm and shared expert */
+} ns4_dspark_rows_mode;
+
+static uint32_t graph_dspark_rows_mode(void) {
+    const char *env = getenv("NS4_DSPARK_ROWS_MODE");
+    if (!env || !env[0]) return NS4_DSPARK_ROWS_SHARED;
+    char *endp = NULL;
+    const unsigned long v = strtoul(env, &endp, 10);
+    if (endp == env || *endp != '\0' || v > NS4_DSPARK_ROWS_SHARED) {
+        return NS4_DSPARK_ROWS_SHARED;
+    }
+    return (uint32_t)v;
+}
+
+/* Decode-exact verifier for a small speculative block.
+ *
+ * The layer-major batch verifier above is a prefill pass: its matmuls are
+ * GEMMs, its attention kernels are tiled for hundreds of rows, and every one
+ * of them accumulates in a different order than the single-token decode
+ * kernels.  That is fine for deciding acceptance, but it means the caches it
+ * leaves behind are not the caches decode would have written, so the accepted
+ * rows have to be replayed one decode at a time -- at which point the block
+ * has cost more than the tokens it saved.
+ *
+ * This pass runs the same block through the decode kernels instead.  Work that
+ * does not depend on the block's own cache updates (HC mixing, the Q/KV
+ * projections, the output projections) is issued once for all rows through the
+ * row-exact kernels, which keep each row's accumulation order and therefore its
+ * bits; the recurrent parts -- the compressor frontiers, the indexer, attention
+ * itself, and the routed experts each row selects for itself -- run per row in
+ * position order, exactly as consecutive decode steps would.  Running attention
+ * per row costs only a launch: it reads the caches rather than the weights, and
+ * each row sees a different compressed-row count anyway.
+ *
+ * The result is bit-identical to decoding the rows one at a time, so the caller
+ * can commit the accepted prefix instead of replaying it, while the weight
+ * reads that dominate decode are paid once for the whole block.
+ */
+static bool graph_verify_decode_rows_exact(
+        ns4_gpu_graph      *g,
+        const ns4_model    *model,
+        const ns4_weights  *weights,
+        const token_vec    *prompt,
+        uint32_t            start,
+        uint32_t            n_tokens,
+        bool                capture_dspark_hidden,
+        int                *row_tops) {
+    enum { rows_cap = 8 };
+    if (!g || !model || !weights || !prompt ||
+        n_tokens == 0 || n_tokens > rows_cap ||
+        n_tokens > g->prefill_cap ||
+        g->raw_cap == 0 || !g->spec_logits ||
+        start == 0 || start > (uint32_t)prompt->len ||
+        n_tokens > (uint32_t)prompt->len - start) {
+        return false;
+    }
+    /* Everything below assumes the promoted single-GPU decode path: a tier
+     * split, SSD streaming, debug dumps or the reference kernels would each
+     * make the row form diverge from what decode actually runs. */
+    if (g->placement || g->cuda_tp_decode || g->cuda_tp_ep ||
+        g->ssd_streaming || g->quality || g->materialize_ffn_out ||
+        g->decode_stage_profile || g->decode_index_stage_profile ||
+        g_expert_profile.active ||
+        graph_debug_get_config()->prefix != NULL ||
+        graph_use_reference_hc_decode() ||
+        graph_use_reference_hc_norm_decode() ||
+        graph_use_reference_qkv_norm() ||
+        graph_use_reference_qkv_pair_proj() ||
+        graph_use_reference_kv_decode() ||
+        !g->cuda_qkv_pair ||
+        NS4_N_HC != 4 || NS4_N_HEAD_KV != 1u) {
+        return false;
+    }
+    const int t = g->active_tier;
+    if (t < 0 || t >= NS4_MAX_GPUS) return false;
+
+    ns4_gpu_tensor *const batch_flat = graph_batch_flat_hc(g);
+    ns4_gpu_tensor *const batch_mix = graph_batch_hc_mix(g);
+    ns4_gpu_tensor *const batch_split = graph_batch_hc_split(g);
+    ns4_gpu_tensor *const batch_attn_cur = graph_batch_attn_cur(g);
+    ns4_gpu_tensor *const batch_attn_norm = graph_batch_attn_norm(g);
+    ns4_gpu_tensor *const batch_qr = graph_batch_qr(g);
+    ns4_gpu_tensor *const batch_qr_norm = graph_batch_qr_norm(g);
+    ns4_gpu_tensor *const batch_q = graph_batch_q(g);
+    ns4_gpu_tensor *const batch_kv_raw = graph_batch_kv_raw(g);
+    ns4_gpu_tensor *const batch_kv = graph_batch_kv(g);
+    ns4_gpu_tensor *const batch_heads = graph_batch_heads(g);
+    ns4_gpu_tensor *const selected_base = g->comp_selected_by_tier[t];
+    if (!batch_flat || !batch_mix || !batch_split || !batch_attn_cur ||
+        !batch_attn_norm || !batch_qr || !batch_qr_norm || !batch_q ||
+        !batch_kv_raw || !batch_kv || !batch_heads || !selected_base) {
+        return false;
+    }
+
+    const uint64_t hc_dim = (uint64_t)NS4_N_HC * NS4_N_EMBD;
+    const uint64_t mix_hc = 2ull * NS4_N_HC + (uint64_t)NS4_N_HC * NS4_N_HC;
+    const uint64_t q_dim = (uint64_t)NS4_N_HEAD * NS4_N_HEAD_DIM;
+    const uint64_t vocab_bytes = (uint64_t)NS4_N_VOCAB * sizeof(float);
+    const uint32_t top_k_slots = NS4_N_INDEXER_TOP_K;
+    if (top_k_slots == 0 ||
+        ns4_gpu_tensor_bytes(selected_base) <
+            (uint64_t)n_tokens * top_k_slots * sizeof(uint32_t) ||
+        ns4_gpu_tensor_bytes(g->spec_logits) <
+            (uint64_t)n_tokens * vocab_bytes) {
+        return false;
+    }
+
+    ns4_gpu_attention_decode_row rows[rows_cap];
+    ns4_gpu_tensor *raw_caches[rows_cap];
+    uint32_t raw_caps[rows_cap];
+    uint32_t raw_rows[rows_cap];
+    uint32_t positions[rows_cap];
+    memset(rows, 0, sizeof(rows));
+    for (uint32_t r = 0; r < n_tokens; r++) {
+        positions[r] = start + r;
+        raw_caps[r] = g->raw_cap;
+        raw_rows[r] = positions[r] % g->raw_cap;
+        rows[r].pos = positions[r];
+        rows[r].raw_cap = g->raw_cap;
+    }
+
+    ns4_gpu_tensor *const saved_cur_hc = g->cur_hc_by_tier[t];
+    ns4_gpu_tensor *const saved_after_ffn_hc = g->after_ffn_hc_by_tier[t];
+    ns4_gpu_tensor *const saved_selected = g->comp_selected_by_tier[t];
+    ns4_gpu_tensor *const saved_batch_cur = g->batch_cur_hc_by_tier[t];
+    ns4_gpu_tensor *const saved_batch_next = g->batch_next_hc_by_tier[t];
+    ns4_gpu_tensor *const saved_ffn_cur = g->ffn_cur_by_tier[t];
+    ns4_gpu_tensor *const saved_ffn_norm = g->ffn_norm_by_tier[t];
+    ns4_gpu_tensor *const saved_shared_mid = g->shared_mid_by_tier[t];
+    const uint32_t rows_mode = graph_dspark_rows_mode();
+    ns4_gpu_tensor row_cur[rows_cap];
+    ns4_gpu_tensor row_next[rows_cap];
+    ns4_gpu_tensor row_selected[rows_cap];
+
+    const bool saved_capture_prefixes = g->spec_capture_prefixes;
+    const bool saved_rows_active = g->spec_rows_active;
+    /* A partial accept rewinds the compressor frontiers to a prefix slot, so
+     * the block has to leave one behind after every row but its last. */
+    g->spec_capture_prefixes = n_tokens > 1u;
+    g->spec_rows_active = true;
+    bool ok = ns4_gpu_begin_commands() != 0;
+    const bool dspark_capture_active =
+        ok && capture_dspark_hidden &&
+        graph_dspark_capture_verified_suffix_begin(g, start, n_tokens, true);
+    for (uint32_t r = 0; ok && r < n_tokens; r++) {
+        ok = graph_borrow_tensor_view(&row_selected[r], selected_base,
+                                            (uint64_t)r * top_k_slots *
+                                                sizeof(uint32_t),
+                                            (uint64_t)top_k_slots *
+                                                sizeof(uint32_t)) &&
+             graph_borrow_tensor_view(&row_cur[r], graph_batch_cur_hc(g),
+                                            (uint64_t)r * hc_dim * sizeof(float),
+                                            hc_dim * sizeof(float)) &&
+             ns4_gpu_embed_token_hc_tensor(&row_cur[r],
+                                           model->map,
+                                           model->size,
+                                           weights->token_embd->abs_offset,
+                                           (uint32_t)weights->token_embd->dim[1],
+                                           (uint32_t)prompt->v[start + r],
+                                           NS4_N_EMBD,
+                                           NS4_N_HC) != 0;
+    }
+
+    for (uint32_t il = 0; ok && il < NS4_N_LAYER; il++) {
+        const ns4_layer_weights *layer = &weights->layer[il];
+        const uint32_t ratio = ns4_layer_compress_ratio(il);
+        const bool compressed = ratio != 0;
+        const uint64_t q_rank = layer->attn_q_a->dim[1];
+        const float freq_base = layer_rope_freq_base(il);
+        const float freq_scale = layer_rope_freq_scale(il);
+        const float ext_factor =
+            compressed && NS4_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
+        float attn_factor = 1.0f;
+        if (ext_factor != 0.0f && freq_scale > 0.0f) {
+            attn_factor /= 1.0f + 0.1f * logf(1.0f / freq_scale);
+        }
+        ns4_gpu_tensor *const cur_base = graph_batch_cur_hc(g);
+        ns4_gpu_tensor *const next_base = graph_batch_next_hc(g);
+        ns4_gpu_tensor mix_view, split_view, attn_cur_view, attn_norm_view;
+        ns4_gpu_tensor qr_view, qr_norm_view, q_view, kv_raw_view, kv_view;
+        ok = graph_borrow_tensor_view(&mix_view, batch_mix, 0,
+                                            (uint64_t)n_tokens * mix_hc * sizeof(float)) &&
+             graph_borrow_tensor_view(&split_view, batch_split, 0,
+                                            (uint64_t)n_tokens * mix_hc * sizeof(float)) &&
+             graph_borrow_tensor_view(&attn_cur_view, batch_attn_cur, 0,
+                                            (uint64_t)n_tokens * NS4_N_EMBD * sizeof(float)) &&
+             graph_borrow_tensor_view(&attn_norm_view, batch_attn_norm, 0,
+                                            (uint64_t)n_tokens * NS4_N_EMBD * sizeof(float)) &&
+             graph_borrow_tensor_view(&qr_view, batch_qr, 0,
+                                            (uint64_t)n_tokens * q_rank * sizeof(float)) &&
+             graph_borrow_tensor_view(&qr_norm_view, batch_qr_norm, 0,
+                                            (uint64_t)n_tokens * q_rank * sizeof(float)) &&
+             graph_borrow_tensor_view(&q_view, batch_q, 0,
+                                            (uint64_t)n_tokens * q_dim * sizeof(float)) &&
+             graph_borrow_tensor_view(&kv_raw_view, batch_kv_raw, 0,
+                                            (uint64_t)n_tokens * NS4_N_HEAD_DIM * sizeof(float)) &&
+             graph_borrow_tensor_view(&kv_view, batch_kv, 0,
+                                            (uint64_t)n_tokens * NS4_N_HEAD_DIM * sizeof(float));
+
+        if (rows_mode == NS4_DSPARK_ROWS_PER_ROW) {
+            /* Reference shape: every row is an ordinary decode layer, in
+             * position order.  Exact by construction, and the yardstick the
+             * batched shapes below are held to. */
+            for (uint32_t r = 0; ok && r < n_tokens; r++) {
+                ok = graph_borrow_tensor_view(&row_cur[r], cur_base,
+                                                    (uint64_t)r * hc_dim * sizeof(float),
+                                                    hc_dim * sizeof(float)) &&
+                     graph_borrow_tensor_view(&row_next[r], next_base,
+                                                    (uint64_t)r * hc_dim * sizeof(float),
+                                                    hc_dim * sizeof(float));
+                if (!ok) break;
+                g->cur_hc_by_tier[t] = &row_cur[r];
+                g->after_ffn_hc_by_tier[t] = &row_next[r];
+                ok = graph_encode_decode_layer(
+                        g, model, layer, il, positions[r],
+                        g->layer_raw_cache[il], g->raw_cap, raw_rows[r],
+                        graph_raw_span_for_batch(g, positions[r], 1),
+                        prompt->v[start + r]);
+                if (ok && r + 1u < n_tokens && r < NS4_SPEC_PREFIX_SLOTS) {
+                    ok = graph_capture_prefix_attn_state(g, il, r) &&
+                         graph_capture_prefix_index_state(g, il, r);
+                }
+                g->cur_hc_by_tier[t] = saved_cur_hc;
+                g->after_ffn_hc_by_tier[t] = saved_after_ffn_hc;
+            }
+        } else {
+        /* HC pre: the row-parallel fused kernel is the one decode uses, and
+         * the small per-row HC projection stays a one-row GEMV so it keeps
+         * decode's reduction. */
+        if (ok) {
+            ok = ns4_gpu_rms_norm_plain_rows_tensor(batch_flat, cur_base,
+                                                    (uint32_t)hc_dim,
+                                                    n_tokens,
+                                                    NS4_RMS_EPS) != 0;
+        }
+        for (uint32_t r = 0; ok && r < n_tokens; r++) {
+            ns4_gpu_tensor mix_row, flat_row;
+            ok = graph_borrow_tensor_view(&mix_row, batch_mix,
+                                                (uint64_t)r * mix_hc * sizeof(float),
+                                                mix_hc * sizeof(float)) &&
+                 graph_borrow_tensor_view(&flat_row, batch_flat,
+                                                (uint64_t)r * hc_dim * sizeof(float),
+                                                hc_dim * sizeof(float)) &&
+                 graph_matmul_plain_tensor(&mix_row, model, layer->hc_attn_fn,
+                                                 hc_dim, mix_hc, &flat_row, 1);
+        }
+        if (ok) {
+            ok = ns4_gpu_hc_split_weighted_sum_norm_tensor(
+                    &attn_cur_view, &attn_norm_view, &split_view, &mix_view,
+                    cur_base, model->map, model->size,
+                    layer->hc_attn_scale->abs_offset,
+                    layer->hc_attn_base->abs_offset,
+                    layer->attn_norm->abs_offset,
+                    NS4_N_EMBD, NS4_N_HC, NS4_N_HC_SINKHORN_ITER,
+                    NS4_HC_EPS, NS4_RMS_EPS) != 0;
+        }
+
+        if (rows_mode == NS4_DSPARK_ROWS_HC) {
+            for (uint32_t r = 0; ok && r < n_tokens; r++) {
+                graph_attn_pre_alias alias;
+                ok = graph_borrow_tensor_view(&row_cur[r], cur_base,
+                                                    (uint64_t)r * hc_dim * sizeof(float),
+                                                    hc_dim * sizeof(float)) &&
+                     graph_borrow_tensor_view(&row_next[r], next_base,
+                                                    (uint64_t)r * hc_dim * sizeof(float),
+                                                    hc_dim * sizeof(float));
+                if (!ok) break;
+                g->cur_hc_by_tier[t] = &row_cur[r];
+                g->after_ffn_hc_by_tier[t] = &row_next[r];
+                ok = graph_bind_attn_pre_batch_row(g, g, layer, r, false, &alias);
+                if (ok) {
+                    ok = graph_encode_decode_layer_phase(
+                            g, model, layer, il, positions[r],
+                            g->layer_raw_cache[il], g->raw_cap, raw_rows[r],
+                            graph_raw_span_for_batch(g, positions[r], 1),
+                            prompt->v[start + r],
+                            METAL_DECODE_LAYER_FROM_ATTN_PRE_TO_FFN);
+                    graph_unbind_attn_pre_batch_row(g, &alias);
+                }
+                if (ok && r + 1u < n_tokens && r < NS4_SPEC_PREFIX_SLOTS) {
+                    ok = graph_capture_prefix_attn_state(g, il, r) &&
+                         graph_capture_prefix_index_state(g, il, r);
+                }
+                g->cur_hc_by_tier[t] = saved_cur_hc;
+                g->after_ffn_hc_by_tier[t] = saved_after_ffn_hc;
+            }
+        } else {
+        /* Q/KV projections and their norms/RoPE: one weight read for the whole
+         * block, per-row accumulation order preserved. */
+        if (ok) {
+            ok = ns4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
+                    &qr_view, &kv_raw_view, model->map, model->size,
+                    layer->attn_q_a->abs_offset, layer->attn_kv->abs_offset,
+                    NS4_N_EMBD, q_rank, NS4_N_HEAD_DIM,
+                    &attn_norm_view, n_tokens) != 0;
+        }
+        if (ok) {
+            ok = ns4_gpu_dsv4_qkv_rms_norm_rows_tensor(
+                    &qr_norm_view, &qr_view, model->map, model->size,
+                    layer->attn_q_a_norm->abs_offset, (uint32_t)q_rank,
+                    &kv_view, &kv_raw_view,
+                    layer->attn_kv_a_norm->abs_offset,
+                    NS4_N_HEAD_DIM, n_tokens, NS4_RMS_EPS) != 0;
+        }
+        if (ok) {
+            ok = ns4_gpu_rope_tail_decode_rows_tensor(
+                    &kv_view, rows, n_tokens, NS4_N_HEAD_KV, NS4_N_HEAD_DIM,
+                    NS4_N_ROT,
+                    compressed ? (uint32_t)NS4_ROPE_ORIG_CTX : 0u,
+                    false, freq_base, freq_scale, ext_factor, attn_factor,
+                    NS4_ROPE_YARN_BETA_FAST, NS4_ROPE_YARN_BETA_SLOW) != 0;
+        }
+        if (ok) {
+            ok = ns4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+                    &q_view, model->map, model->size,
+                    layer->attn_q_b->abs_offset, q_rank, q_dim,
+                    &qr_norm_view, n_tokens) != 0;
+        }
+        if (ok) {
+            ok = ns4_gpu_head_rms_norm_tensor(&q_view, n_tokens, NS4_N_HEAD,
+                                              NS4_N_HEAD_DIM,
+                                              NS4_RMS_EPS) != 0;
+        }
+        if (ok) {
+            ok = ns4_gpu_rope_tail_decode_rows_tensor(
+                    &q_view, rows, n_tokens, NS4_N_HEAD, NS4_N_HEAD_DIM,
+                    NS4_N_ROT,
+                    compressed ? (uint32_t)NS4_ROPE_ORIG_CTX : 0u,
+                    false, freq_base, freq_scale, ext_factor, attn_factor,
+                    NS4_ROPE_YARN_BETA_FAST, NS4_ROPE_YARN_BETA_SLOW) != 0;
+        }
+        for (uint32_t r = 0; r < n_tokens; r++) raw_caches[r] = g->layer_raw_cache[il];
+        if (ok) {
+            ok = ns4_gpu_kv_fp8_store_raw_decode_rows_tensor(
+                    &kv_view, raw_caches, raw_caps, raw_rows, n_tokens,
+                    NS4_N_HEAD_DIM, NS4_N_ROT) != 0;
+        }
+
+        /* Compressor frontiers, the indexer and the routed experts are all
+         * per row: the first two are recurrent, and the experts a row selects
+         * are its own, so this half cannot share a weight read anyway.
+         * Attention reads the caches rather than weights, so running it per
+         * row costs nothing beyond a launch and keeps decode's kernel. */
+        for (uint32_t r = 0; ok && r < n_tokens; r++) {
+            graph_attn_pre_alias alias;
+            const uint32_t n_raw =
+                graph_raw_span_for_batch(g, positions[r], 1);
+            ok = graph_borrow_tensor_view(&row_cur[r], cur_base,
+                                                (uint64_t)r * hc_dim * sizeof(float),
+                                                hc_dim * sizeof(float)) &&
+                 graph_borrow_tensor_view(&row_next[r], next_base,
+                                                (uint64_t)r * hc_dim * sizeof(float),
+                                                hc_dim * sizeof(float));
+            if (!ok) break;
+            g->cur_hc_by_tier[t] = &row_cur[r];
+            g->after_ffn_hc_by_tier[t] = &row_next[r];
+            g->comp_selected_by_tier[t] = &row_selected[r];
+            ok = graph_bind_attn_pre_batch_row(g, g, layer, r, true, &alias);
+            if (ok) {
+                ok = graph_encode_decode_layer_phase(
+                        g, model, layer, il, positions[r],
+                        g->layer_raw_cache[il], g->raw_cap, raw_rows[r],
+                        n_raw, prompt->v[start + r],
+                        METAL_DECODE_LAYER_FROM_KV_STORE_TO_ATTN);
+            }
+            const uint32_t n_comp = g->layer_n_comp[il];
+            const bool indexed =
+                ratio == 4u &&
+                n_comp > graph_decode_indexer_sparse_threshold(g) &&
+                g->layer_n_index_comp[il] > NS4_N_INDEXER_TOP_K;
+            const uint32_t n_selected = indexed
+                ? (NS4_N_INDEXER_TOP_K < g->layer_n_index_comp[il]
+                    ? NS4_N_INDEXER_TOP_K : g->layer_n_index_comp[il])
+                : 0u;
+            const uint32_t raw_start =
+                graph_raw_start_for_span(g, positions[r], n_raw);
+            if (ok && indexed) {
+                ok = ns4_gpu_attention_indexed_mixed_batch_heads_tensor(
+                        graph_heads(g), model->map, model->size,
+                        layer->attn_sinks->abs_offset,
+                        graph_q(g), g->layer_raw_cache[il],
+                        g->layer_attn_comp_cache[il],
+                        graph_attn_comp_cache_is_f16(),
+                        graph_comp_selected(g), 1, positions[r], n_raw,
+                        g->raw_cap, raw_start, n_comp, n_selected,
+                        g->raw_window, ratio, NS4_N_HEAD,
+                        NS4_N_HEAD_DIM) != 0;
+            } else if (ok) {
+                ok = ns4_gpu_attention_decode_heads_tensor(
+                        graph_heads(g), model->map, model->size,
+                        layer->attn_sinks->abs_offset,
+                        graph_q(g), g->layer_raw_cache[il], n_raw,
+                        g->raw_cap, raw_start,
+                        n_comp ? g->layer_attn_comp_cache[il] : NULL,
+                        graph_attn_comp_cache_is_f16(), n_comp, NULL, 0,
+                        NS4_N_HEAD, NS4_N_HEAD_DIM) != 0;
+            }
+            if (ok) {
+                ok = ns4_gpu_rope_tail_tensor(
+                        graph_heads(g), 1, NS4_N_HEAD, NS4_N_HEAD_DIM,
+                        NS4_N_ROT, positions[r],
+                        compressed ? (uint32_t)NS4_ROPE_ORIG_CTX : 0u,
+                        true, freq_base, freq_scale, ext_factor, attn_factor,
+                        NS4_ROPE_YARN_BETA_FAST,
+                        NS4_ROPE_YARN_BETA_SLOW) != 0;
+            }
+            if (ok && rows_mode < NS4_DSPARK_ROWS_ATTN_OUT) {
+                ok = graph_encode_decode_layer_phase(
+                        g, model, layer, il, positions[r],
+                        g->layer_raw_cache[il], g->raw_cap, raw_rows[r],
+                        n_raw, prompt->v[start + r],
+                        METAL_DECODE_LAYER_FROM_ATTN_TO_FFN);
+            }
+            graph_unbind_attn_pre_batch_row(g, &alias);
+            if (ok && r + 1u < n_tokens && r < NS4_SPEC_PREFIX_SLOTS) {
+                ok = graph_capture_prefix_attn_state(g, il, r) &&
+                     graph_capture_prefix_index_state(g, il, r);
+            }
+            g->comp_selected_by_tier[t] = saved_selected;
+            g->cur_hc_by_tier[t] = saved_cur_hc;
+            g->after_ffn_hc_by_tier[t] = saved_after_ffn_hc;
+        }
+
+        if (rows_mode >= NS4_DSPARK_ROWS_ATTN_OUT) {
+            /* The attention output projection is the single largest dense
+             * weight read in a layer, and every row wants the same bytes:
+             * run both halves once for the block, then finish each row from
+             * its own post-attention HC state. */
+            const uint32_t n_groups = NS4_N_OUT_GROUP;
+            const uint32_t group_heads = NS4_N_HEAD / n_groups;
+            const uint32_t group_dim = NS4_N_HEAD_DIM * group_heads;
+            const uint32_t rank = NS4_N_LORA_O;
+            const uint64_t low_dim = (uint64_t)n_groups * rank;
+            ns4_gpu_tensor heads_view, low_view, out_view;
+            ok = ok &&
+                 graph_borrow_tensor_view(&heads_view, batch_heads, 0,
+                                                (uint64_t)n_tokens * q_dim * sizeof(float)) &&
+                 graph_borrow_tensor_view(&low_view, graph_batch_attn_low(g), 0,
+                                                (uint64_t)n_tokens * low_dim * sizeof(float)) &&
+                 graph_borrow_tensor_view(&out_view, graph_batch_attn_out(g), 0,
+                                                (uint64_t)n_tokens * NS4_N_EMBD * sizeof(float));
+            if (ok) {
+                ok = ns4_gpu_attention_output_low_q8_rows_exact_tensor(
+                        &low_view, model->map, model->size,
+                        layer->attn_output_a->abs_offset, group_dim, rank,
+                        n_groups, 0u, n_groups, &heads_view, n_tokens) != 0;
+            }
+            if (ok) {
+                ok = ns4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+                        &out_view, model->map, model->size,
+                        layer->attn_output_b->abs_offset, low_dim,
+                        NS4_N_EMBD, &low_view, n_tokens) != 0;
+            }
+            for (uint32_t r = 0; ok && r < n_tokens; r++) {
+                graph_attn_pre_alias alias;
+                ns4_gpu_tensor out_row, hc_row, split_row;
+                ok = graph_borrow_tensor_view(&row_cur[r], cur_base,
+                                                    (uint64_t)r * hc_dim * sizeof(float),
+                                                    hc_dim * sizeof(float)) &&
+                     graph_borrow_tensor_view(&row_next[r], next_base,
+                                                    (uint64_t)r * hc_dim * sizeof(float),
+                                                    hc_dim * sizeof(float)) &&
+                     graph_borrow_tensor_view(&out_row, graph_batch_attn_out(g),
+                                                    (uint64_t)r * NS4_N_EMBD * sizeof(float),
+                                                    (uint64_t)NS4_N_EMBD * sizeof(float)) &&
+                     graph_borrow_tensor_view(&hc_row, graph_batch_after_attn_hc(g),
+                                                    (uint64_t)r * hc_dim * sizeof(float),
+                                                    hc_dim * sizeof(float)) &&
+                     graph_borrow_tensor_view(&split_row, batch_split,
+                                                    (uint64_t)r * mix_hc * sizeof(float),
+                                                    mix_hc * sizeof(float));
+                if (!ok) break;
+                g->cur_hc_by_tier[t] = &row_cur[r];
+                g->after_ffn_hc_by_tier[t] = &row_next[r];
+                g->comp_selected_by_tier[t] = &row_selected[r];
+                ok = ns4_gpu_hc_expand_split_tensor(&hc_row, &out_row,
+                                                    &row_cur[r], &split_row,
+                                                    NS4_N_EMBD, NS4_N_HC) != 0;
+                if (ok && rows_mode < NS4_DSPARK_ROWS_SHARED) {
+                    ok = graph_bind_attn_pre_batch_row(g, g, layer, r, true,
+                                                       &alias);
+                    if (ok) {
+                        ok = graph_encode_decode_layer_phase(
+                                g, model, layer, il, positions[r],
+                                g->layer_raw_cache[il], g->raw_cap, raw_rows[r],
+                                graph_raw_span_for_batch(g, positions[r], 1),
+                                prompt->v[start + r],
+                                METAL_DECODE_LAYER_FROM_ATTN_HC_TO_FFN);
+                        graph_unbind_attn_pre_batch_row(g, &alias);
+                    }
+                }
+                g->comp_selected_by_tier[t] = saved_selected;
+                g->cur_hc_by_tier[t] = saved_cur_hc;
+                g->after_ffn_hc_by_tier[t] = saved_after_ffn_hc;
+            }
+
+            if (rows_mode >= NS4_DSPARK_ROWS_SHARED) {
+                /* The FFN pre-norm and the shared expert's gate/up are the
+                 * other block-wide weight read in a layer: run them once for
+                 * every row, then let each row finish through its own router,
+                 * experts and residual. */
+                const uint32_t shared_dim =
+                    (uint32_t)layer->ffn_gate_shexp->dim[1];
+                ns4_gpu_tensor hc_rows, ffn_cur_view, ffn_norm_view;
+                ns4_gpu_tensor gate_rows, up_rows, mid_rows;
+                const uint64_t sh_floats = (uint64_t)n_tokens * shared_dim;
+                /* Attention is finished for the block by now, so the batched
+                 * query buffer is free to carry the shared expert's rows. */
+                ok = ok &&
+                     (uint64_t)3u * sh_floats * sizeof(float) <=
+                         ns4_gpu_tensor_bytes(batch_q) &&
+                     graph_borrow_tensor_view(&hc_rows, graph_batch_after_attn_hc(g), 0,
+                                                    (uint64_t)n_tokens * hc_dim * sizeof(float)) &&
+                     graph_borrow_tensor_view(&ffn_cur_view, graph_batch_ffn_cur(g), 0,
+                                                    (uint64_t)n_tokens * NS4_N_EMBD * sizeof(float)) &&
+                     graph_borrow_tensor_view(&ffn_norm_view, graph_batch_ffn_norm(g), 0,
+                                                    (uint64_t)n_tokens * NS4_N_EMBD * sizeof(float)) &&
+                     graph_borrow_tensor_view(&gate_rows, batch_q, 0,
+                                                    sh_floats * sizeof(float)) &&
+                     graph_borrow_tensor_view(&up_rows, batch_q,
+                                                    sh_floats * sizeof(float),
+                                                    sh_floats * sizeof(float)) &&
+                     graph_borrow_tensor_view(&mid_rows, batch_q,
+                                                    2u * sh_floats * sizeof(float),
+                                                    sh_floats * sizeof(float));
+                if (ok) {
+                    ok = ns4_gpu_rms_norm_plain_rows_tensor(batch_flat, &hc_rows,
+                                                            (uint32_t)hc_dim,
+                                                            n_tokens,
+                                                            NS4_RMS_EPS) != 0;
+                }
+                for (uint32_t r = 0; ok && r < n_tokens; r++) {
+                    ns4_gpu_tensor mix_row, flat_row;
+                    ok = graph_borrow_tensor_view(&mix_row, batch_mix,
+                                                        (uint64_t)r * mix_hc * sizeof(float),
+                                                        mix_hc * sizeof(float)) &&
+                         graph_borrow_tensor_view(&flat_row, batch_flat,
+                                                        (uint64_t)r * hc_dim * sizeof(float),
+                                                        hc_dim * sizeof(float)) &&
+                         graph_matmul_plain_tensor(&mix_row, model,
+                                                         layer->hc_ffn_fn,
+                                                         hc_dim, mix_hc,
+                                                         &flat_row, 1);
+                }
+                if (ok) {
+                    ok = ns4_gpu_hc_split_weighted_sum_norm_tensor(
+                            &ffn_cur_view, &ffn_norm_view, &split_view,
+                            &mix_view, &hc_rows, model->map, model->size,
+                            layer->hc_ffn_scale->abs_offset,
+                            layer->hc_ffn_base->abs_offset,
+                            layer->ffn_norm->abs_offset,
+                            NS4_N_EMBD, NS4_N_HC, NS4_N_HC_SINKHORN_ITER,
+                            NS4_HC_EPS, NS4_RMS_EPS) != 0;
+                }
+                if (ok) {
+                    ok = ns4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
+                            &gate_rows, &up_rows, model->map, model->size,
+                            layer->ffn_gate_shexp->abs_offset,
+                            layer->ffn_up_shexp->abs_offset,
+                            NS4_N_EMBD, shared_dim, shared_dim,
+                            &ffn_norm_view, n_tokens) != 0;
+                }
+                if (ok) {
+                    ok = ns4_gpu_swiglu_tensor(&mid_rows, &gate_rows, &up_rows,
+                                               (uint32_t)sh_floats,
+                                               NS4_SWIGLU_CLAMP_EXP,
+                                               1.0f) != 0;
+                }
+                for (uint32_t r = 0; ok && r < n_tokens; r++) {
+                    graph_attn_pre_alias alias;
+                    ns4_gpu_tensor ffn_cur_row, ffn_norm_row, mid_row;
+                    ok = graph_borrow_tensor_view(&ffn_cur_row, graph_batch_ffn_cur(g),
+                                                        (uint64_t)r * NS4_N_EMBD * sizeof(float),
+                                                        (uint64_t)NS4_N_EMBD * sizeof(float)) &&
+                         graph_borrow_tensor_view(&ffn_norm_row, graph_batch_ffn_norm(g),
+                                                        (uint64_t)r * NS4_N_EMBD * sizeof(float),
+                                                        (uint64_t)NS4_N_EMBD * sizeof(float)) &&
+                         graph_borrow_tensor_view(&mid_row, &mid_rows,
+                                                        (uint64_t)r * shared_dim * sizeof(float),
+                                                        (uint64_t)shared_dim * sizeof(float));
+                    if (!ok) break;
+                    g->cur_hc_by_tier[t] = &row_cur[r];
+                    g->after_ffn_hc_by_tier[t] = &row_next[r];
+                    g->comp_selected_by_tier[t] = &row_selected[r];
+                    g->ffn_cur_by_tier[t] = &ffn_cur_row;
+                    g->ffn_norm_by_tier[t] = &ffn_norm_row;
+                    g->shared_mid_by_tier[t] = &mid_row;
+                    ok = graph_bind_attn_pre_batch_row(g, g, layer, r, true,
+                                                       &alias);
+                    if (ok) {
+                        ok = graph_encode_decode_layer_phase(
+                                g, model, layer, il, positions[r],
+                                g->layer_raw_cache[il], g->raw_cap, raw_rows[r],
+                                graph_raw_span_for_batch(g, positions[r], 1),
+                                prompt->v[start + r],
+                                METAL_DECODE_LAYER_FROM_FFN_NORM_SHARED_MID);
+                        graph_unbind_attn_pre_batch_row(g, &alias);
+                    }
+                    g->shared_mid_by_tier[t] = saved_shared_mid;
+                    g->ffn_norm_by_tier[t] = saved_ffn_norm;
+                    g->ffn_cur_by_tier[t] = saved_ffn_cur;
+                    g->comp_selected_by_tier[t] = saved_selected;
+                    g->cur_hc_by_tier[t] = saved_cur_hc;
+                    g->after_ffn_hc_by_tier[t] = saved_after_ffn_hc;
+                }
+            }
+        }
+        }
+        }
+
+        /* Decode hands a layer's output to the next one by swapping the two
+         * HC halves, and the DSpark capture reads the post-swap "cur".  The
+         * row form owes the block the same two steps. */
+        if (ok) {
+            ns4_gpu_tensor *const hc_tmp = g->batch_cur_hc_by_tier[t];
+            g->batch_cur_hc_by_tier[t] = g->batch_next_hc_by_tier[t];
+            g->batch_next_hc_by_tier[t] = hc_tmp;
+        }
+        if (ok && dspark_capture_active) {
+            ok = graph_dspark_capture_verified_suffix_layer(g, il, start,
+                                                            n_tokens);
+        }
+    }
+
+    /* One head per row, into the speculative logits rows the caller reads. */
+    /* The vocab projection is the one large weight the head reads, so every
+     * row runs only the cheap prologue into its own norm row and the block
+     * then reads `output` once. */
+    const int head_t = g->placement ? g->head_tier : t;
+    ns4_gpu_tensor *const saved_output_norm =
+        head_t >= 0 && head_t < NS4_MAX_GPUS ? g->output_norm_by_tier[head_t]
+                                             : NULL;
+    ns4_gpu_tensor norm_rows;
+    ns4_gpu_tensor norm_row[rows_cap];
+    ok = ok && head_t >= 0 && head_t < NS4_MAX_GPUS &&
+         graph_borrow_tensor_view(&norm_rows, graph_batch_ffn_norm(g), 0,
+                                        (uint64_t)n_tokens * NS4_N_EMBD * sizeof(float));
+    for (uint32_t r = 0; ok && r < n_tokens; r++) {
+        ok = graph_borrow_tensor_view(&row_cur[r], graph_batch_cur_hc(g),
+                                            (uint64_t)r * hc_dim * sizeof(float),
+                                            hc_dim * sizeof(float)) &&
+             graph_borrow_tensor_view(&norm_row[r], graph_batch_ffn_norm(g),
+                                            (uint64_t)r * NS4_N_EMBD * sizeof(float),
+                                            (uint64_t)NS4_N_EMBD * sizeof(float));
+        if (!ok) break;
+        g->cur_hc_by_tier[t] = &row_cur[r];
+        g->output_norm_by_tier[head_t] = &norm_row[r];
+        ok = graph_encode_output_head_ex(g, model, weights,
+                                               weights->output->dim[1], true);
+        g->output_norm_by_tier[head_t] = saved_output_norm;
+        g->cur_hc_by_tier[t] = saved_cur_hc;
+    }
+    if (ok) {
+        ok = ns4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+                g->spec_logits, model->map, model->size,
+                weights->output->abs_offset, NS4_N_EMBD,
+                weights->output->dim[1], &norm_rows, n_tokens) != 0;
+    }
+    for (uint32_t r = 0; ok && row_tops && r + 1u < n_tokens; r++) {
+        ns4_gpu_tensor logit_row;
+        ok = graph_borrow_tensor_view(&logit_row, g->spec_logits,
+                                            (uint64_t)r * vocab_bytes,
+                                            vocab_bytes) &&
+             ns4_gpu_argmax_tensor(&row_selected[r], &logit_row,
+                                   NS4_N_VOCAB) != 0;
+    }
+
+    g->cur_hc_by_tier[t] = saved_cur_hc;
+    g->after_ffn_hc_by_tier[t] = saved_after_ffn_hc;
+    g->comp_selected_by_tier[t] = saved_selected;
+    /* NS4_N_LAYER swaps leave the pair on an arbitrary parity; the batch
+     * encoder keys its own bookkeeping on these, so hand them back as found. */
+    g->batch_cur_hc_by_tier[t] = saved_batch_cur;
+    g->batch_next_hc_by_tier[t] = saved_batch_next;
+    g->ffn_cur_by_tier[t] = saved_ffn_cur;
+    g->ffn_norm_by_tier[t] = saved_ffn_norm;
+    g->shared_mid_by_tier[t] = saved_shared_mid;
+    g->spec_capture_prefixes = saved_capture_prefixes;
+    g->spec_rows_active = saved_rows_active;
+
+    if (ok) ok = ns4_gpu_end_commands() != 0;
+    else (void)ns4_gpu_synchronize();
+    if (!ok) {
+        if (dspark_capture_active) graph_dspark_capture_invalidate(g);
+        return false;
+    }
+
+    if (row_tops && n_tokens > 1u) {
+        for (uint32_t r = 0; ok && r + 1u < n_tokens; r++) {
+            ok = ns4_gpu_tensor_read(&row_selected[r], 0, &row_tops[r],
+                                     sizeof(row_tops[r])) != 0;
+        }
+    }
+    return ok;
 }
 
 static bool graph_encode_attention_session_batch(
