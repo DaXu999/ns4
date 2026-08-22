@@ -1,0 +1,166 @@
+# NS4 Imatrix Pipeline
+
+This directory contains the calibration dataset and instructions used to build
+activation importance matrices for DeepSeek V4 Flash GGUF quantization.
+
+The current imatrix target is the routed MoE path.  Flash has 43 layers and
+256 routed experts per layer, and exposes three routed expert tensors per
+layer:
+
+- `blk.N.ffn_gate_exps.weight`
+- `blk.N.ffn_up_exps.weight`
+- `blk.N.ffn_down_exps.weight`
+
+For gate/up tensors, the collector records the squared FFN-normalized input
+activation.  For down tensors, it records the squared routed SwiGLU row after
+route weighting.  The result tells the quantizer which input columns are used
+more heavily by the actual NS4 inference graph.
+
+## 1. Build The Calibration Dataset
+
+The tracked dataset is in `tools/gguf-tools/imatrix/dataset/`.  It was generated
+by `dataset/build_ds4_imatrix_dataset.py`, which walks the ds4 source tree
+(`ds4.c`, `metal/`) for its source-review prompts and therefore runs from a ds4
+checkout, not from this repository:
+
+```sh
+python3 gguf-tools/imatrix/dataset/build_ds4_imatrix_dataset.py   # in a ds4 checkout
+```
+
+The important output is:
+
+```text
+tools/gguf-tools/imatrix/dataset/rendered_prompts.txt
+```
+
+It contains NS4-rendered chat prompts, separated by visible
+`DS4_IMATRIX_PROMPT` markers (the frozen data keeps the ds4 spelling).  The prompts include:
+
+- C/CUDA source-review prompts from this repository.
+- Long-context snippets.
+- Agent/tool-call prompts using NS4's DSML syntax.
+- Language/prose rewriting, summarization, extraction, and translation prompts.
+- `ns4-eval` GPQA Diamond, SuperGPQA, and AIME2025 benchmark prompts.
+- Both thinking and non-thinking assistant prefixes.
+
+The current tracked dataset has 4690 rendered prompts and roughly 2.91M tokens
+by the coarse bytes/4 estimate.  Check
+`tools/gguf-tools/imatrix/dataset/manifest.json` for the exact generated-file
+summary.
+
+## 2. Collect The Imatrix
+
+Use the NS4 runtime itself to collect routed MoE activation statistics.  The
+collector uses the loaded GGUF metadata.
+
+Flash example:
+
+```sh
+./ns4 \
+  -m ../deepseek-v4-quants/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf \
+  --imatrix-dataset tools/gguf-tools/imatrix/dataset/rendered_prompts.txt \
+  --imatrix-out ../deepseek-v4-quants/imatrix/DeepSeek-V4-Flash-chat-v2-routed-moe-ns4-1p5m.dat \
+  --ctx 32768
+```
+
+Useful smoke-test limits:
+
+```sh
+./ns4 \
+  -m MODEL.gguf \
+  --imatrix-dataset tools/gguf-tools/imatrix/dataset/rendered_prompts.txt \
+  --imatrix-out /tmp/ns4-test.imatrix.dat \
+  --imatrix-max-prompts 1 \
+  --imatrix-max-tokens 4096
+```
+
+The collector hooks the layer-major prefill graph, so it needs the CUDA
+backend. Validated on CUDA in the ns4 standalone bring-up: the routed-expert
+observation count comes out exactly tokens x 43 layers x 6 experts, and the
+emitted `.dat` parses as the legacy llama.cpp imatrix format. Do not collect
+under `--cuda-tensor-parallel`: the expert-parallel prefill path bypasses the
+tensor the collector reads.
+It does not change inference math; it reads the already materialized MoE inputs
+and accumulates `sum(x[column]^2)` per routed expert.
+
+The output format is llama.cpp's legacy binary `.dat` imatrix format.  NS4 packs
+per-expert vectors into one entry per routed expert tensor:
+
+```text
+entry length = n_expert * n_columns
+```
+
+The quantizer slices the right expert's segment when quantizing each expert.
+
+## 3. Generate GGUF Files With The Imatrix
+
+The local C quantization tool in `tools/gguf-tools/` supports:
+
+```text
+--imatrix FILE
+--imatrix-strict
+```
+
+Example Q4 routed-expert regeneration:
+
+```sh
+tools/gguf-tools/deepseek4-quantize \
+  --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Flash \
+  --template ../deepseek-v4-quants/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf \
+  --out ../deepseek-v4-quants/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf \
+  --imatrix ../deepseek-v4-quants/imatrix/DeepSeek-V4-Flash-chat-v2-routed-moe-ns4-1p5m.dat
+```
+
+Example Q2 regeneration:
+
+```sh
+tools/gguf-tools/deepseek4-quantize \
+  --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Flash \
+  --template ../deepseek-v4-quants/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf \
+  --out ../deepseek-v4-quants/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
+  --imatrix ../deepseek-v4-quants/imatrix/DeepSeek-V4-Flash-chat-v2-routed-moe-ns4-1p5m.dat
+```
+
+`deepseek4-quantize` reads the routed expert count from the template GGUF.  Use
+`--n-experts` only when working with an older template that lacks
+`deepseek4.expert_count`.
+
+For Q4, the imatrix does not change the runtime tensor type: routed experts
+remain `Q4_K`.  It changes how quantization error is weighted while choosing
+scales and codes.  For Q2, it replaces the previous synthetic weight-energy
+fallback used for `IQ2_XXS` gate/up experts with real activation statistics.
+
+## 4. Evaluate
+
+Useful local tools:
+
+```text
+tools/gguf-tools/quality-testing/
+```
+
+`tools/gguf-tools/quality-testing/` can score local GGUFs against official DeepSeek
+API continuations by target-token negative log likelihood.
+
+The Q4 imatrix file uploaded to Hugging Face was tested on 100 official
+DeepSeek V4 Flash continuations:
+
+```text
+old Q4 avg NLL:         0.177357819
+Q4 imatrix avg NLL:     0.173895148
+relative NLL change:   -1.95%
+case wins:              54 imatrix / 46 old
+first-token matches:    83 imatrix / 81 old
+avg greedy LCP:         12.21 imatrix / 11.94 old
+```
+
+## Compatibility
+
+The `.dat` file is intentionally in llama.cpp's legacy imatrix format, so the
+data is not conceptually tied to NS4.  In practice, it is immediately useful
+only with a quantizer that understands NS4's tensor names and packed per-expert
+entries.  The current `deepseek4-quantize` tooling does that.
+
+Other GGUF creation tools can use the same imatrix if they implement the same
+name mapping and per-expert slicing convention.  Without that NS4-specific
+mapping, a generic imatrix loader will see valid data but will not know how to
+apply the packed routed-expert vectors correctly.

@@ -1,0 +1,7 @@
+deepseek4-quantize
+quality-testing/score_official
+quality-testing/score_llama
+quality-testing/data/*
+!quality-testing/data/README.md
+!quality-testing/data/flash/
+!quality-testing/data/flash/**
