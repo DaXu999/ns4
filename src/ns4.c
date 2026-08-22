@@ -2429,16 +2429,20 @@ static bool accelerator_span_filter_contains(uint64_t off,
     return false;
 }
 
-static bool accelerator_prepare_model_tensor_spans(const ns4_model *m,
+/* Collect the startup preload candidates of one GGUF: one span per tensor
+ * that passes the optional span filter and is not already covered by an
+ * aligned CUDA artifact, sorted by file offset.  Returns false on a malformed
+ * tensor table; *nspan_out may be 0. */
+static bool accelerator_collect_model_tensor_spans(const ns4_model *m,
                                                    const uint64_t *span_offsets,
                                                    const uint64_t *span_sizes,
                                                    uint32_t span_count,
-                                                   uint64_t *prepared_out) {
+                                                   accelerator_tensor_span **spans_out,
+                                                   uint64_t *nspan_out) {
+    *spans_out = NULL;
+    *nspan_out = 0;
     uint64_t cap = m->n_tensors;
-    if (cap == 0) {
-        if (prepared_out) *prepared_out = 0;
-        return true;
-    }
+    if (cap == 0) return true;
 
     accelerator_tensor_span *spans = xmalloc((size_t)cap * sizeof(spans[0]));
     uint64_t nspan = 0;
@@ -2471,11 +2475,80 @@ static bool accelerator_prepare_model_tensor_spans(const ns4_model *m,
     }
     if (nspan == 0) {
         free(spans);
+        return true;
+    }
+    qsort(spans, (size_t)nspan, sizeof(spans[0]), accelerator_tensor_span_cmp);
+    *spans_out = spans;
+    *nspan_out = nspan;
+    return true;
+}
+
+/* Merge the next run of neighbouring spans (gap <= 64 KiB, merged size <=
+ * max_span; a single oversized tensor still forms its own span).  Advances *i
+ * and returns false once the table is exhausted. */
+static bool accelerator_next_merged_span(const accelerator_tensor_span *spans,
+                                         uint64_t nspan,
+                                         uint64_t max_span,
+                                         uint64_t *i,
+                                         uint64_t *off_out,
+                                         uint64_t *end_out) {
+    if (*i >= nspan) return false;
+    uint64_t off = spans[*i].off;
+    uint64_t end = spans[*i].end;
+    (*i)++;
+    while (*i < nspan &&
+           spans[*i].off <= end + 65536u &&
+           spans[*i].end - off <= max_span) {
+        if (spans[*i].end > end) end = spans[*i].end;
+        (*i)++;
+    }
+    *off_out = off;
+    *end_out = end;
+    return true;
+}
+
+/* Bytes the CUDA weight arena hands out for this GGUF's startup spans: the
+ * same collect/merge walk as the preload pass, each span rounded to the
+ * arena's 256-byte granule.  Lets the engine size the arena exactly instead
+ * of growing it in NS4_CUDA_WEIGHT_ARENA_CHUNK_MB chunks. */
+static uint64_t accelerator_model_tensor_span_arena_bytes(const ns4_model *m,
+                                                          const uint64_t *span_offsets,
+                                                          const uint64_t *span_sizes,
+                                                          uint32_t span_count) {
+    accelerator_tensor_span *spans = NULL;
+    uint64_t nspan = 0;
+    if (!m || !m->map || m->size == 0) return 0;
+    if (!accelerator_collect_model_tensor_spans(m, span_offsets, span_sizes,
+                                                span_count, &spans, &nspan)) {
+        return 0;
+    }
+    const uint64_t max_span = accelerator_cuda_preload_span_bytes();
+    uint64_t total = 0;
+    uint64_t off = 0;
+    uint64_t end = 0;
+    for (uint64_t i = 0;
+         accelerator_next_merged_span(spans, nspan, max_span, &i, &off, &end);) {
+        total += ((end - off) + 255u) & ~(uint64_t)255u;
+    }
+    free(spans);
+    return total;
+}
+
+static bool accelerator_prepare_model_tensor_spans(const ns4_model *m,
+                                                   const uint64_t *span_offsets,
+                                                   const uint64_t *span_sizes,
+                                                   uint32_t span_count,
+                                                   uint64_t *prepared_out) {
+    accelerator_tensor_span *spans = NULL;
+    uint64_t nspan = 0;
+    if (!accelerator_collect_model_tensor_spans(m, span_offsets, span_sizes,
+                                                span_count, &spans, &nspan)) {
+        return false;
+    }
+    if (nspan == 0) {
         if (prepared_out) *prepared_out = 0;
         return true;
     }
-
-    qsort(spans, (size_t)nspan, sizeof(spans[0]), accelerator_tensor_span_cmp);
 
     const uint64_t max_span = accelerator_cuda_preload_span_bytes();
     const int tty = ns4_log_is_tty(stderr);
@@ -2493,16 +2566,10 @@ static bool accelerator_prepare_model_tensor_spans(const ns4_model *m,
             tty ? ": 0.00 GiB" : "\n");
     fflush(stderr);
 
-    for (uint64_t i = 0; i < nspan;) {
-        uint64_t off = spans[i].off;
-        uint64_t end = spans[i].end;
-        i++;
-        while (i < nspan &&
-               spans[i].off <= end + 65536u &&
-               spans[i].end - off <= max_span) {
-            if (spans[i].end > end) end = spans[i].end;
-            i++;
-        }
+    uint64_t off = 0;
+    uint64_t end = 0;
+    for (uint64_t i = 0;
+         accelerator_next_merged_span(spans, nspan, max_span, &i, &off, &end);) {
         char label[96];
         snprintf(label, sizeof(label), "tensor-span:%" PRIu64, merged);
         if (ns4_gpu_cache_model_range(m->map, m->size, off, end - off, label) == 0) {
@@ -2587,6 +2654,42 @@ static bool accelerator_cache_model_tensors(ns4_backend backend,
             "ns4: %s startup model preparation covered %.2f GiB of tensor spans in %.3fs\n",
             accelerator_name, (double)prepared / 1073741824.0, t1 - t0);
     return true;
+}
+
+/* Size the CUDA weight arena to exactly the startup spans of the main model
+ * (plus the runtime support model when that is cached as well).  Otherwise
+ * the arena grows in NS4_CUDA_WEIGHT_ARENA_CHUNK_MB chunks and the last chunk
+ * of each model strands up to a chunk of VRAM.  NS4_CUDA_WEIGHT_ARENA_EXACT=0
+ * restores the chunked layout. */
+static void accelerator_set_weight_arena_reserve(const ns4_model *model,
+                                                 const ns4_model *support_model,
+                                                 const uint64_t *span_offsets,
+                                                 const uint64_t *span_sizes,
+                                                 uint32_t span_count) {
+    if (getenv("NS4_CUDA_DIRECT_MODEL") != NULL) return;
+    const char *env = getenv("NS4_CUDA_WEIGHT_ARENA_EXACT");
+    if (env && env[0] == '0' && env[1] == '\0') return;
+    const uint64_t model_bytes =
+        accelerator_model_tensor_span_arena_bytes(model, span_offsets,
+                                                  span_sizes, span_count);
+    const uint64_t support_bytes = support_model
+        ? accelerator_model_tensor_span_arena_bytes(support_model, NULL, NULL, 0)
+        : 0;
+    const uint64_t total = model_bytes + support_bytes;
+    if (total == 0) return;
+    ns4_gpu_set_weight_arena_reserve(total);
+    if (support_bytes != 0) {
+        fprintf(stderr,
+                "ns4: CUDA weight arena sized to %.2f GiB of tensor spans "
+                "(model %.2f GiB + support model %.2f GiB)\n",
+                (double)total / 1073741824.0,
+                (double)model_bytes / 1073741824.0,
+                (double)support_bytes / 1073741824.0);
+    } else {
+        fprintf(stderr,
+                "ns4: CUDA weight arena sized to %.2f GiB of tensor spans\n",
+                (double)total / 1073741824.0);
+    }
 }
 #endif
 
@@ -38014,6 +38117,13 @@ static int ns4_engine_open_internal(ns4_engine **out,
             ns4_engine_close(e);
             *out = NULL;
             return 1;
+        }
+        if (e->backend == NS4_BACKEND_CUDA) {
+            accelerator_set_weight_arena_reserve(&e->model,
+                                                 support_model_runtime_ready
+                                                     ? &e->mtp_model : NULL,
+                                                 load_offsets, load_sizes,
+                                                 load_span_count);
         }
         (void)ns4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
         if (!accelerator_cache_model_tensors(e->backend, &e->model,

@@ -415,6 +415,9 @@ struct cuda_derived_range {
 
 static std::vector<cuda_model_range> g_model_ranges;
 static std::vector<cuda_model_arena> g_model_arenas;
+/* Exact arena size requested by the engine for the startup spans of the
+ * main (+ support) model; 0 keeps the chunked growth below. */
+static uint64_t g_model_arena_reserve_bytes;
 static std::unordered_map<uint64_t, size_t> g_model_range_by_offset;
 static std::vector<cuda_q8_f16_range> g_q8_f16_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f16_by_offset;
@@ -2392,7 +2395,19 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     const uint64_t limit = cuda_model_cache_limit_bytes();
     if (g_model_range_bytes > limit || aligned > limit - g_model_range_bytes) return NULL;
 
-    const uint64_t chunk = cuda_model_arena_chunk_bytes(aligned);
+    uint64_t chunk;
+    if (g_model_arena_reserve_bytes != 0) {
+        if (g_model_arenas.empty() && g_model_arena_reserve_bytes >= aligned) {
+            chunk = g_model_arena_reserve_bytes;
+        } else {
+            /* The reserve was meant to cover every startup span; anything
+             * past it is an accounting miss, so keep the spill small. */
+            const uint64_t spill_align = 256ull * 1048576ull;
+            chunk = (aligned + spill_align - 1u) & ~(spill_align - 1u);
+        }
+    } else {
+        chunk = cuda_model_arena_chunk_bytes(aligned);
+    }
     void *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)chunk);
     if (err != cudaSuccess) {
@@ -2610,6 +2625,7 @@ static void cuda_model_range_release_all(void) {
         if (a.device_ptr) (void)cudaFree(a.device_ptr);
     }
     g_model_arenas.clear();
+    g_model_arena_reserve_bytes = 0;
     g_model_ranges.clear();
     g_model_range_by_offset.clear();
     g_model_range_bytes = 0;
@@ -28884,6 +28900,10 @@ extern "C" int ns4_gpu_set_model_fd_for_map(int fd, const void *model_map) {
     const int ok = ns4_gpu_set_model_fd(fd);
     if (ok) g_model_fd_host_base = model_map;
     return ok;
+}
+
+extern "C" void ns4_gpu_set_weight_arena_reserve(uint64_t bytes) {
+    g_model_arena_reserve_bytes = bytes;
 }
 
 extern "C" void ns4_gpu_set_ssd_streaming(bool enabled) {
