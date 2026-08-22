@@ -315,12 +315,12 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 completions, the Responses API, or the Anthropic API. Start the server first,
 and set the client context limit no higher than the server's `--ctx`.
 
-Size `--ctx` to your VRAM: KV/indexer context buffers cost about 18 KiB per
-token of allocated context with the 2-bit model -- about 7.6 GiB at the
+Size `--ctx` to your VRAM: KV/indexer context buffers cost about 15.7 KiB per
+token of allocated context with the 2-bit model -- about 6.5 GiB at the
 launcher's 436k setting. Once the KV cache reaches 8 GiB (about 538k tokens at
 prefill chunk 2048) session creation prints `using managed KV cache` and the
-cache moves to managed memory: ~1% slower today, but the margin to real paging
-is unmeasured, so stay below it (a full 1M-token allocation would need ~17
+cache moves to managed memory: slower, but the margin to real paging
+is unmeasured, so stay below it (a full 1M-token allocation would need ~15
 GiB). On a single 96 GB card the launcher's 436k keeps ~3 GiB of headroom and
 `NS4_CTX=532000` is measured-good when the workload needs the room; its header
 documents the free-VRAM floor in between. The `384000` output limit below

@@ -84,6 +84,9 @@ int ns4_gpu_synchronize(void);
 int ns4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ns4_gpu_set_model_fd(int fd);
 int ns4_gpu_set_model_fd_for_map(int fd, const void *model_map);
+/* Size the weight arena's first chunk to exactly this many bytes (the
+ * engine's sum of the startup tensor spans); 0 keeps chunked growth. */
+void ns4_gpu_set_weight_arena_reserve(uint64_t bytes);
 int ns4_gpu_build_derived_artifacts(const void *model_map, uint64_t model_size,
                                     const char *model_path);
 int ns4_gpu_model_range_replaced(const void *model_map, uint64_t offset,
