@@ -30439,9 +30439,10 @@ ns4_context_memory ns4_context_memory_estimate_with_prefill_mode(
                                   NS4_N_HEAD_DIM *
                                   (NS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
             if (ratio == 4) {
-                m.compressed_bytes += (uint64_t)layer_comp_cap *
-                                      NS4_N_INDEXER_HEAD_DIM *
-                                      sizeof(float);
+                /* fp4 indexer mirror rows (80 B), the only persistent
+                 * indexer cache since the f32 rows were retired; matches
+                 * graph_kv_cache_bytes_for_context. */
+                m.compressed_bytes += (uint64_t)layer_comp_cap * 80u;
             }
         }
         uint64_t attn_stage_cap = (uint64_t)(m.prefill_cap / min_ratio + 2u);

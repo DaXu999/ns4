@@ -172,9 +172,9 @@ export NS4_CUDA_DECODE_INDEXER_SPARSE_THRESHOLD="${NS4_CUDA_DECODE_INDEXER_SPARS
 printf 'run-cuda-436k-server: ctx=%s prefill-chunk=%s gpu-vram=%s dspark=%s -> %s:%s\n' \
     "$CTX" "$PREFILL_CHUNK" "$GPU_VRAM" "$DSPARK" "$SERVER_HOST" "$SERVER_PORT"
 case "$PREFILL_CHUNK" in
-    2048) EXPECT_CTX_BUFFERS="7619.27" ;;
-    1024) EXPECT_CTX_BUFFERS="6681.19" ;;
-    512)  EXPECT_CTX_BUFFERS="6212.15" ;;
+    2048) EXPECT_CTX_BUFFERS="6676.21" ;;
+    1024) EXPECT_CTX_BUFFERS="5738.13" ;;
+    512)  EXPECT_CTX_BUFFERS="5269.09" ;;
     *)    EXPECT_CTX_BUFFERS="" ;;
 esac
 [[ -n "$EXPECT_CTX_BUFFERS" ]] && printf 'run-cuda-436k-server: expect "context buffers %s MiB" at the default ctx; full prefill speed holds through ctx 536000, managed KV past ~537900\n' "$EXPECT_CTX_BUFFERS"
