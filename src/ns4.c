@@ -37947,11 +37947,27 @@ static int ns4_engine_open_internal(ns4_engine **out,
             }
         }
         (void)ns4_gpu_set_model_fd(e->model.fd);
+        /* The support model (legacy MTP, or DSpark under --dspark) shares the
+         * aligned artifacts, the weight arena and the startup cache. */
+        const bool support_model_runtime_ready =
+            e->mtp_ready ||
+            (e->support_kind == NS4_SUPPORT_DSPARK && e->dspark);
         if (e->backend == NS4_BACKEND_CUDA &&
             !load_slice && !e->ssd_streaming) {
             (void)ns4_gpu_build_derived_artifacts(e->model.map,
                                                   e->model.size,
-                                                  opt->model_path);
+                                                  opt->model_path,
+                                                  "base");
+            /* The DSpark draft blocks carry the same IQ2_XXS/Q2_K routed
+             * experts as the main layers: give them the aligned layout too,
+             * so the draft MoE runs the artifact kernels and its raw expert
+             * spans stay out of the weight arena. */
+            if (support_model_runtime_ready && e->mtp_model.map) {
+                (void)ns4_gpu_build_derived_artifacts(e->mtp_model.map,
+                                                      e->mtp_model.size,
+                                                      opt->mtp_path,
+                                                      "support");
+            }
         }
         int model_map_ok = 0;
         uint64_t *load_offsets = NULL;
@@ -38099,9 +38115,6 @@ static int ns4_engine_open_internal(ns4_engine **out,
             *out = NULL;
             return 1;
         }
-        const bool support_model_runtime_ready =
-            e->mtp_ready ||
-            (e->support_kind == NS4_SUPPORT_DSPARK && e->dspark);
         if (support_model_runtime_ready &&
             !ns4_gpu_set_model_map_range(e->mtp_model.map,
                                            e->mtp_model.size,

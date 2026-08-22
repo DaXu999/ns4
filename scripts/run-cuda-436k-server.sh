@@ -71,9 +71,10 @@
 # OPTIONAL DSPARK (NS4_DSPARK=1)
 #
 # The Flash 0731 DSpark support GGUF adds 5.58 GiB of resident weights (its
-# three draft blocks, routed experts included; the arena is sized for main
-# plus support) and ~0.2 GiB of runtime state -- nothing that scales with
-# the context. At prefill chunk 2048 that lands at ~95 GiB and session
+# three draft blocks: 5.06 GiB of routed experts built into aligned
+# artifacts like the main layers', plus 0.52 GiB of other spans in the
+# arena) and ~0.2 GiB of runtime state -- nothing that scales with the
+# context. At prefill chunk 2048 that lands at ~95 GiB and session
 # creation fails; at chunk 1024 the engine peaks at 93.1 GiB and serves
 # (measured: 9.4k-token prompt, DSpark active), with ~1 GiB of slack. So
 # NS4_DSPARK=1 defaults the prefill chunk to 1024 unless NS4_PREFILL_CHUNK
@@ -82,9 +83,12 @@
 # tk/s); decode is unaffected by the chunk. DSpark only drafts for
 # temperature-0 requests and is silently inactive under --batched-session.
 # Set NS4_DSPARK_SUPPORT to another support GGUF path. Whether drafting pays
-# is a separate question: the first A/B runs on this card decoded slower with
-# DSpark (80.9 -> 54.8 t/s on a code prompt at ctx 8k, 76.9 -> 64.5 at a 32k
-# prose prompt), with byte-identical greedy output.
+# is a separate question: the A/B runs on this card decoded slower with
+# DSpark (80.9 -> 52.5 t/s on a code prompt at ctx 8k, 76.9 -> 61.7 at a 32k
+# prose prompt), with byte-identical greedy output. The time goes to the
+# verify and replay passes through the main model, not to the draft blocks:
+# the aligned support experts trimmed the draft chain ~5% and left the
+# picture unchanged.
 #
 # The three env exports are not tuning niceties. Without them the q8->f16
 # weight cache grows until free VRAM hits the reserve, which on this model is

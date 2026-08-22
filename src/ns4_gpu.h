@@ -87,8 +87,11 @@ int ns4_gpu_set_model_fd_for_map(int fd, const void *model_map);
 /* Size the weight arena's first chunk to exactly this many bytes (the
  * engine's sum of the startup tensor spans); 0 keeps chunked growth. */
 void ns4_gpu_set_weight_arena_reserve(uint64_t bytes);
+/* Build the aligned IQ2_XXS/Q2_K expert artifacts of one GGUF before its
+ * weight upload; one build per model map.  model_id labels the log lines:
+ * "base" for the main model, "support" for the runtime support model. */
 int ns4_gpu_build_derived_artifacts(const void *model_map, uint64_t model_size,
-                                    const char *model_path);
+                                    const char *model_path, const char *model_id);
 int ns4_gpu_model_range_replaced(const void *model_map, uint64_t offset,
                                  uint64_t bytes);
 int ns4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);

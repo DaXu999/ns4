@@ -424,10 +424,15 @@ static std::unordered_map<uint64_t, size_t> g_q8_f16_by_offset;
 static std::vector<cuda_q8_f32_range> g_q8_f32_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f32_by_offset;
 static std::vector<cuda_derived_range> g_derived_ranges;
-static const void *g_derived_replace_map;
-static uint64_t g_derived_artifact_bytes;
-static double g_derived_artifact_build_secs;
-static int g_derived_replaces_complete;
+/* One entry per model map whose aligned artifacts were built: the main
+ * model, and the runtime support model when its draft blocks carry IQ2/Q2K
+ * routed experts.  replaces_complete marks the maps whose every routed
+ * expert tensor is covered, i.e. whose raw expert spans stay off the GPU. */
+struct cuda_derived_map {
+    const void *host_base;
+    int replaces_complete;
+};
+static std::vector<cuda_derived_map> g_derived_maps;
 static void *g_aligned_q81_scratch;
 static uint64_t g_model_range_bytes;
 static uint64_t g_q8_f16_bytes;
@@ -552,7 +557,11 @@ static const char *cuda_derived_weight_ptr(
 }
 
 static int cuda_model_map_replaces_complete(const void *model_map) {
-    return g_derived_replaces_complete && model_map == g_derived_replace_map;
+    if (!model_map) return 0;
+    for (const cuda_derived_map &m : g_derived_maps) {
+        if (m.host_base == model_map) return m.replaces_complete;
+    }
+    return 0;
 }
 
 static int cuda_integrated_artifact_map(const void *model_map) {
@@ -2642,10 +2651,7 @@ static void cuda_derived_range_release_all(void) {
         if (r.device_ptr) (void)cudaFree(r.device_ptr);
     }
     g_derived_ranges.clear();
-    g_derived_replace_map = NULL;
-    g_derived_artifact_bytes = 0;
-    g_derived_artifact_build_secs = 0.0;
-    g_derived_replaces_complete = 0;
+    g_derived_maps.clear();
 }
 
 static int cublas_ok(cublasStatus_t st, const char *what) {
@@ -4399,9 +4405,19 @@ extern "C" int ns4_gpu_set_model_fd(int fd) {
 extern "C" int ns4_gpu_build_derived_artifacts(
         const void *model_map,
         uint64_t model_size,
-        const char *model_path) {
+        const char *model_path,
+        const char *model_id) {
     if (!model_map || model_size == 0 || !model_path || !model_path[0]) return 0;
-    if (!g_derived_ranges.empty()) return (int)g_derived_ranges.size();
+    if (!model_id || !model_id[0]) model_id = "base";
+    /* One build per model map; the main and the support model each register
+     * their own ranges, keyed by map pointer. */
+    {
+        int built = 0;
+        for (const cuda_derived_range &r : g_derived_ranges) {
+            if (r.host_base == model_map) built++;
+        }
+        if (built) return built;
+    }
     if (getenv("NS4_CUDA_NO_DERIVED_WEIGHTS") != NULL) return 0;
     const char *build = getenv("NS4_CUDA_BUILD_ARTIFACTS");
     if (build && strcmp(build, "0") == 0) return 0;
@@ -4461,10 +4477,21 @@ extern "C" int ns4_gpu_build_derived_artifacts(
         cuda_aligned_iq2_enabled() && cuda_aligned_q2k_enabled();
     const bool build_q8 = integrated && cuda_aligned_q8_enabled();
     if (!build_moe && !build_q8) return 0;
+    if (!build_q8) {
+        bool moe_candidates = false;
+        for (const ns4_repack_tensor &tensor : records) {
+            if (ns4_repack_iq2_candidate(tensor) ||
+                ns4_repack_q2k_candidate(tensor)) {
+                moe_candidates = true;
+                break;
+            }
+        }
+        if (!moe_candidates) return 0;
+    }
 
     ns4_repack_build_args args;
     args.log_prefix = "ns4";
-    args.model_id = "base";
+    args.model_id = model_id;
     args.path = model_path;
     args.records = &records;
     args.device = device;
@@ -4528,10 +4555,8 @@ extern "C" int ns4_gpu_build_derived_artifacts(
     }
     if (replace_candidates == 0) replaces_complete = 0;
 
-    g_derived_replace_map = model_map;
-    g_derived_replaces_complete = replaces_complete;
-    g_derived_artifact_bytes = built_bytes;
-    g_derived_artifact_build_secs = cuda_wall_sec() - t0;
+    g_derived_maps.push_back({model_map, replaces_complete});
+    const double build_secs = cuda_wall_sec() - t0;
     if (!g_aligned_q81_scratch) {
         cudaError_t scratch_err = cudaMalloc(&g_aligned_q81_scratch, 256u * 1024u);
         if (scratch_err == cudaSuccess) {
@@ -4545,13 +4570,18 @@ extern "C" int ns4_gpu_build_derived_artifacts(
                     cudaGetErrorString(scratch_err));
         }
     }
+    char model_label[64] = "";
+    if (strcmp(model_id, "base") != 0) {
+        snprintf(model_label, sizeof(model_label), " for the %s model", model_id);
+    }
     fprintf(stderr,
-            "ns4: built %llu aligned CUDA artifacts (%.2f GiB) in %.1fs%s\n",
-            (unsigned long long)g_derived_ranges.size(),
-            (double)g_derived_artifact_bytes / 1073741824.0,
-            g_derived_artifact_build_secs,
+            "ns4: built %llu aligned CUDA artifacts%s (%.2f GiB) in %.1fs%s\n",
+            (unsigned long long)artifacts.size(),
+            model_label,
+            (double)built_bytes / 1073741824.0,
+            build_secs,
             replaces_complete ? "; expert raw residency replaced" : "");
-    return (int)g_derived_ranges.size();
+    return (int)artifacts.size();
 }
 
 extern "C" int ns4_gpu_model_range_replaced(
