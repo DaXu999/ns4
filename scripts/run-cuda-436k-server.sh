@@ -53,6 +53,39 @@
 # per-token attention and the DSA indexer scan growing, not memory pressure,
 # and no allocation avoids it.
 #
+# WHERE THE VRAM GOES AT 436,000 (single card, exact-size weight arena build)
+#
+# Measured with a cudaMalloc interposer, the engine's own allocations peak at
+# 89.4 GiB: 72.56 GiB of aligned expert artifacts, 8.20 GiB of other weight
+# spans in the arena, 4.86 GiB of KV state (compressed rows, fp4 indexer
+# mirror, SWA ring), and 3.65 GiB of session work buffers at prefill chunk
+# 2048 (indexer scores + comp mask 1.66 GiB, batch_* prefill buffers 2.0 GiB,
+# half of each for chunk 1024). The CUDA runtime keeps ~1.5 GiB more outside
+# those numbers, and session creation fails loudly once the engine's
+# allocations reach ~94.2 GiB on this card. The weight arena used to be
+# grown in NS4_CUDA_WEIGHT_ARENA_CHUNK_MB chunks and stranded 1.9 GiB at this
+# model's 8.20 GiB of spans (the experts left the arena with the aligned
+# artifacts); the exact-size arena removes that, so the slack figures above
+# gain ~1.9 GiB. NS4_CUDA_WEIGHT_ARENA_EXACT=0 restores the chunked layout.
+#
+# OPTIONAL DSPARK (NS4_DSPARK=1)
+#
+# The Flash 0731 DSpark support GGUF adds 5.58 GiB of resident weights (its
+# three draft blocks, routed experts included; the arena is sized for main
+# plus support) and ~0.2 GiB of runtime state -- nothing that scales with
+# the context. At prefill chunk 2048 that lands at ~95 GiB and session
+# creation fails; at chunk 1024 the engine peaks at 93.1 GiB and serves
+# (measured: 9.4k-token prompt, DSpark active), with ~1 GiB of slack. So
+# NS4_DSPARK=1 defaults the prefill chunk to 1024 unless NS4_PREFILL_CHUNK
+# is set. The price is prefill throughput: ~3080 tk/s at 1024 against ~3415
+# at 2048 on a 9.4k prompt (chunk 512 buys another 1.0 GiB of slack at ~2500
+# tk/s); decode is unaffected by the chunk. DSpark only drafts for
+# temperature-0 requests and is silently inactive under --batched-session.
+# Set NS4_DSPARK_SUPPORT to another support GGUF path. Whether drafting pays
+# is a separate question: the first A/B runs on this card decoded slower with
+# DSpark (80.9 -> 54.8 t/s on a code prompt at ctx 8k, 76.9 -> 64.5 at a 32k
+# prose prompt), with byte-identical greedy output.
+#
 # The three env exports are not tuning niceties. Without them the q8->f16
 # weight cache grows until free VRAM hits the reserve, which on this model is
 # zero, and throughput collapses ~20x (prefill 2016 -> 99 tk/s, decode
@@ -69,7 +102,13 @@ cd -- "$ROOT"
 
 MODEL="${NS4_MODEL:-$ROOT/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf}"
 CTX="${NS4_CTX:-436000}"
-PREFILL_CHUNK="${NS4_PREFILL_CHUNK:-2048}"
+DSPARK="${NS4_DSPARK:-0}"
+DSPARK_SUPPORT="${NS4_DSPARK_SUPPORT:-$ROOT/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf}"
+if [[ "$DSPARK" == "1" ]]; then
+    PREFILL_CHUNK="${NS4_PREFILL_CHUNK:-1024}"
+else
+    PREFILL_CHUNK="${NS4_PREFILL_CHUNK:-2048}"
+fi
 GPU_VRAM="${NS4_GPU_VRAM:-94}"
 SERVER_HOST="${NS4_SERVER_HOST:-127.0.0.1}"
 SERVER_PORT="${NS4_SERVER_PORT:-8000}"
@@ -78,6 +117,16 @@ die() { printf 'run-cuda-436k-server: %s\n' "$*" >&2; exit 1; }
 
 [[ -f "$MODEL" ]] || die "model not found: $MODEL (set NS4_MODEL)"
 [[ -x ./ns4-server ]] || die "./ns4-server not built -- make ns4-server CUDA_ARCH=sm_120"
+DSPARK_ARGS=()
+if [[ "$DSPARK" == "1" ]]; then
+    [[ -f "$DSPARK_SUPPORT" ]] || die "DSpark support GGUF not found: $DSPARK_SUPPORT
+       (./scripts/download_model.sh ds4f-dspark, or set NS4_DSPARK_SUPPORT)"
+    DSPARK_ARGS=(--mtp "$DSPARK_SUPPORT" --dspark)
+    if (( PREFILL_CHUNK > 1024 && CTX >= 436000 )); then
+        printf 'run-cuda-436k-server: warning: DSpark at prefill-chunk %s and ctx %s was measured not to fit the 96 GB card (session creation fails); use NS4_PREFILL_CHUNK=1024\n' \
+            "$PREFILL_CHUNK" "$CTX" >&2
+    fi
+fi
 
 # ns4-server links ns4_cuda.o but has its own link step, so a rebuild of the
 # CUDA object does not update it. This has silently served a stale binary
@@ -89,6 +138,8 @@ if [[ -f ./src/ns4_cuda.o && ./src/ns4_cuda.o -nt ./ns4-server ]]; then
 fi
 
 export NS4_CUDA_NO_Q8_F16_CACHE="${NS4_CUDA_NO_Q8_F16_CACHE:-1}"
+# The arena is sized exactly for the startup spans; the chunk size below only
+# governs the chunked fallback (NS4_CUDA_WEIGHT_ARENA_EXACT=0) and any spill.
 export NS4_CUDA_WEIGHT_ARENA_CHUNK_MB="${NS4_CUDA_WEIGHT_ARENA_CHUNK_MB:-5184}"
 export NS4_CUDA_WEIGHT_PRELOAD_SPAN_MB="${NS4_CUDA_WEIGHT_PRELOAD_SPAN_MB:-512}"
 
@@ -118,9 +169,15 @@ export NS4_CUDA_Q8_PAIR_WIDE="${NS4_CUDA_Q8_PAIR_WIDE:-256}"
 # changes results once the sequence reaches its 4k-8k band.
 export NS4_CUDA_DECODE_INDEXER_SPARSE_THRESHOLD="${NS4_CUDA_DECODE_INDEXER_SPARSE_THRESHOLD-4096}"
 
-printf 'run-cuda-436k-server: ctx=%s prefill-chunk=%s gpu-vram=%s -> %s:%s\n' \
-    "$CTX" "$PREFILL_CHUNK" "$GPU_VRAM" "$SERVER_HOST" "$SERVER_PORT"
-printf 'run-cuda-436k-server: expect "context buffers 7619.27 MiB" at the default ctx; full prefill speed holds through ctx 536000, managed KV past ~537900\n'
+printf 'run-cuda-436k-server: ctx=%s prefill-chunk=%s gpu-vram=%s dspark=%s -> %s:%s\n' \
+    "$CTX" "$PREFILL_CHUNK" "$GPU_VRAM" "$DSPARK" "$SERVER_HOST" "$SERVER_PORT"
+case "$PREFILL_CHUNK" in
+    2048) EXPECT_CTX_BUFFERS="7619.27" ;;
+    1024) EXPECT_CTX_BUFFERS="6681.19" ;;
+    512)  EXPECT_CTX_BUFFERS="6212.15" ;;
+    *)    EXPECT_CTX_BUFFERS="" ;;
+esac
+[[ -n "$EXPECT_CTX_BUFFERS" ]] && printf 'run-cuda-436k-server: expect "context buffers %s MiB" at the default ctx; full prefill speed holds through ctx 536000, managed KV past ~537900\n' "$EXPECT_CTX_BUFFERS"
 
 exec ./ns4-server --cuda -m "$MODEL" \
     --gpu-vram "$GPU_VRAM" \
@@ -128,4 +185,5 @@ exec ./ns4-server --cuda -m "$MODEL" \
     --ctx "$CTX" \
     --host "$SERVER_HOST" \
     --port "$SERVER_PORT" \
+    "${DSPARK_ARGS[@]}" \
     "$@"
