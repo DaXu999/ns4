@@ -22896,18 +22896,24 @@ static bool graph_dspark_capture_prefill_rows(
     return ok;
 }
 
+/* `batch_row0` is where the block's own rows start in the capture buffer: 1 for
+ * the decode-then-verify cycle, whose row 0 holds the separately decoded token
+ * at `start - 1`, and 0 for a folded block, which begins at the confirmed token
+ * and so needs no row copied in ahead of it. */
 static bool graph_dspark_capture_verified_suffix_begin(
         ns4_gpu_graph *g,
         uint32_t       start,
         uint32_t       n_tokens,
+        uint32_t       batch_row0,
         bool           commands_open) {
     if (!g || !g->dspark_capture_enabled ||
         !g->dspark_target_hidden ||
         !g->dspark_target_hidden_batch ||
         start == 0 ||
         n_tokens == 0 ||
-        n_tokens + 1u < n_tokens ||
-        n_tokens + 1u > g->prefill_cap ||
+        batch_row0 > 1u ||
+        n_tokens + batch_row0 < n_tokens ||
+        n_tokens + batch_row0 > g->prefill_cap ||
         !g->dspark_capture_valid ||
         g->dspark_capture_checkpoint_len != start) {
         graph_dspark_capture_invalidate(g);
@@ -22917,7 +22923,9 @@ static bool graph_dspark_capture_verified_suffix_begin(
     const uint64_t embd_bytes = (uint64_t)NS4_N_EMBD * sizeof(float);
     graph_dspark_capture_batch_invalidate(g);
     bool ok = commands_open || ns4_gpu_begin_commands() != 0;
-    for (uint32_t slot = 0; ok && slot < g->dspark_target_layer_count; slot++) {
+    for (uint32_t slot = 0;
+         ok && batch_row0 != 0 && slot < g->dspark_target_layer_count;
+         slot++) {
         ns4_gpu_tensor *dst =
             ns4_gpu_tensor_view(g->dspark_target_hidden_batch,
                                 ((uint64_t)slot * g->prefill_cap *
@@ -22947,7 +22955,8 @@ static bool graph_dspark_capture_verified_suffix_layer(
         ns4_gpu_graph *g,
         uint32_t       il,
         uint32_t       start,
-        uint32_t       n_tokens) {
+        uint32_t       n_tokens,
+        uint32_t       batch_row0) {
     const int slot = graph_dspark_target_slot(g, il);
     if (slot < 0) return true;
     if (!g || !g->dspark_target_hidden_batch ||
@@ -22955,8 +22964,10 @@ static bool graph_dspark_capture_verified_suffix_layer(
         !g->dspark_hc_mean_rows ||
         start == 0 ||
         n_tokens == 0 ||
-        n_tokens + 1u < n_tokens ||
-        n_tokens + 1u > g->prefill_cap) {
+        batch_row0 > 1u ||
+        start < batch_row0 ||
+        n_tokens + batch_row0 < n_tokens ||
+        n_tokens + batch_row0 > g->prefill_cap) {
         return false;
     }
 
@@ -22964,7 +22975,7 @@ static bool graph_dspark_capture_verified_suffix_layer(
     ns4_gpu_tensor *batch_dst =
         ns4_gpu_tensor_view(g->dspark_target_hidden_batch,
                             (((uint64_t)(uint32_t)slot * g->prefill_cap +
-                              1u) * NS4_N_EMBD) * sizeof(float),
+                              batch_row0) * NS4_N_EMBD) * sizeof(float),
                             (uint64_t)n_tokens * embd_bytes);
     ns4_gpu_tensor *last_src =
         batch_dst ?
@@ -22993,8 +23004,8 @@ static bool graph_dspark_capture_verified_suffix_layer(
         graph_dspark_capture_note_slot(g, (uint32_t)slot);
         ok = graph_dspark_capture_batch_note_slot(g,
                                                         (uint32_t)slot,
-                                                        start - 1u,
-                                                        n_tokens + 1u);
+                                                        start - batch_row0,
+                                                        n_tokens + batch_row0);
     }
     return ok;
 }
@@ -28237,6 +28248,7 @@ static bool dspark_apply_markov_confidence_lazy_runtime(
         uint32_t               *proposal_len,
         uint32_t               *confidence_len,
         uint32_t               *confidence_prefix_len,
+        uint32_t                extra_slots,
         bool                    reuse_first_confidence,
         float                  *confidence0) {
     if (proposal_len) *proposal_len = 0;
@@ -28276,6 +28288,8 @@ static bool dspark_apply_markov_confidence_lazy_runtime(
     int32_t prev_token = first_prev_token;
     uint32_t produced = 0;
     uint32_t confident = 0;
+    uint32_t extra_used = 0;
+    bool prefix_closed = false;
     for (uint32_t draft = 0; ok && draft < dw->block_size; draft++) {
         if (prev_token < 0 || (uint32_t)prev_token >= NS4_N_VOCAB) {
             ok = false;
@@ -28304,8 +28318,16 @@ static bool dspark_apply_markov_confidence_lazy_runtime(
         if (draft == 0 && confidence0) *confidence0 = confidence_logit;
         if (confidence_len) *confidence_len = draft + 1u;
         if (sigmoid_stable(confidence_logit) < confidence_threshold) {
-            ok = true;
-            break;
+            /* The confident prefix ends here.  Producing past it is only for
+             * the fold, which spends the first slot on a token the target has
+             * already confirmed and would otherwise speculate one position
+             * less far than the unfolded cycle did. */
+            if (confident == 0 || extra_used >= extra_slots) {
+                ok = true;
+                break;
+            }
+            extra_used++;
+            prefix_closed = true;
         }
 
         int32_t token = -1;
@@ -28343,7 +28365,7 @@ static bool dspark_apply_markov_confidence_lazy_runtime(
                 token = (int32_t)gpu_token;
                 proposal[draft] = token;
                 produced = draft + 1u;
-                confident = produced;
+                if (!prefix_closed) confident = produced;
                 prev_token = token;
                 continue;
             }
@@ -28379,7 +28401,7 @@ static bool dspark_apply_markov_confidence_lazy_runtime(
         }
         proposal[draft] = token;
         produced = draft + 1u;
-        confident = produced;
+        if (!prefix_closed) confident = produced;
         prev_token = token;
     }
 
@@ -30009,6 +30031,7 @@ static bool graph_verify_suffix_tops_impl(
         graph_dspark_capture_verified_suffix_begin(g,
                                                          start,
                                                          n_tokens,
+                                                         1u,
                                                          true);
     static int verify_profile_left = -1;
     if (verify_profile_left < 0) {
@@ -30034,7 +30057,8 @@ static bool graph_verify_suffix_tops_impl(
             ok = graph_dspark_capture_verified_suffix_layer(g,
                                                                   il,
                                                                   start,
-                                                                  n_tokens);
+                                                                  n_tokens,
+                                                                  1u);
         }
         if (ok && selected_profile) {
             ok = ns4_gpu_end_commands() != 0 &&
@@ -33148,6 +33172,9 @@ typedef struct {
 typedef struct ns4_dspark_spec_stats {
     uint64_t cycles;
     uint64_t first_tokens;
+    /* Cycles whose confirmed token rode the verify block instead of a decode
+     * of its own.  `target` time is what those cycles no longer spend. */
+    uint64_t folded_cycles;
     uint64_t proposed_tokens;
     uint64_t accepted_draft_tokens;
     uint64_t full_accepts;
@@ -33218,6 +33245,10 @@ struct ns4_session {
 #ifndef NS4_NO_GPU
     int dspark_draft_tokens[NS4_DSPARK_MAX_BLOCK_SIZE];
     uint32_t dspark_draft_len;
+    /* Context position the draft's first slot predicts.  The fold consumes a
+     * draft one cycle after it was proposed, so the block has to check that
+     * the draft still starts where the checkpoint does. */
+    uint32_t dspark_draft_pos;
     uint32_t dspark_sched_cycles;
     uint32_t dspark_sched_accepted;
     uint32_t dspark_sched_no_draft;
@@ -33269,6 +33300,50 @@ static uint32_t ns4_dspark_env_u32(const char *name, uint32_t fallback) {
     unsigned long v = strtoul(env, &end, 10);
     if (end == env || errno != 0 || v > UINT32_MAX) return fallback;
     return (uint32_t)v;
+}
+
+/* Fold the already-confirmed token into the verify block.
+ *
+ * A cycle used to pay a separate full decode for the token the target had
+ * already confirmed, and only then verify the drafts behind it: two passes
+ * over the dense weights for one block of positions.  With the fold on, that
+ * token is row 0 of the same block, so it rides the block's shared dense reads
+ * and costs one row instead of one decode.  The price is that the proposer can
+ * no longer run off a fresh decode of it -- it runs off the block's own last
+ * committed hidden state, one position further back, so every drafted slot
+ * moves one step deeper into the draft block.
+ *
+ * Measured, it does not pay: the decode it removes was producing a token, and
+ * the confirmed token now occupies draft slot 0, so every block speculates one
+ * position less far than it did.  Off by default; NS4_DSPARK_FOLD=1 turns it
+ * on and NS4_DSPARK_FOLD=0 is the decode-then-verify cycle. */
+static bool dspark_fold_enabled(void) {
+    return ns4_dspark_env_u32("NS4_DSPARK_FOLD", 0u) != 0u;
+}
+
+/* Draft slots to keep past the confident prefix when the fold is on.
+ *
+ * Folding spends the drafter's first slot on the confirmed token, so a block
+ * pruned to the confident prefix speculates one position less far than the
+ * unfolded cycle did.  One slot past the prefix restores the reach, but that
+ * slot is the first one the pruner rejected and it is accepted about a third
+ * of the time -- less than the row it costs is worth, so restoring the reach
+ * reads worse than losing it.  NS4_DSPARK_FOLD_EXTRA_SLOTS=0 keeps the pruned
+ * length as it is. */
+static uint32_t dspark_fold_extra_slots(void) {
+    return ns4_dspark_env_u32("NS4_DSPARK_FOLD_EXTRA_SLOTS", 1u);
+}
+
+/* Rows a folded block must be worth running.
+ *
+ * A one-row block speculates nothing: it is the confirmed token by itself, run
+ * through the block path rather than the decode path the graph islands are
+ * captured for.  Whether that is cheaper than the decode is a measurement, not
+ * an argument, so the floor is a knob; raise it to make short drafts take the
+ * ordinary decode instead. */
+static uint32_t dspark_fold_min_rows(void) {
+    const uint32_t v = ns4_dspark_env_u32("NS4_DSPARK_FOLD_MIN_ROWS", 1u);
+    return v ? v : 1u;
 }
 
 static bool ns4_dspark_scheduler_enabled(void) {
@@ -33908,6 +33983,7 @@ static void ns4_session_dspark_capture_invalidate(ns4_session *s) {
     if (!s) return;
     s->dspark_draft_valid = false;
     s->dspark_draft_len = 0;
+    s->dspark_draft_pos = 0;
     if (ns4_session_is_cpu(s)) return;
     graph_dspark_capture_invalidate(&s->graph);
 #else
@@ -38414,7 +38490,7 @@ static void ns4_session_print_dspark_stats(const ns4_session *s) {
     const double extra_ms = st->propose_ms + st->total_ms;
     const double net_saved_ms = st->saved_ms - extra_ms;
     fprintf(stderr,
-            "ns4: DSpark stats cycles=%llu first_tokens=%llu proposed=%llu "
+            "ns4: DSpark stats cycles=%llu folded=%llu first_tokens=%llu proposed=%llu "
             "accepted_draft=%llu accept_rate=%.2f%% avg_accept=%.3f "
             "full=%llu partial=%llu miss_first=%llu no_draft=%llu "
             "no_room=%llu invalid=%llu scheduler_skips=%llu "
@@ -38428,6 +38504,7 @@ static void ns4_session_print_dspark_stats(const ns4_session *s) {
             "target=%.3f saved=%.3f net_saved=%.3f "
             "draft_len_hist=%s accepted_len_hist=%s\n",
             (unsigned long long)st->cycles,
+            (unsigned long long)st->folded_cycles,
             (unsigned long long)st->first_tokens,
             (unsigned long long)st->proposed_tokens,
             (unsigned long long)st->accepted_draft_tokens,
@@ -39821,8 +39898,11 @@ static bool ns4_session_prepare_dspark_draft_impl(ns4_session *s,
             s->dspark_stats.field_ += (now_sec() - (t0_)) * 1000.0;         \
         }                                                                   \
     } while (0)
+    const uint32_t fold_extra =
+        dspark_fold_enabled() ? dspark_fold_extra_slots() : 0u;
     s->dspark_draft_valid = false;
     s->dspark_draft_len = 0;
+    s->dspark_draft_pos = 0;
     s->dspark_last_confidence0 = 0.0f;
     s->dspark_last_confidence0_valid = false;
     if (scheduler_enabled) s->dspark_last_propose_ms = 0.0;
@@ -40067,6 +40147,7 @@ static bool ns4_session_prepare_dspark_draft_impl(ns4_session *s,
                         &markov_proposal_len,
                         &confidence_len,
                         &confidence_prefix_len,
+                        fold_extra,
                         reuse_confidence0_markov,
                         &confidence0);
             NS4_DSPARK_PROP_ADD(propose_markov_ms, markov_t0);
@@ -40165,6 +40246,17 @@ static bool ns4_session_prepare_dspark_draft_impl(ns4_session *s,
             uint32_t proposal_len = markov_proposal_len;
             if (confidence_threshold > 0.0f) {
                 proposal_len = confidence_ok ? confidence_prefix_len : 0;
+                /* Slot 0 lands on the position the target has already
+                 * confirmed, so a folded block reaches one position less far
+                 * than the pruned length suggests.  Hand back the slots the
+                 * lazy pass produced past the prefix for it. */
+                if (proposal_len != 0 && fold_extra != 0 &&
+                    proposal_len < markov_proposal_len) {
+                    proposal_len += fold_extra;
+                    if (proposal_len > markov_proposal_len) {
+                        proposal_len = markov_proposal_len;
+                    }
+                }
             }
             s->dspark_draft_len = proposal_len;
             if (s->dspark_draft_len > NS4_DSPARK_MAX_BLOCK_SIZE) {
@@ -40174,6 +40266,8 @@ static bool ns4_session_prepare_dspark_draft_impl(ns4_session *s,
                 s->dspark_draft_tokens[i] = markov_proposal[i];
             }
             s->dspark_draft_valid = s->dspark_draft_len != 0;
+            /* Slot 0 predicts the position after the one the proposer ran on. */
+            if (s->dspark_draft_valid) s->dspark_draft_pos = pos + 1u;
         }
         if (confidence_ok && confidence_len != 0) {
             s->dspark_last_confidence0 = confidence0;
@@ -40183,6 +40277,7 @@ static bool ns4_session_prepare_dspark_draft_impl(ns4_session *s,
         if (!s->dspark_draft_valid && fake_argmax_enabled) {
             s->dspark_draft_tokens[0] = sample_argmax(s->logits, NS4_N_VOCAB);
             s->dspark_draft_len = 1;
+            s->dspark_draft_pos = pos + 1u;
             s->dspark_draft_valid = true;
             fake_argmax_ok = true;
         }
@@ -40330,6 +40425,19 @@ static bool ns4_session_prepare_dspark_draft(ns4_session *s,
     return ok;
 }
 
+/* Propose the next block off the last committed position.
+ *
+ * The fold consumes a draft one cycle after it is made, so the anchor is the
+ * final committed row -- which the verify block has already left in the target
+ * hidden capture -- rather than a token this cycle decoded on its own. */
+static void ns4_session_dspark_propose_next(ns4_session *s) {
+    if (!s || !s->checkpoint_valid || s->checkpoint.len <= 0) return;
+    const int pos = s->checkpoint.len - 1;
+    (void)ns4_session_prepare_dspark_draft(s,
+                                           s->checkpoint.v[pos],
+                                           (uint32_t)pos);
+}
+
 static void ns4_session_prepare_support_draft(ns4_session *s,
                                               int token,
                                               uint32_t pos,
@@ -40342,7 +40450,12 @@ static void ns4_session_prepare_support_draft(ns4_session *s,
         (void)ns4_session_prepare_legacy_mtp_draft(s, token, pos, mtp_probe_log);
         break;
     case NS4_SUPPORT_DSPARK:
-        (void)ns4_session_prepare_dspark_draft(s, token, pos);
+        /* Folding proposes from the last committed position at the end of the
+         * cycle instead, so that the next block can open on the confirmed
+         * token rather than on a decode of it. */
+        if (!dspark_fold_enabled()) {
+            (void)ns4_session_prepare_dspark_draft(s, token, pos);
+        }
         break;
     case NS4_SUPPORT_NONE:
     default:
@@ -40593,6 +40706,7 @@ static bool graph_verify_decode_rows_exact(
         const token_vec    *prompt,
         uint32_t            start,
         uint32_t            n_tokens,
+        bool                fold_confirmed,
         bool                capture_dspark_hidden,
         int                *row_tops);
 
@@ -40662,6 +40776,7 @@ static bool dspark_commit_verified_block(ns4_session *s,
                                          uint32_t     start,
                                          int          commit,
                                          int          draft_n,
+                                         bool         fold,
                                          float       *row_logits) {
     if (!s || commit <= 0 || commit > draft_n || !row_logits) return false;
     ns4_engine *e = s->engine;
@@ -40681,20 +40796,30 @@ static bool dspark_commit_verified_block(ns4_session *s,
     memcpy(s->logits, row_logits, (size_t)NS4_N_VOCAB * sizeof(s->logits[0]));
     s->checkpoint_valid = true;
 
-    /* The block captured hidden states for [start-1, start+draft_n-1] as batch
-     * rows 0..draft_n; row `commit` is the last committed position. */
+    /* Batch row `lead` is position `start`: the decode-then-verify cycle put
+     * its separately decoded token at start-1 in row 0 and the block's rows
+     * behind it, a folded block starts at `start` itself.  Either way the last
+     * committed position is the row the proposer must read next. */
+    const uint32_t lead = fold ? 0u : 1u;
     const bool batch_rows_ok =
         g->dspark_capture_batch_valid &&
-        g->dspark_capture_batch_start + 1u == start &&
-        g->dspark_capture_batch_tokens == (uint32_t)draft_n + 1u;
+        g->dspark_capture_batch_start + lead == start &&
+        g->dspark_capture_batch_tokens == (uint32_t)draft_n + lead;
     if (batch_rows_ok) {
-        (void)graph_dspark_capture_adopt_batch_row(g, (uint32_t)commit);
-        if (!graph_dspark_ring_extend_from_batch(g,
+        (void)graph_dspark_capture_adopt_batch_row(
+                g, (uint32_t)commit + lead - 1u);
+        /* The support ring stops one row short of the position the next
+         * proposal runs on: that proposal writes its own row for it.  Unfolded,
+         * that position is the next cycle's separate decode, so every committed
+         * row goes in; folded, it is this block's own last committed row. */
+        const uint32_t ring_rows = (uint32_t)commit + lead - 1u;
+        if (ring_rows != 0 &&
+            !graph_dspark_ring_extend_from_batch(g,
                                                        &e->mtp_model,
                                                        &e->dspark_weights,
-                                                       1u,
+                                                       fold ? 0u : 1u,
                                                        start,
-                                                       (uint32_t)commit)) {
+                                                       ring_rows)) {
             /* The ring holds draft-derived rows for these positions; drop the
              * window rather than let the next block attend to them. */
             graph_dspark_cache_reset(g);
@@ -40708,6 +40833,10 @@ static bool dspark_commit_verified_block(ns4_session *s,
     return true;
 }
 
+/* `fold` enters the cycle with no decode behind it: the caller's token is the
+ * one the target already confirmed, and this block carries it as row 0 rather
+ * than paying a decode of its own for it.  `n_accept` is then 0, and the token
+ * reaches `accepted` through the ordinary commit below like any draft. */
 static int ns4_session_eval_dspark_speculative_argmax(
         ns4_session *s,
         int          n_accept,
@@ -40715,6 +40844,7 @@ static int ns4_session_eval_dspark_speculative_argmax(
         int          eos_token,
         int         *accepted,
         int          accepted_cap,
+        bool         fold,
         char        *err,
         size_t       errlen) {
     const bool spec_log = getenv("NS4_DSPARK_SPEC_LOG") != NULL;
@@ -40734,7 +40864,8 @@ static int ns4_session_eval_dspark_speculative_argmax(
      s->dspark_last_propose_ms + (now_sec() - stats_t0) * 1000.0 : 0.0)
     if (stats_enabled) {
         s->dspark_stats.cycles++;
-        if (n_accept > 0) s->dspark_stats.first_tokens++;
+        if (n_accept > 0 || fold) s->dspark_stats.first_tokens++;
+        if (fold) s->dspark_stats.folded_cycles++;
     }
     if (spec_log) {
         fprintf(stderr,
@@ -40800,15 +40931,19 @@ static int ns4_session_eval_dspark_speculative_argmax(
             return n_accept;
         }
     }
+    /* Row 0 of a folded block is the confirmed token, not a proposal: keeping
+     * it out of these counters is what makes the rates comparable between the
+     * two cycle shapes. */
+    const int spec_n = fold ? draft_n - 1 : draft_n;
     if (stats_enabled) {
-        s->dspark_stats.proposed_tokens += (uint64_t)draft_n;
+        s->dspark_stats.proposed_tokens += (uint64_t)spec_n;
         ns4_dspark_stats_note_len(s->dspark_stats.draft_len_hist,
-                                  (uint32_t)draft_n);
+                                  (uint32_t)spec_n);
     }
     s->dspark_draft_valid = false;
     s->dspark_draft_len = 0;
 
-    const int target_top = sample_argmax(s->logits, NS4_N_VOCAB);
+    const int target_top = fold ? drafts[0] : sample_argmax(s->logits, NS4_N_VOCAB);
     if (target_top != drafts[0]) {
         if (stats_enabled) {
             s->dspark_stats.first_misses++;
@@ -40860,6 +40995,7 @@ static int ns4_session_eval_dspark_speculative_argmax(
                                                  &s->checkpoint,
                                                  (uint32_t)start,
                                                  (uint32_t)draft_n,
+                                                 fold,
                                                  true,
                                                  row_tops);
         ok = exact_rows_verify ||
@@ -40915,7 +41051,7 @@ static int ns4_session_eval_dspark_speculative_argmax(
     bool committed_from_verifier = false;
     if (ok && commit_budget > 0 && exact_rows_verify && !dspark_rows_no_commit() &&
         dspark_commit_verified_block(s, (uint32_t)start, commit_budget,
-                                     draft_n, row_logits)) {
+                                     draft_n, fold, row_logits)) {
         committed_from_verifier = true;
         committed_drafts = commit_budget;
         for (int i = 0; i < commit_budget; i++) {
@@ -40999,18 +41135,20 @@ static int ns4_session_eval_dspark_speculative_argmax(
             ns4_session_dspark_capture_note_checkpoint(s);
         }
     }
+    const int spec_committed =
+        committed_drafts > 0 && fold ? committed_drafts - 1 : committed_drafts;
     if (stats_enabled) {
         if (committed_drafts > 0) {
             if (committed_drafts == draft_n) s->dspark_stats.full_accepts++;
             else s->dspark_stats.partial_accepts++;
-            s->dspark_stats.accepted_draft_tokens += (uint64_t)committed_drafts;
+            s->dspark_stats.accepted_draft_tokens += (uint64_t)spec_committed;
         }
         ns4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist,
-                                  (uint32_t)committed_drafts);
+                                  (uint32_t)spec_committed);
     }
     ns4_session_dspark_scheduler_note(
             s,
-            (uint32_t)committed_drafts,
+            (uint32_t)spec_committed,
             false,
             NS4_DSPARK_SCHED_EXTRA_MS());
     if (spec_log) {
@@ -41910,6 +42048,11 @@ static uint32_t graph_dspark_rows_mode(void) {
  * can commit the accepted prefix instead of replaying it, while the weight
  * reads that dominate decode are paid once for the whole block.
  */
+/* `fold_confirmed` says row 0 carries the token the target has already
+ * confirmed rather than a draft, which is what lets the block replace this
+ * cycle's separate decode.  The rows themselves run identically either way;
+ * only the hidden-state capture changes, because a folded block starts at the
+ * confirmed position instead of one past it. */
 static bool graph_verify_decode_rows_exact(
         ns4_gpu_graph      *g,
         const ns4_model    *model,
@@ -41917,6 +42060,7 @@ static bool graph_verify_decode_rows_exact(
         const token_vec    *prompt,
         uint32_t            start,
         uint32_t            n_tokens,
+        bool                fold_confirmed,
         bool                capture_dspark_hidden,
         int                *row_tops) {
     enum { rows_cap = 8 };
@@ -42015,7 +42159,8 @@ static bool graph_verify_decode_rows_exact(
     bool ok = ns4_gpu_begin_commands() != 0;
     const bool dspark_capture_active =
         ok && capture_dspark_hidden &&
-        graph_dspark_capture_verified_suffix_begin(g, start, n_tokens, true);
+        graph_dspark_capture_verified_suffix_begin(
+                g, start, n_tokens, fold_confirmed ? 0u : 1u, true);
     for (uint32_t r = 0; ok && r < n_tokens; r++) {
         ok = graph_borrow_tensor_view(&row_selected[r], selected_base,
                                             (uint64_t)r * top_k_slots *
@@ -42491,8 +42636,8 @@ static bool graph_verify_decode_rows_exact(
             g->batch_next_hc_by_tier[t] = hc_tmp;
         }
         if (ok && dspark_capture_active) {
-            ok = graph_dspark_capture_verified_suffix_layer(g, il, start,
-                                                            n_tokens);
+            ok = graph_dspark_capture_verified_suffix_layer(
+                    g, il, start, n_tokens, fold_confirmed ? 0u : 1u);
         }
     }
 
@@ -44554,6 +44699,50 @@ int ns4_session_eval_speculative_argmax(ns4_session *s, int first_token,
             }
         }
     }
+    /* Fold: the target already confirmed `first_token`, and the draft standing
+     * from the end of the last cycle starts exactly there.  Then this token
+     * needs no decode of its own -- it is row 0 of the verify block, sharing
+     * that block's dense weight reads with the drafts behind it. */
+    const bool fold_ready =
+        e->support_kind == NS4_SUPPORT_DSPARK &&
+        can_prepare_support_draft &&
+        dspark_fold_enabled() &&
+        s->checkpoint_valid &&
+        s->dspark_draft_valid &&
+        s->dspark_draft_len >= dspark_fold_min_rows() &&
+        s->dspark_draft_pos == (uint32_t)s->checkpoint.len &&
+        s->dspark_draft_tokens[0] == first_token &&
+        ns4_session_dspark_capture_current(s);
+    if (fold_ready) {
+        const int folded =
+            ns4_session_eval_dspark_speculative_argmax(s,
+                                                       0,
+                                                       max_tokens,
+                                                       eos_token,
+                                                       accepted,
+                                                       accepted_cap,
+                                                       true,
+                                                       err,
+                                                       errlen);
+        if (folded < 0) return -1;
+        if (folded > 0) {
+            if (accepted[folded - 1] != eos_token) {
+                ns4_session_dspark_propose_next(s);
+            }
+            return folded;
+        }
+        /* The block declined the shape or its own state; the token still has
+         * to be produced, so fall through to the ordinary decode. */
+    }
+    if (e->support_kind == NS4_SUPPORT_DSPARK && dspark_fold_enabled()) {
+        /* With the fold on, a draft is only ever consumed by the block that
+         * opens on it.  One left standing here is aimed at a position this
+         * cycle is about to pass, so it is spent, not pending. */
+        s->dspark_draft_valid = false;
+        s->dspark_draft_len = 0;
+        s->dspark_draft_pos = 0;
+    }
+
     if (ns4_session_eval_internal(s,
                                   first_token,
                                   can_prepare_support_draft,
@@ -44566,14 +44755,21 @@ int ns4_session_eval_speculative_argmax(ns4_session *s, int first_token,
     if (dspark_tail_skip) return n_accept;
 
     if (e->support_kind == NS4_SUPPORT_DSPARK) {
-        return ns4_session_eval_dspark_speculative_argmax(s,
-                                                          n_accept,
-                                                          max_tokens,
-                                                          eos_token,
-                                                          accepted,
-                                                          accepted_cap,
-                                                          err,
-                                                          errlen);
+        const int rc =
+            ns4_session_eval_dspark_speculative_argmax(s,
+                                                       n_accept,
+                                                       max_tokens,
+                                                       eos_token,
+                                                       accepted,
+                                                       accepted_cap,
+                                                       false,
+                                                       err,
+                                                       errlen);
+        if (rc > 0 && dspark_fold_enabled() &&
+            accepted[rc - 1] != eos_token) {
+            ns4_session_dspark_propose_next(s);
+        }
+        return rc;
     }
 
     if (graph_cuda_splitkv_spec_requested() &&
