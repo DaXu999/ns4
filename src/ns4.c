@@ -3208,13 +3208,6 @@ static void ns4_vec_dot_q6_K_q8_K(int n, float *s, const block_q6_K *x, const bl
     *s = sumf;
 }
 
-static inline float ns4_e8m0_to_f32(uint8_t e) {
-    const uint32_t bits = e == 0 ? 0x00400000u : (uint32_t)e << 23;
-    float value;
-    memcpy(&value, &bits, sizeof(value));
-    return value;
-}
-
 static float ns4_vec_dot_q5_K_f32(int n, const block_q5_K *x, const float *y) {
     const int nb = n / QK_K;
     float sumf = 0.0f;

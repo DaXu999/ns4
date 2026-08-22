@@ -1,5 +1,6 @@
 /* Unit tests for the GGUF MXFP4 block layout and scalar reference dot. */
 
+#include <float.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -97,17 +98,25 @@ static int test_random_reference(void) {
         }
 
         const float got = vec_dot_mxfp4_f32(N, blocks, y);
-        float expected = 0.0f;
+        /* Exact reference: every product is exact in double, and the double sum is
+         * ~1e-14 relative.  The float dot's rounding error scales with the magnitude of
+         * the terms (the result cancels to <1% of it here), and its summation order is
+         * the compiler's (-ffast-math vectorises the reduction), so the tolerance is a
+         * few float ulps of sum|terms|, not of the result. */
+        double expected = 0.0;
+        double sum_abs = 0.0;
         for (int ib = 0; ib < N_BLOCK; ib++) {
             for (int j = 0; j < QK_MXFP4 / 2; j++) {
                 const uint8_t q = blocks[ib].qs[j];
-                expected += reference_value(blocks[ib].e, q & 0x0f) * y[ib * QK_MXFP4 + j];
-                expected += reference_value(blocks[ib].e, q >> 4) * y[ib * QK_MXFP4 + j + QK_MXFP4 / 2];
+                const double lo = (double)reference_value(blocks[ib].e, q & 0x0f) * y[ib * QK_MXFP4 + j];
+                const double hi = (double)reference_value(blocks[ib].e, q >> 4) * y[ib * QK_MXFP4 + j + QK_MXFP4 / 2];
+                expected += lo + hi;
+                sum_abs += fabs(lo) + fabs(hi);
             }
         }
-        const float tolerance = 2.0e-6f * fmaxf(1.0f, fabsf(expected));
-        if (fabsf(got - expected) > tolerance) {
-            printf("    trial %d: got %.9g expected %.9g\n", trial, got, expected);
+        const double tolerance = 8.0 * FLT_EPSILON * sum_abs;
+        if (fabs((double)got - expected) > tolerance) {
+            printf("    trial %d: got %.9g expected %.10g (tolerance %.3g)\n", trial, got, expected, tolerance);
             ok = 0;
             break;
         }
