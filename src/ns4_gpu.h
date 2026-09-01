@@ -1316,6 +1316,37 @@ int ns4_gpu_routed_moe_one_tensor(
         uint32_t                layer_index,
         bool                    force_resident);
 
+/* DSpark verify rows batched through the decode-exact aligned path: per-row
+ * results are bit-identical to n_tokens calls of the one-token decode form. */
+int ns4_gpu_routed_moe_rows_exact_tensor(
+        ns4_gpu_tensor       *out,
+        ns4_gpu_tensor       *gate,
+        ns4_gpu_tensor       *up,
+        ns4_gpu_tensor       *mid,
+        ns4_gpu_tensor       *experts,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ns4_gpu_tensor *selected,
+        const ns4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ns4_gpu_tensor *x,
+        uint32_t                layer_index,
+        uint32_t                n_tokens);
+
 int ns4_gpu_routed_moe_batch_tensor(
         ns4_gpu_tensor       *out,
         ns4_gpu_tensor       *gate,

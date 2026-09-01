@@ -24121,6 +24121,11 @@ __global__ static void moe_down_sum6_aligned_qwarp32_kernel(
         uint32_t out_dim) {
     uint32_t lane = threadIdx.x & 7u;
     uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    /* blockIdx.y = token row, as in the w32 form above. */
+    const uint32_t tok = blockIdx.y;
+    selected += (uint64_t)tok * 6u;
+    midq += (uint64_t)tok * 6u * midq_blocks;
+    out += (uint64_t)tok * out_dim;
     if (row >= out_dim) return;
     const uint32_t parity = row & 1u;
     const uint64_t row_pair = (uint64_t)(row >> 1);
@@ -24169,6 +24174,13 @@ __global__ static void moe_down_sum6_aligned_w32_kernel(
     const uint32_t lane32 = threadIdx.x & 31u;
     const uint32_t g = lane32 >> 2u;
     const uint32_t sub = lane32 & 3u;
+    /* blockIdx.y is the token row: the DSpark verify batches its rows into
+     * one launch (bit-exact -- each row's slot chain is untouched, the rows
+     * just share the launch and whatever expert bytes L2 can catch). */
+    const uint32_t tok = blockIdx.y;
+    selected += (uint64_t)tok * 6u;
+    midq += (uint64_t)tok * 6u * midq_blocks;
+    out += (uint64_t)tok * out_dim;
     /* One row per warp, so the guard below never splits a warp and the full
      * mask on every shuffle stays correct. */
     const uint32_t row = blockIdx.x * (256u / 32u) + (threadIdx.x >> 5u);
@@ -26291,7 +26303,8 @@ static int routed_moe_launch(
         uint32_t layer_index,
         uint32_t n_tokens,
         int allow_streaming,
-        int owned_filtered) {
+        int owned_filtered,
+        int exact_rows) {
     if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
         expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0 ||
@@ -26338,12 +26351,16 @@ static int routed_moe_launch(
             expert_mid_dim, out_dim, n_total_expert,
             down_aligned_bytes);
         if (gate_aligned && up_aligned && down_aligned) {
+            /* exact_rows is the DSpark verify: it interleaves with the rest
+             * of the decode stream, and the legacy default stream would
+             * serialize against it every layer. */
             const cudaStream_t aligned_stream =
-                n_tokens == 1u ? cuda_decode_stream() : (cudaStream_t)0;
+                (n_tokens == 1u || exact_rows) ? cuda_decode_stream()
+                                               : (cudaStream_t)0;
             int rc;
             /* Set when the down leg already folded the slot sum into out. */
             int down_summed = 0;
-            if (n_tokens == 1u) {
+            if (n_tokens == 1u || (exact_rows && n_tokens <= 8u)) {
                 /* perf-06: the q8_K decode kernel against the aligned
                  * artifacts.  It keeps the raw path's activation quantisation
                  * and accumulation order, so decode stays bit-identical to the
@@ -26455,8 +26472,8 @@ static int routed_moe_launch(
                         if (rc == 0 && use_down_w32) {
                             /* perf-09: a full warp per row, 8 rows per block --
                              * 4x the lanes of the qwarp32 form and 4x the grid,
-                             * same results. */
-                            dim3 sgrid((out_dim + 7u) / 8u, 1, 1);
+                             * same results.  grid.y carries the verify rows. */
+                            dim3 sgrid((out_dim + 7u) / 8u, n_tokens, 1);
                             moe_down_sum6_aligned_w32_kernel<<<
                                     sgrid, 256, 0, aligned_stream>>>(
                                 (float *)out->ptr,
@@ -26471,7 +26488,7 @@ static int routed_moe_launch(
                                          "aligned q8_K down+sum w32 launch") ? 0 : -1;
                             if (rc == 0) down_summed = 1;
                         } else if (rc == 0) {
-                            dim3 sgrid((out_dim + 31u) / 32u, 1, 1);
+                            dim3 sgrid((out_dim + 31u) / 32u, n_tokens, 1);
                             moe_down_sum6_aligned_qwarp32_kernel<<<
                                     sgrid, 256, 0, aligned_stream>>>(
                                 (float *)out->ptr,
@@ -28256,7 +28273,7 @@ extern "C" int ns4_gpu_routed_moe_one_tensor(ns4_gpu_tensor *out, ns4_gpu_tensor
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, n_total_expert, n_expert, clamp, x,
-                             layer_index, 1, force_resident ? 0 : 1, 0);
+                             layer_index, 1, force_resident ? 0 : 1, 0, 0);
 }
 extern "C" int ns4_gpu_routed_moe_batch_tensor(ns4_gpu_tensor *out, ns4_gpu_tensor *gate, ns4_gpu_tensor *up, ns4_gpu_tensor *mid, ns4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ns4_gpu_tensor *selected, const ns4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ns4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16, bool force_resident) {
     (void)force_resident;
@@ -28268,7 +28285,25 @@ extern "C" int ns4_gpu_routed_moe_batch_tensor(ns4_gpu_tensor *out, ns4_gpu_tens
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, n_total_expert, n_expert, clamp, x,
-                             layer_index, n_tokens, 1, 0);
+                             layer_index, n_tokens, 1, 0, 0);
+}
+
+/* DSpark verify: the block's rows batched through the decode-exact aligned
+ * q8_K path.  Each row's math is exactly the per-row decode chain (that is
+ * what the verifier commits), the rows just share one set of launches -- and
+ * adjacent rows share ~40% of their routed experts, which the batched grid
+ * lets L2 dedupe instead of re-reading per row.  Only this entry sets
+ * exact_rows: small prefill tails must keep taking the MMQ path, whose
+ * numerics differ. */
+extern "C" int ns4_gpu_routed_moe_rows_exact_tensor(ns4_gpu_tensor *out, ns4_gpu_tensor *gate, ns4_gpu_tensor *up, ns4_gpu_tensor *mid, ns4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ns4_gpu_tensor *selected, const ns4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ns4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens) {
+    return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
+                             gate_offset, up_offset, down_offset,
+                             gate_type, down_type,
+                             gate_expert_bytes, gate_row_bytes,
+                             down_expert_bytes, down_row_bytes,
+                             expert_in_dim, expert_mid_dim, out_dim,
+                             selected, weights, n_total_expert, n_expert, clamp, x,
+                             layer_index, n_tokens, 1, 0, 1);
 }
 
 extern "C" int ns4_gpu_routed_moe_batch_owned_tensor(
@@ -28347,7 +28382,7 @@ extern "C" int ns4_gpu_routed_moe_batch_owned_tensor(
             down_expert_bytes, down_row_bytes,
             expert_in_dim, expert_mid_dim, out_dim,
             selected, weights, resident_expert_count, n_expert,
-            clamp, x, layer_index, n_tokens, 0, 1);
+            clamp, x, layer_index, n_tokens, 0, 1, 0);
 }
 extern "C" int ns4_gpu_hc_split_sinkhorn_tensor(ns4_gpu_tensor *out, const ns4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
     if (!out || !mix || !model_map || n_hc != 4) return 0;

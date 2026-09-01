@@ -18479,6 +18479,10 @@ typedef enum {
     METAL_DECODE_LAYER_TO_ROUTER,
     METAL_DECODE_LAYER_TO_SHARED_MID,
     METAL_DECODE_LAYER_FROM_ROUTER,
+    /* DSpark verify epilogue: ffn_norm, shared_mid AND the routed MoE all
+     * arrive batched from the caller -- run only the combine + hc epilogue.
+     * Distinct from FROM_ROUTER, which recomputes the shared expert. */
+    METAL_DECODE_LAYER_FROM_ROUTER_SHARED_MID,
 } decode_layer_phase;
 
 static bool graph_encode_decode_layer_phase(
@@ -18610,8 +18614,10 @@ static bool graph_encode_decode_layer_phase(
         }
     }
     const bool resume_from_ffn_norm =
-        phase == METAL_DECODE_LAYER_FROM_FFN_NORM_SHARED_MID;
-    if (phase != METAL_DECODE_LAYER_FROM_ROUTER) {
+        phase == METAL_DECODE_LAYER_FROM_FFN_NORM_SHARED_MID ||
+        phase == METAL_DECODE_LAYER_FROM_ROUTER_SHARED_MID;
+    if (phase != METAL_DECODE_LAYER_FROM_ROUTER &&
+        phase != METAL_DECODE_LAYER_FROM_ROUTER_SHARED_MID) {
     const bool fuse_hc_norm =
         NS4_N_HC == 4 &&
         !graph_use_reference_hc_decode() &&
@@ -19871,7 +19877,9 @@ static bool graph_encode_decode_layer_phase(
     }
     if (phase == METAL_DECODE_LAYER_TO_ROUTER) return ok;
     }
-    const bool external_routed = phase == METAL_DECODE_LAYER_FROM_ROUTER;
+    const bool external_routed =
+        phase == METAL_DECODE_LAYER_FROM_ROUTER ||
+        phase == METAL_DECODE_LAYER_FROM_ROUTER_SHARED_MID;
     const bool fuse_shared_gate_up =
         !g->quality &&
         layer->ffn_gate_shexp->type == NS4_TENSOR_Q8_0 &&
@@ -20400,7 +20408,7 @@ static bool graph_encode_decode_layer_phase(
                                                shared_dim, NS4_SWIGLU_CLAMP_EXP, 1.0f) != 0;
         }
         NS4_CUDA_PROFILE_DECODE_STAGE("shared_gate_up");
-        if (ok) ok = ns4_gpu_routed_moe_one_tensor(graph_routed_out(g),
+        if (ok && !external_routed) ok = ns4_gpu_routed_moe_one_tensor(graph_routed_out(g),
                                                      graph_routed_gate(g),
                                                      graph_routed_up(g),
                                                      graph_routed_mid(g),
@@ -20608,7 +20616,7 @@ static bool graph_encode_decode_layer_phase(
                             NS4_N_EXPERT_USED) != 0;
             }
         }
-        if (ok) ok = ns4_gpu_routed_moe_one_tensor(graph_routed_out(g),
+        if (ok && !external_routed) ok = ns4_gpu_routed_moe_one_tensor(graph_routed_out(g),
                                                      graph_routed_gate(g),
                                                      graph_routed_up(g),
                                                      graph_routed_mid(g),
@@ -20694,7 +20702,7 @@ static bool graph_encode_decode_layer_phase(
         }
         return ok;
     }
-    if (ok && !cuda_tp_moe) ok = ns4_gpu_routed_moe_one_tensor(graph_routed_out(g),
+    if (ok && !cuda_tp_moe && !external_routed) ok = ns4_gpu_routed_moe_one_tensor(graph_routed_out(g),
                                                  graph_routed_gate(g),
                                                  graph_routed_up(g),
                                                  graph_routed_mid(g),
@@ -42622,7 +42630,202 @@ static bool graph_verify_decode_rows_exact(
                                                NS4_SWIGLU_CLAMP_EXP,
                                                1.0f) != 0;
                 }
-                for (uint32_t r = 0; ok && r < n_tokens; r++) {
+                /* Routed MoE, batched across the block's rows: run each
+                 * row's router with its selection bound to a batch slice,
+                 * one decode-exact grouped expert dispatch over all rows,
+                 * then the per-row combine epilogue.  Each row's math is the
+                 * per-row decode chain unchanged; the rows share launches
+                 * and L2 can dedupe the ~40% of experts adjacent rows have
+                 * in common.  Falls back to the fully per-row phase when the
+                 * exact batched dispatch is unavailable. */
+                int rows_moe_batched = 0;
+                if (ok && n_tokens > 1u &&
+                    getenv("NS4_DSPARK_NO_MOE_BATCH") == NULL &&
+                    !g->ssd_streaming &&
+                    layer->ffn_gate_tid2eid == NULL &&
+                    !graph_decode_cpu_router_applicable(g, layer) &&
+                    graph_batch_router_selected(g) &&
+                    graph_batch_router_weights(g) &&
+                    graph_batch_router_logits(g) &&
+                    graph_batch_routed_out(g) && graph_batch_routed_gate(g) &&
+                    graph_batch_routed_up(g) && graph_batch_routed_mid(g) &&
+                    graph_batch_routed_down(g)) {
+                    ns4_gpu_tensor *const saved_router_sel =
+                        g->router_selected_by_tier[t];
+                    ns4_gpu_tensor *const saved_router_wts =
+                        g->router_weights_by_tier[t];
+                    ns4_gpu_tensor *const saved_routed_out =
+                        g->routed_out_by_tier[t];
+                    const uint64_t sel_row_bytes =
+                        (uint64_t)NS4_N_EXPERT_USED * sizeof(int32_t);
+                    const uint64_t wts_row_bytes =
+                        (uint64_t)NS4_N_EXPERT_USED * sizeof(float);
+                    /* Per-row router, the phase's two kernels called directly
+                     * (identical args, so identical selection) with the
+                     * outputs landing in the batch layout -- none of the
+                     * per-row phase-entry overhead. */
+                    bool bok = true;
+                    for (uint32_t r = 0; bok && r < n_tokens; r++) {
+                        ns4_gpu_tensor ffn_norm_row, sel_row, wts_row;
+                        ns4_gpu_tensor logits_row;
+                        bok = graph_borrow_tensor_view(&ffn_norm_row,
+                                      graph_batch_ffn_norm(g),
+                                      (uint64_t)r * NS4_N_EMBD * sizeof(float),
+                                      (uint64_t)NS4_N_EMBD * sizeof(float)) &&
+                              graph_borrow_tensor_view(&sel_row,
+                                      graph_batch_router_selected(g),
+                                      (uint64_t)r * sel_row_bytes,
+                                      sel_row_bytes) &&
+                              graph_borrow_tensor_view(&wts_row,
+                                      graph_batch_router_weights(g),
+                                      (uint64_t)r * wts_row_bytes,
+                                      wts_row_bytes) &&
+                              graph_borrow_tensor_view(&logits_row,
+                                      graph_batch_router_logits(g),
+                                      (uint64_t)r * NS4_N_EXPERT * sizeof(float),
+                                      (uint64_t)NS4_N_EXPERT * sizeof(float));
+                        if (!bok) break;
+                        bok = graph_matmul_plain_tensor(&logits_row, model,
+                                      layer->ffn_gate_inp,
+                                      NS4_N_EMBD, NS4_N_EXPERT,
+                                      &ffn_norm_row, 1) &&
+                              ns4_gpu_router_select_tensor(&sel_row, &wts_row,
+                                      graph_router_probs(g),
+                                      model->map, model->size,
+                                      layer->ffn_exp_probs_b ?
+                                          layer->ffn_exp_probs_b->abs_offset : 0,
+                                      0,
+                                      0,
+                                      (uint32_t)prompt->v[start + r],
+                                      NS4_N_EXPERT,
+                                      NS4_N_EXPERT_USED,
+                                      NS4_EXPERT_WEIGHT_SCALE,
+                                      0,
+                                      0,
+                                      layer->ffn_exp_probs_b != NULL,
+                                      false,
+                                      &logits_row) != 0;
+                    }
+                    ok = ok && bok;
+                    if (ok) {
+                        ns4_gpu_tensor sel_view, wts_view, rout_view;
+                        const uint64_t expert_in_dim =
+                            layer->ffn_gate_exps->dim[0];
+                        const uint64_t down_in_dim =
+                            layer->ffn_down_exps->dim[0];
+                        const uint64_t routed_out_dim =
+                            layer->ffn_down_exps->dim[1];
+                        const uint64_t gate_row_bytes =
+                            routed_expert_row_bytes(layer->ffn_gate_exps);
+                        const uint64_t down_row_bytes =
+                            routed_expert_row_bytes(layer->ffn_down_exps);
+                        rows_moe_batched =
+                            graph_borrow_tensor_view(&sel_view,
+                                    graph_batch_router_selected(g), 0,
+                                    (uint64_t)n_tokens * sel_row_bytes) &&
+                            graph_borrow_tensor_view(&wts_view,
+                                    graph_batch_router_weights(g), 0,
+                                    (uint64_t)n_tokens * wts_row_bytes) &&
+                            graph_borrow_tensor_view(&rout_view,
+                                    graph_batch_routed_out(g), 0,
+                                    (uint64_t)n_tokens * NS4_N_EMBD *
+                                        sizeof(float)) &&
+                            ns4_gpu_routed_moe_rows_exact_tensor(
+                                    &rout_view,
+                                    graph_batch_routed_gate(g),
+                                    graph_batch_routed_up(g),
+                                    graph_batch_routed_mid(g),
+                                    graph_batch_routed_down(g),
+                                    model->map, model->size,
+                                    layer->ffn_gate_exps->abs_offset,
+                                    layer->ffn_up_exps->abs_offset,
+                                    layer->ffn_down_exps->abs_offset,
+                                    layer->ffn_gate_exps->type,
+                                    layer->ffn_down_exps->type,
+                                    (uint64_t)down_in_dim * gate_row_bytes,
+                                    gate_row_bytes,
+                                    (uint64_t)routed_out_dim * down_row_bytes,
+                                    down_row_bytes,
+                                    (uint32_t)expert_in_dim,
+                                    (uint32_t)down_in_dim,
+                                    (uint32_t)routed_out_dim,
+                                    &sel_view, &wts_view,
+                                    NS4_N_EXPERT, NS4_N_EXPERT_USED,
+                                    NS4_SWIGLU_CLAMP_EXP,
+                                    &ffn_norm_view, il, n_tokens) != 0;
+                        {
+                            static int logged = 0;
+                            if (!logged) {
+                                logged = 1;
+                                fprintf(stderr,
+                                        "ns4: verify rows MoE batched=%d\n",
+                                        rows_moe_batched);
+                            }
+                        }
+                    }
+                    for (uint32_t r = 0;
+                         ok && rows_moe_batched && r < n_tokens; r++) {
+                        graph_attn_pre_alias alias;
+                        ns4_gpu_tensor ffn_cur_row, ffn_norm_row, mid_row;
+                        ns4_gpu_tensor sel_row, wts_row, rout_row;
+                        ok = graph_borrow_tensor_view(&ffn_cur_row,
+                                      graph_batch_ffn_cur(g),
+                                      (uint64_t)r * NS4_N_EMBD * sizeof(float),
+                                      (uint64_t)NS4_N_EMBD * sizeof(float)) &&
+                             graph_borrow_tensor_view(&ffn_norm_row,
+                                      graph_batch_ffn_norm(g),
+                                      (uint64_t)r * NS4_N_EMBD * sizeof(float),
+                                      (uint64_t)NS4_N_EMBD * sizeof(float)) &&
+                             graph_borrow_tensor_view(&mid_row, &mid_rows,
+                                      (uint64_t)r * shared_dim * sizeof(float),
+                                      (uint64_t)shared_dim * sizeof(float)) &&
+                             graph_borrow_tensor_view(&sel_row,
+                                      graph_batch_router_selected(g),
+                                      (uint64_t)r * sel_row_bytes,
+                                      sel_row_bytes) &&
+                             graph_borrow_tensor_view(&wts_row,
+                                      graph_batch_router_weights(g),
+                                      (uint64_t)r * wts_row_bytes,
+                                      wts_row_bytes) &&
+                             graph_borrow_tensor_view(&rout_row,
+                                      graph_batch_routed_out(g),
+                                      (uint64_t)r * NS4_N_EMBD * sizeof(float),
+                                      (uint64_t)NS4_N_EMBD * sizeof(float));
+                        if (!ok) break;
+                        g->cur_hc_by_tier[t] = &row_cur[r];
+                        g->after_ffn_hc_by_tier[t] = &row_next[r];
+                        g->comp_selected_by_tier[t] = &row_selected[r];
+                        g->ffn_cur_by_tier[t] = &ffn_cur_row;
+                        g->ffn_norm_by_tier[t] = &ffn_norm_row;
+                        g->shared_mid_by_tier[t] = &mid_row;
+                        g->router_selected_by_tier[t] = &sel_row;
+                        g->router_weights_by_tier[t] = &wts_row;
+                        g->routed_out_by_tier[t] = &rout_row;
+                        ok = graph_bind_attn_pre_batch_row(g, g, layer, r,
+                                                           true, &alias);
+                        if (ok) {
+                            ok = graph_encode_decode_layer_phase(
+                                    g, model, layer, il, positions[r],
+                                    g->layer_raw_cache[il], g->raw_cap,
+                                    raw_rows[r],
+                                    graph_raw_span_for_batch(g, positions[r], 1),
+                                    prompt->v[start + r],
+                                    METAL_DECODE_LAYER_FROM_ROUTER_SHARED_MID);
+                            graph_unbind_attn_pre_batch_row(g, &alias);
+                        }
+                        g->routed_out_by_tier[t] = saved_routed_out;
+                        g->router_weights_by_tier[t] = saved_router_wts;
+                        g->router_selected_by_tier[t] = saved_router_sel;
+                        g->shared_mid_by_tier[t] = saved_shared_mid;
+                        g->ffn_norm_by_tier[t] = saved_ffn_norm;
+                        g->ffn_cur_by_tier[t] = saved_ffn_cur;
+                        g->comp_selected_by_tier[t] = saved_selected;
+                        g->cur_hc_by_tier[t] = saved_cur_hc;
+                        g->after_ffn_hc_by_tier[t] = saved_after_ffn_hc;
+                    }
+                }
+                for (uint32_t r = 0;
+                     ok && !rows_moe_batched && r < n_tokens; r++) {
                     graph_attn_pre_alias alias;
                     ns4_gpu_tensor ffn_cur_row, ffn_norm_row, mid_row;
                     ok = graph_borrow_tensor_view(&ffn_cur_row, graph_batch_ffn_cur(g),
