@@ -6968,11 +6968,48 @@ __global__ static void grouped_q8_0_a_preq_warp8_rows_kernel(
     const uint64_t row_in_group = row - group * rank;
     const unsigned char *wr = w + (group * rank + row_in_group) * blocks * 34;
 
+    /* Same per-warp cooperative weight staging as
+     * matmul_q8_0_preq_warp8_rows_kernel: turn the 34-byte-strided per-lane
+     * block reads into coalesced uint4 span loads without changing which lane
+     * accumulates which block.  (A register double-buffered variant measured
+     * WORSE here, 59.4% -> 42.5% DRAM: the buffer registers push NR=8 from
+     * 74 to 86 regs and blocks-per-SM from 3 to 2.) */
+    const uint32_t warp = threadIdx.x >> 5u;
+    __shared__ __align__(16) int8_t swq[8][2u * 1088u];
+
     float acc[NR];
 #pragma unroll
     for (uint32_t r = 0; r < NR; r++) acc[r] = 0.0f;
 
-    for (uint64_t b = lane; b < blocks; b += 32u) {
+    uint64_t btail = 0;
+    if (use_dp4a && (group_dim & 31u) == 0u && (((uintptr_t)wr) & 15u) == 0u) {
+        int8_t *wst = swq[warp];
+        const uint32_t nspan = (uint32_t)(blocks >> 5u);
+        for (uint32_t c = 0u; c < nspan; c += 2u) {
+            const uint32_t nd = nspan - c < 2u ? nspan - c : 2u;
+            const uint4 *src = (const uint4 *)(wr + (uint64_t)c * 1088u);
+            __syncwarp();
+            for (uint32_t i = lane; i < nd * 68u; i += 32u) {
+                ((uint4 *)wst)[i] = src[i];
+            }
+            __syncwarp();
+            for (uint32_t d = 0u; d < nd; d++) {
+                const uint64_t b = ((uint64_t)(c + d)) * 32u + lane;
+                const int8_t *blk = wst + d * 1088u + lane * 34u;
+                const float ws = __half2float(*(const __half *)blk);
+                const int8_t *qs = blk + 2;
+#pragma unroll
+                for (uint32_t r = 0; r < NR; r++) {
+                    const uint64_t xrow = (uint64_t)r * n_groups + group;
+                    const int dot = dot_i8x32_dp4a_a2b16(
+                            qs, xq + xrow * blocks * 32 + b * 32);
+                    acc[r] += ws * xscale[xrow * blocks + b] * (float)dot;
+                }
+            }
+        }
+        btail = (uint64_t)nspan * 32u;
+    }
+    for (uint64_t b = btail + lane; b < blocks; b += 32u) {
         const uint64_t i0 = b * 32;
         const uint64_t bn = group_dim - i0 < 32 ? group_dim - i0 : 32;
         const __half *scale_h = (const __half *)(wr + b * 34);
