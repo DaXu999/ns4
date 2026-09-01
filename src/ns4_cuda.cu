@@ -21592,11 +21592,19 @@ __device__ static void dev_dot_q2_K_q8_K_block_aligned_quarter(
         int *summs_out,
         float *dall_out,
         float *dmin_out) {
+    /* The scale words for one parity sit in two adjacent-word pairs and the
+     * qs words at stride 2 inside a 16-word half-block; read them as two
+     * uint2 and four uint4 loads instead of 4+8 stride-2 word loads.  The
+     * extracted words are identical, so the integer chain below is exact;
+     * only the transaction shape changes (the kernel measured l1tex-led at
+     * 42% DRAM with the strided form). */
     union { uint32_t w[4]; uint8_t b[16]; } sc;
-    #pragma unroll
-    for (uint32_t p = 0; p < 4u; p++) {
-        sc.w[p] = sc4[pblk * 8ull + (uint64_t)(p >> 1) * 4ull +
-                      (uint64_t)parity * 2ull + (uint64_t)(p & 1u)];
+    {
+        const uint2 s01 = *(const uint2 *)&sc4[pblk * 8ull +
+                                              (uint64_t)parity * 2ull];
+        const uint2 s23 = *(const uint2 *)&sc4[pblk * 8ull + 4ull +
+                                              (uint64_t)parity * 2ull];
+        sc.w[0] = s01.x; sc.w[1] = s01.y; sc.w[2] = s23.x; sc.w[3] = s23.y;
     }
     const uint32_t dmw = dm2[pblk * 2ull + parity];
     *dall_out = y->d * dev_f16_to_f32((uint16_t)(dmw & 0xffffu));
@@ -21610,10 +21618,15 @@ __device__ static void dev_dot_q2_K_q8_K_block_aligned_quarter(
     }
 
     uint32_t w[8];
-    #pragma unroll
-    for (uint32_t t = 0; t < 8u; t++) {
-        w[t] = qs2[pblk * 32ull + (uint64_t)((sub >> 1) * 8u + t) * 2ull +
-                   (uint64_t)parity];
+    {
+        const uint4 *q4 = (const uint4 *)&qs2[pblk * 32ull +
+                                              (uint64_t)(sub >> 1) * 16ull];
+        #pragma unroll
+        for (uint32_t j = 0; j < 4u; j++) {
+            const uint4 v = q4[j];
+            w[j * 2u] = parity ? v.y : v.x;
+            w[j * 2u + 1u] = parity ? v.w : v.z;
+        }
     }
     int isum = 0;
     #pragma unroll
