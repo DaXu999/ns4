@@ -27074,6 +27074,17 @@ static bool graph_dspark_stage_profile_boundary(
     return ns4_gpu_begin_commands() != 0;
 }
 
+/* Visible ring rows for a draft block; 0 disables the cap. */
+static uint32_t dspark_support_window_rows(void) {
+    static uint32_t cached = UINT32_MAX;
+    if (cached == UINT32_MAX) {
+        const char *env = getenv("NS4_DSPARK_SUPPORT_WINDOW");
+        cached = env && env[0] ? (uint32_t)strtoul(env, NULL, 10) : 128u;
+        if (cached == UINT32_MAX) cached = 128u;
+    }
+    return cached;
+}
+
 static bool graph_eval_dspark_stage_block(
         ns4_gpu_graph            *g,
         const ns4_model          *dspark_model,
@@ -27447,8 +27458,23 @@ static bool graph_eval_dspark_stage_chain(
     }
 
     const uint32_t rows = dw->block_size + 1u;
-    const uint32_t support_len = g->dspark_cache_len;
-    const uint32_t raw_start = support_len ? g->dspark_cache_start : 0;
+    uint32_t support_len = g->dspark_cache_len;
+    uint32_t raw_start = support_len ? g->dspark_cache_start : 0;
+    /* The draft attends over a bounded recency window, not the whole ring.
+     * Acceptance decays monotonically past ~128 visible rows (78% at 128,
+     * 67% at 256, 52% at 512, 3% at ~2900, measured at ctx 8192) and holds
+     * 86%+ deep into a generation with the cap in place, so the support
+     * model evidently learned a short window -- the same 128 the target's
+     * DSA indexer uses.  Older rows stay in the ring untouched; only the
+     * attention span is clamped.  NS4_DSPARK_SUPPORT_WINDOW overrides
+     * (0 = uncapped) for A/B. */
+    const uint32_t window = dspark_support_window_rows();
+    if (window != 0 && support_len > window) {
+        const uint32_t drop = support_len - window;
+        raw_start = (uint32_t)(((uint64_t)raw_start + drop) %
+                               g->dspark_cache_cap);
+        support_len = window;
+    }
     if (support_len > g->dspark_cache_cap ||
         rows > g->dspark_cache_cap - support_len ||
         (support_len != 0 && raw_start >= g->dspark_cache_cap) ||
@@ -39977,14 +40003,14 @@ static bool ns4_session_prepare_dspark_draft_impl(ns4_session *s,
         const bool captured_batch_end_ok =
             s->graph.dspark_capture_batch_tokens != 0 &&
             captured_batch_end <= UINT32_MAX;
-        /* Seeding the ring from the prefill captures poisons the proposer:
-         * with the prefill-derived window in place draft acceptance collapses
-         * (3% vs 76% at ctx 8192, measured), and the verified-block commit
-         * faithfully extends the poisoned window forever.  The replay path
-         * masked this because its commits dropped the window as a side
-         * effect.  Until the prefill capture is proven row-equal to the
-         * decode capture, start the ring cold and let decode-captured rows
-         * build it; NS4_DSPARK_PREFILL_SEED=1 restores the seeding for A/B. */
+        /* The ring starts cold on purpose.  Prefill-captured hiddens are
+         * row-aligned with the decode captures but not numerically equal --
+         * past position 4096 prefill attends densely while decode goes
+         * through the top-k indexer -- and rows built from them measurably
+         * cost acceptance (71.4% vs 75.7% at ctx 131072, deterministic).
+         * With the draft window at 128 rows a cold ring warms in ~128
+         * tokens, so seeding buys nothing it can keep.
+         * NS4_DSPARK_PREFILL_SEED=1 restores the seeding for A/B. */
         const bool prefill_seed_enabled =
             getenv("NS4_DSPARK_PREFILL_SEED") != NULL;
         const bool initial_cache_ready =
