@@ -5240,6 +5240,35 @@ __device__ __forceinline__ static int32_t dot_i8_block(const int8_t *a, const in
     return dot;
 }
 
+/* Load-width variant of dot_i8x32_dp4a for the rows kernels, which ncu shows
+ * L1-transaction-bound (31.5 of a worst-case 32 sectors per request): the
+ * activation side is read as two 16-byte vectors instead of eight words, and
+ * the q8_0 qs bytes as sixteen u16 loads (a q8_0 block is 34 bytes, so qs at
+ * +2 is always 2-aligned and never wider).  The assembled 4-byte ints and
+ * the dp4a chain order are exactly dot_i8x32_dp4a's, so the result is
+ * bit-identical; only the transaction shape changes.  `a` must be 2-aligned,
+ * `b` 16-aligned. */
+__device__ __forceinline__ static int32_t dot_i8x32_dp4a_a2b16(const int8_t *a, const int8_t *b) {
+    const uint16_t *ah = (const uint16_t *)a;
+    const int4 b0 = *(const int4 *)b;
+    const int4 b1 = *(const int4 *)(b + 16);
+    int32_t dot = 0;
+    dot = __dp4a((int32_t)((uint32_t)ah[0] | ((uint32_t)ah[1] << 16)), b0.x, dot);
+    dot = __dp4a((int32_t)((uint32_t)ah[2] | ((uint32_t)ah[3] << 16)), b0.y, dot);
+    dot = __dp4a((int32_t)((uint32_t)ah[4] | ((uint32_t)ah[5] << 16)), b0.z, dot);
+    dot = __dp4a((int32_t)((uint32_t)ah[6] | ((uint32_t)ah[7] << 16)), b0.w, dot);
+    dot = __dp4a((int32_t)((uint32_t)ah[8] | ((uint32_t)ah[9] << 16)), b1.x, dot);
+    dot = __dp4a((int32_t)((uint32_t)ah[10] | ((uint32_t)ah[11] << 16)), b1.y, dot);
+    dot = __dp4a((int32_t)((uint32_t)ah[12] | ((uint32_t)ah[13] << 16)), b1.z, dot);
+    dot = __dp4a((int32_t)((uint32_t)ah[14] | ((uint32_t)ah[15] << 16)), b1.w, dot);
+    return dot;
+}
+
+__device__ __forceinline__ static int32_t dot_i8_block_a2b16(const int8_t *a, const int8_t *b, uint64_t n, int use_dp4a) {
+    if (use_dp4a && n == 32u) return dot_i8x32_dp4a_a2b16(a, b);
+    return dot_i8_block(a, b, n, use_dp4a);
+}
+
 __global__ static NS4_CUDA_UNUSED void matmul_q8_0_kernel(
         float *out,
         const unsigned char *w,
@@ -5482,7 +5511,7 @@ __global__ static void matmul_q8_0_preq_warp8_kernel(
  * lane-strided order and the same expression as the per-row kernel, so results
  * are bit-identical to single-token decode -- which is the whole point, since
  * the caller commits this state instead of replaying it. */
-template<uint32_t MAXR>
+template<uint32_t NR>
 __global__ static void matmul_q8_0_preq_warp8_rows_kernel(
         float *out,
         const unsigned char *w,
@@ -5491,20 +5520,21 @@ __global__ static void matmul_q8_0_preq_warp8_rows_kernel(
         uint64_t in_dim,
         uint64_t out_dim,
         uint64_t blocks,
-        uint32_t n_rows,
         int use_dp4a) {
-    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint64_t row =
+        (uint64_t)blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u);
     const uint32_t lane = threadIdx.x & 31u;
-    __shared__ int8_t sxq[16384];
+    __shared__ __align__(16) int8_t sxq[16384];
     __shared__ float sxs[512];
-    const uint64_t row_elems = (uint64_t)n_rows * blocks;
+    const uint64_t row_elems = (uint64_t)NR * blocks;
     const int stage = row_elems * 32u <= sizeof(sxq) && row_elems <= 512u;
     if (stage) {
         const uint64_t nbytes = row_elems * 32u;
-        for (uint64_t i = threadIdx.x * 16u; i < nbytes; i += 256u * 16u) {
+        for (uint64_t i = threadIdx.x * 16u; i < nbytes;
+             i += (uint64_t)blockDim.x * 16u) {
             *(uint4 *)(sxq + i) = *(const uint4 *)(xq + i);
         }
-        for (uint64_t i = threadIdx.x; i < row_elems; i += 256u) {
+        for (uint64_t i = threadIdx.x; i < row_elems; i += blockDim.x) {
             sxs[i] = xscale[i];
         }
         __syncthreads();
@@ -5513,9 +5543,9 @@ __global__ static void matmul_q8_0_preq_warp8_rows_kernel(
     const unsigned char *wr = w + row * blocks * 34;
     const int8_t *xqb0 = stage ? sxq : xq;
     const float *xsb0 = stage ? sxs : xscale;
-    float acc[MAXR];
+    float acc[NR];
 #pragma unroll
-    for (uint32_t r = 0; r < MAXR; r++) acc[r] = 0.0f;
+    for (uint32_t r = 0; r < NR; r++) acc[r] = 0.0f;
     for (uint64_t b = lane; b < blocks; b += 32u) {
         const uint64_t i0 = b * 32;
         const uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
@@ -5523,16 +5553,15 @@ __global__ static void matmul_q8_0_preq_warp8_rows_kernel(
         const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
         const float ws = __half2float(*scale_h);
 #pragma unroll
-        for (uint32_t r = 0; r < MAXR; r++) {
-            if (r >= n_rows) break;
+        for (uint32_t r = 0; r < NR; r++) {
             const uint64_t off = (uint64_t)r * blocks + b;
-            const int dot = dot_i8_block(qs, xqb0 + off * 32, bn, use_dp4a);
+            const int dot =
+                dot_i8_block_a2b16(qs, xqb0 + off * 32, bn, use_dp4a);
             acc[r] += ws * xsb0[off] * (float)dot;
         }
     }
 #pragma unroll
-    for (uint32_t r = 0; r < MAXR; r++) {
-        if (r >= n_rows) break;
+    for (uint32_t r = 0; r < NR; r++) {
         const float sum = warp_sum_f32(acc[r]);
         if (lane == 0) out[(uint64_t)r * out_dim + row] = sum;
     }
@@ -5765,6 +5794,19 @@ __global__ static void matmul_q8_0_pair_preq_wide_kernel(
         if (row < out0_dim) out0[tok * out0_dim + row] = total0;
         if (row < out1_dim) out1[tok * out1_dim + row] = total1;
     }
+}
+
+/* Rows-verify kernel block shape: 8 rows per block measured best (80.6 t/s
+ * vs 79.6 at 4, DSpark 8k) -- unlike the pair kernel these grids are large
+ * enough already, and smaller blocks just cost occupancy.
+ * NS4_CUDA_Q8_ROWS_RPB pins it for A/B. */
+static uint32_t cuda_q8_rows_rpb(void) {
+    const char *e = getenv("NS4_CUDA_Q8_ROWS_RPB");
+    if (e) {
+        const uint32_t v = (uint32_t)atoi(e);
+        if (v == 1u || v == 2u || v == 4u || v == 8u) return v;
+    }
+    return 8u;
 }
 
 /* Pick RPB so the grid clears this card's DRAM saturation point (~188 blocks,
@@ -6857,7 +6899,7 @@ __global__ static void dequant_q8_0_to_f32_kernel(
  * weight rows are read once instead of once per row.  Each (row, output)
  * accumulation keeps the per-lane block stride and the warp reduction of the
  * one-row kernel, so the result is bit-identical to running it n_rows times. */
-template<uint32_t MAXR>
+template<uint32_t NR>
 __global__ static void grouped_q8_0_a_preq_warp8_rows_kernel(
         float *low,
         const unsigned char *w,
@@ -6866,10 +6908,10 @@ __global__ static void grouped_q8_0_a_preq_warp8_rows_kernel(
         uint64_t group_dim,
         uint64_t rank,
         uint32_t n_groups,
-        uint32_t n_rows,
         uint64_t blocks,
         int use_dp4a) {
-    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint64_t row =
+        (uint64_t)blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u);
     const uint32_t lane = threadIdx.x & 31u;
     const uint64_t low_dim = (uint64_t)n_groups * rank;
     if (row >= low_dim) return;
@@ -6878,9 +6920,9 @@ __global__ static void grouped_q8_0_a_preq_warp8_rows_kernel(
     const uint64_t row_in_group = row - group * rank;
     const unsigned char *wr = w + (group * rank + row_in_group) * blocks * 34;
 
-    float acc[MAXR];
+    float acc[NR];
 #pragma unroll
-    for (uint32_t r = 0; r < MAXR; r++) acc[r] = 0.0f;
+    for (uint32_t r = 0; r < NR; r++) acc[r] = 0.0f;
 
     for (uint64_t b = lane; b < blocks; b += 32u) {
         const uint64_t i0 = b * 32;
@@ -6889,17 +6931,15 @@ __global__ static void grouped_q8_0_a_preq_warp8_rows_kernel(
         const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
         const float ws = __half2float(*scale_h);
 #pragma unroll
-        for (uint32_t r = 0; r < MAXR; r++) {
-            if (r >= n_rows) break;
+        for (uint32_t r = 0; r < NR; r++) {
             const uint64_t xrow = (uint64_t)r * n_groups + group;
-            const int dot = dot_i8_block(qs, xq + xrow * blocks * 32 + b * 32,
-                                         bn, use_dp4a);
+            const int dot = dot_i8_block_a2b16(
+                    qs, xq + xrow * blocks * 32 + b * 32, bn, use_dp4a);
             acc[r] += ws * xscale[xrow * blocks + b] * (float)dot;
         }
     }
 #pragma unroll
-    for (uint32_t r = 0; r < MAXR; r++) {
-        if (r >= n_rows) break;
+    for (uint32_t r = 0; r < NR; r++) {
         const float sum = warp_sum_f32(acc[r]);
         if (lane == 0) low[(uint64_t)r * low_dim + row] = sum;
     }
@@ -17283,12 +17323,24 @@ extern "C" int ns4_gpu_matmul_q8_0_decode_rows_exact_tensor(
      * amortised by having enough blocks in flight. */
     if (n_rows > 1u && n_rows <= 8u &&
         getenv("NS4_CUDA_NO_Q8_ROWS_SHARED") == NULL) {
-        matmul_q8_0_preq_warp8_rows_kernel<8>
-            <<<((unsigned)out_dim + 7u) / 8u, 256, 0, cuda_decode_stream()>>>(
-                (float *)out->ptr,
-                reinterpret_cast<const unsigned char *>(wptr),
-                xq, xscale, in_dim, out_dim, blocks, n_rows,
-                cuda_q8_use_dp4a());
+        const uint32_t rpb = cuda_q8_rows_rpb();
+        const dim3 grid_r(((unsigned)out_dim + rpb - 1u) / rpb, 1u, 1u);
+#define NS4_Q8_ROWS_LAUNCH(NR) \
+        matmul_q8_0_preq_warp8_rows_kernel<NR> \
+            <<<grid_r, rpb * 32u, 0, cuda_decode_stream()>>>( \
+                (float *)out->ptr, \
+                reinterpret_cast<const unsigned char *>(wptr), \
+                xq, xscale, in_dim, out_dim, blocks, cuda_q8_use_dp4a())
+        switch (n_rows) {
+        case 2u: NS4_Q8_ROWS_LAUNCH(2u); break;
+        case 3u: NS4_Q8_ROWS_LAUNCH(3u); break;
+        case 4u: NS4_Q8_ROWS_LAUNCH(4u); break;
+        case 5u: NS4_Q8_ROWS_LAUNCH(5u); break;
+        case 6u: NS4_Q8_ROWS_LAUNCH(6u); break;
+        case 7u: NS4_Q8_ROWS_LAUNCH(7u); break;
+        default: NS4_Q8_ROWS_LAUNCH(8u); break;
+        }
+#undef NS4_Q8_ROWS_LAUNCH
         return cuda_ok(cudaGetLastError(),
                        "q8_0 decode rows shared warp launch");
     }
@@ -20494,11 +20546,23 @@ extern "C" int ns4_gpu_attention_output_low_q8_rows_exact_tensor(
                  "attention_output_low_q8 rows prequant launch")) return 0;
     if (n_rows > 1u && n_rows <= 8u &&
         getenv("NS4_CUDA_NO_ATTN_OUT_A_ROWS_SHARED") == NULL) {
-        dim3 grid_s(((unsigned)low_dim + 7u) / 8u, 1u, 1u);
-        grouped_q8_0_a_preq_warp8_rows_kernel<8>
-                <<<grid_s, 256, 0, cuda_decode_stream()>>>(
-                (float *)low->ptr, out_a, xq, xscale, group_dim, rank,
-                group_cnt, n_rows, blocks_a, use_dp4a);
+        const uint32_t rpb = cuda_q8_rows_rpb();
+        dim3 grid_s(((unsigned)low_dim + rpb - 1u) / rpb, 1u, 1u);
+#define NS4_ATTN_A_ROWS_LAUNCH(NR) \
+        grouped_q8_0_a_preq_warp8_rows_kernel<NR> \
+                <<<grid_s, rpb * 32u, 0, cuda_decode_stream()>>>( \
+                (float *)low->ptr, out_a, xq, xscale, group_dim, rank, \
+                group_cnt, blocks_a, use_dp4a)
+        switch (n_rows) {
+        case 2u: NS4_ATTN_A_ROWS_LAUNCH(2u); break;
+        case 3u: NS4_ATTN_A_ROWS_LAUNCH(3u); break;
+        case 4u: NS4_ATTN_A_ROWS_LAUNCH(4u); break;
+        case 5u: NS4_ATTN_A_ROWS_LAUNCH(5u); break;
+        case 6u: NS4_ATTN_A_ROWS_LAUNCH(6u); break;
+        case 7u: NS4_ATTN_A_ROWS_LAUNCH(7u); break;
+        default: NS4_ATTN_A_ROWS_LAUNCH(8u); break;
+        }
+#undef NS4_ATTN_A_ROWS_LAUNCH
         return cuda_ok(cudaGetLastError(),
                        "attention_output_low_q8 rows shared launch");
     }
