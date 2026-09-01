@@ -5810,6 +5810,14 @@ __global__ static void matmul_q8_0_pair_preq_wide_kernel(
     const unsigned char *wr1 = row < out1_dim ? w1 + row * blocks * 34 : NULL;
     const int8_t *xqr = xq + tok * blocks * 32u;
     const float *xsr = xscale + tok * blocks;
+    /* dot_i8_block_a2b16 instead of dot_i8_block: the u16 weight and int4
+     * activation loads quarter this kernel's L1 transactions (61.8 -> 65.4%
+     * DRAM in-app).  Two staged variants measured WORSE and are dead ends:
+     * per-warp cooperative spans (53.4% -- only the K-active warps carry the
+     * burst and there is no loop to hide the sync round-trip) and block-wide
+     * one-sync staging of both rows (54.9% -- the barrier serializes the
+     * whole block behind the slowest load).  The direct-load form keeps every
+     * thread's bytes in flight from the first instruction. */
     for (uint64_t b = threadIdx.x; b < blocks; b += NT) {
         uint64_t i0 = b * 32;
         uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
@@ -5818,13 +5826,13 @@ __global__ static void matmul_q8_0_pair_preq_wide_kernel(
         if (wr0) {
             const __half *scale_h = (const __half *)(wr0 + b * 34);
             const int8_t *qs = (const int8_t *)(wr0 + b * 34 + 2);
-            int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
+            int dot = dot_i8_block_a2b16(qs, xqb, bn, use_dp4a);
             acc0 += __half2float(*scale_h) * xs * (float)dot;
         }
         if (wr1) {
             const __half *scale_h = (const __half *)(wr1 + b * 34);
             const int8_t *qs = (const int8_t *)(wr1 + b * 34 + 2);
-            int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
+            int dot = dot_i8_block_a2b16(qs, xqb, bn, use_dp4a);
             acc1 += __half2float(*scale_h) * xs * (float)dot;
         }
     }
