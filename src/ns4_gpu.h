@@ -55,6 +55,14 @@ int ns4_gpu_tensor_read(const ns4_gpu_tensor *tensor, uint64_t offset, void *dat
 int ns4_gpu_tensor_copy(ns4_gpu_tensor *dst, uint64_t dst_offset,
                           const ns4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
+/* Up to four same-tier device copies in one launch on the decode stream,
+ * asynchronous to the host (unlike ns4_gpu_tensor_copy's blocking
+ * cudaMemcpy). Unused pairs pass NULL/NULL. */
+int ns4_gpu_tensor_copy4_async_tensor(
+        ns4_gpu_tensor *dst0, uint64_t doff0, const ns4_gpu_tensor *src0, uint64_t soff0, uint64_t b0,
+        ns4_gpu_tensor *dst1, uint64_t doff1, const ns4_gpu_tensor *src1, uint64_t soff1, uint64_t b1,
+        ns4_gpu_tensor *dst2, uint64_t doff2, const ns4_gpu_tensor *src2, uint64_t soff2, uint64_t b2,
+        ns4_gpu_tensor *dst3, uint64_t doff3, const ns4_gpu_tensor *src3, uint64_t soff3, uint64_t b3);
 int ns4_gpu_tensor_copy_f32_to_f16(ns4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ns4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count);
@@ -474,6 +482,33 @@ int ns4_gpu_matmul_f16_pair_tensor(
         const ns4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* Rows-exact f16 GEMVs for the DSpark verify block: succeed only when the
+ * one-row entry would take the wide ordered kernel under the current env,
+ * reproducing its per-row arithmetic bit-exactly with one weight read per
+ * block; return 0 otherwise so the caller keeps its per-row loop. */
+int ns4_gpu_matmul_f16_pair_wide_rows_exact_tensor(
+        ns4_gpu_tensor       *out_a,
+        ns4_gpu_tensor       *out_b,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_a_offset,
+        uint64_t                weight_b_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        uint64_t                out_stride,
+        const ns4_gpu_tensor *x,
+        uint32_t                n_rows);
+
+int ns4_gpu_matmul_f16_one_wide_rows_exact_tensor(
+        ns4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ns4_gpu_tensor *x,
+        uint32_t                n_rows);
+
 /* Optional decode fusion. Returns 1 when the paired projection and
  * recurrent compressor-state store were encoded, 0 when the optimized path
  * is unavailable, and -1 on an attempted-path error. */
@@ -793,7 +828,9 @@ int ns4_gpu_compressor_update_tensor(
         float                   beta_fast,
         float                   beta_slow,
         float                   rms_eps,
-        bool                    state_already_stored);
+        bool                    state_already_stored,
+        int                     fp8_emit,
+        int                    *fp8_done);
 
 int ns4_gpu_compressor_store_batch_tensor(
         const ns4_gpu_tensor *kv,
@@ -1531,6 +1568,23 @@ int ns4_gpu_shared_down_hc_expand_q8_0_tensor(
         const ns4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc);
+
+int ns4_gpu_shared_down_hc_expand_rows_exact_tensor(
+        ns4_gpu_tensor       *out_hc,
+        ns4_gpu_tensor       *block_out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ns4_gpu_tensor *shared_mid,
+        const ns4_gpu_tensor *routed_out,
+        const ns4_gpu_tensor *residual_hc,
+        const ns4_gpu_tensor *split,
+        uint32_t                split_stride,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        uint32_t                n_rows);
 
 int ns4_gpu_shared_down_hc_expand_add_q8_0_tensor(
         ns4_gpu_tensor       *out_hc,

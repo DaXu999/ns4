@@ -13048,6 +13048,14 @@ typedef struct {
      * are transient views, so the decode-island cache -- which keys on tensor
      * addresses and replays captured device pointers -- must not record them. */
     bool spec_rows_active;
+    /* Set by the rows verifier when this row's attn compressor projections
+     * (graph_comp_kv_cur / graph_comp_sc_cur) arrive precomputed from a
+     * rows-batched GEMV; the decode phase skips its own pair projection. */
+    bool spec_comp_proj_external;
+    /* Same contract for the indexer query/weights: graph_indexer_q and
+     * graph_indexer_weights arrive precomputed (rows-batched q_b GEMV,
+     * rope, qat, proj) and the phase runs only the scan and top-k. */
+    bool spec_indexer_q_external;
     uint32_t raw_cap;
     /* Maximum compressed-row capacity across layers.  Shared work buffers use
      * this worst-case size because ratio-4 indexer layers can still reach it. */
@@ -17058,6 +17066,56 @@ static bool graph_capture_prefix_index_state(
                                  g->layer_index_state_score[il], 0, bytes) != 0;
 }
 
+/* Both prefix captures for one (layer, slot) in a single async launch on
+ * the decode stream.  The blocking-cudaMemcpy pair above costs a host
+ * round trip per copy, which dominates when the rows verifier snapshots
+ * every layer for every row; the fused form moves the same bytes with the
+ * same values.  Falls back to the memcpy pair if the fused copy refuses. */
+static bool graph_capture_prefix_states_fused(
+        ns4_gpu_graph *g,
+        uint32_t       il,
+        uint32_t       slot) {
+    if (!g->spec_capture_prefixes) return true;
+    if (slot >= NS4_SPEC_PREFIX_SLOTS) return false;
+    const bool want_attn = ns4_layer_compress_ratio(il) != 0;
+    const bool want_index = ns4_layer_compress_ratio(il) == 4;
+    if (!want_attn && !want_index) return true;
+    if (want_attn &&
+        (!g->spec_prefix1_attn_state_kv[il] ||
+         !g->spec_prefix1_attn_state_score[il])) {
+        return false;
+    }
+    if (want_index &&
+        (!g->spec_prefix1_index_state_kv[il] ||
+         !g->spec_prefix1_index_state_score[il])) {
+        return false;
+    }
+    const uint64_t abytes =
+        want_attn ? ns4_gpu_tensor_bytes(g->layer_attn_state_kv[il]) : 0;
+    const uint64_t aoff = (uint64_t)slot * abytes;
+    const uint64_t ibytes =
+        want_index ? ns4_gpu_tensor_bytes(g->layer_index_state_kv[il]) : 0;
+    const uint64_t ioff = (uint64_t)slot * ibytes;
+    if (ns4_gpu_tensor_copy4_async_tensor(
+                want_attn ? g->spec_prefix1_attn_state_kv[il] : NULL, aoff,
+                want_attn ? g->layer_attn_state_kv[il] : NULL, 0, abytes,
+                want_attn ? g->spec_prefix1_attn_state_score[il] : NULL, aoff,
+                want_attn ? g->layer_attn_state_score[il] : NULL, 0, abytes,
+                want_index ? g->spec_prefix1_index_state_kv[il] : NULL, ioff,
+                want_index ? g->layer_index_state_kv[il] : NULL, 0, ibytes,
+                want_index ? g->spec_prefix1_index_state_score[il] : NULL, ioff,
+                want_index ? g->layer_index_state_score[il] : NULL, 0,
+                ibytes)) {
+        if (want_attn) g->spec_prefix_n_comp[slot][il] = g->layer_n_comp[il];
+        if (want_index) {
+            g->spec_prefix_n_index_comp[slot][il] = g->layer_n_index_comp[il];
+        }
+        return true;
+    }
+    return graph_capture_prefix_attn_state(g, il, slot) &&
+           graph_capture_prefix_index_state(g, il, slot);
+}
+
 static uint32_t graph_decode_indexer_sparse_threshold(const ns4_gpu_graph *g) {
     (void)g;
     static int parsed = -1;
@@ -18938,7 +18996,10 @@ static bool graph_encode_decode_layer_phase(
             ok = false;
         }
         bool comp_state_already_stored = false;
-        if (ok && !graph_use_reference_compressor_pair_proj()) {
+        if (ok && g->spec_comp_proj_external) {
+            /* graph_comp_kv_cur()/graph_comp_sc_cur() arrived precomputed
+             * for this row from the rows-batched pair GEMV. */
+        } else if (ok && !graph_use_reference_compressor_pair_proj()) {
             const int fused_store =
                 ns4_gpu_matmul_f16_pair_compressor_store_tensor(
                         graph_comp_kv_cur(g),
@@ -18984,6 +19045,7 @@ static bool graph_encode_decode_layer_phase(
         }
         NS4_CUDA_PROFILE_DECODE_STAGE("compressor_proj");
         const uint32_t comp_row = g->layer_n_comp[il];
+        int comp_fp8_done = 0;
         if (ok) ok = ns4_gpu_compressor_update_tensor(graph_comp_kv_cur(g),
                                                         graph_comp_sc_cur(g),
                                                         g->layer_attn_state_kv[il],
@@ -19008,14 +19070,17 @@ static bool graph_encode_decode_layer_phase(
                                                         NS4_ROPE_YARN_BETA_FAST,
                                                         NS4_ROPE_YARN_BETA_SLOW,
                                                         NS4_RMS_EPS,
-                                                        comp_state_already_stored) != 0;
+                                                        comp_state_already_stored,
+                                                        1, &comp_fp8_done) != 0;
         NS4_CUDA_PROFILE_DECODE_STAGE("compressor_update");
         if (ok && emit) {
             ns4_gpu_tensor *comp_row_view = graph_attn_comp_row_view(g, il, comp_row);
             if (!comp_row_view) {
                 ok = false;
             } else {
-                ok = ns4_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view, 1, NS4_N_HEAD_DIM, NS4_N_ROT) != 0;
+                if (!comp_fp8_done) {
+                    ok = ns4_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view, 1, NS4_N_HEAD_DIM, NS4_N_ROT) != 0;
+                }
                 if (ok) {
                     graph_debug_dump_tensor("KVcompress", comp_row_view, NS4_N_HEAD_DIM, il, pos);
                 }
@@ -19115,7 +19180,8 @@ static bool graph_encode_decode_layer_phase(
                                                             NS4_ROPE_YARN_BETA_FAST,
                                                             NS4_ROPE_YARN_BETA_SLOW,
                                                             NS4_RMS_EPS,
-                                                            index_state_already_stored) != 0;
+                                                            index_state_already_stored,
+                                                            0, NULL) != 0;
             NS4_CUDA_PROFILE_DECODE_STAGE("indexer_compressor_update");
             if (ok && emit) {
                 ok = ns4_gpu_dsv4_indexer_qat_mirror_tensor(
@@ -19133,6 +19199,11 @@ static bool graph_encode_decode_layer_phase(
                 g->layer_n_comp[il] > decode_sparse_threshold &&
                 g->layer_n_index_comp[il] > NS4_N_INDEXER_TOP_K) {
                 const uint64_t indexer_q_dim = (uint64_t)NS4_N_INDEXER_HEAD * NS4_N_INDEXER_HEAD_DIM;
+                if (g->spec_indexer_q_external) {
+                    /* graph_indexer_q()/graph_indexer_weights() arrived
+                     * precomputed for this row from the rows-batched q_b
+                     * GEMV, rope, qat and proj. */
+                } else {
                 if (!layer->indexer_attn_q_b ||
                     !tensor_type_is_f16_or_q8_0(layer->indexer_attn_q_b->type) ||
                     layer->indexer_attn_q_b->dim[0] != q_rank ||
@@ -19174,6 +19245,7 @@ static bool graph_encode_decode_layer_phase(
                                                          layer->indexer_proj->abs_offset,
                                                          NS4_N_EMBD, NS4_N_INDEXER_HEAD,
                                                          graph_attn_norm(g), 1) != 0;
+                }
                 const float index_scale = 1.0f / sqrtf((float)(NS4_N_INDEXER_HEAD_DIM * NS4_N_INDEXER_HEAD));
                 if (ok && decode_index_stage_profile) {
                     ok = graph_indexer_stage_profile_boundary(NULL,
@@ -24280,7 +24352,8 @@ static bool graph_encode_layer_attention_batch(
                                                             NS4_ROPE_YARN_BETA_FAST,
                                                             NS4_ROPE_YARN_BETA_SLOW,
                                                             NS4_RMS_EPS,
-                                                            false) != 0;
+                                                            false,
+                                                                0, NULL) != 0;
                     if (ok && emit) {
                         ns4_gpu_tensor *comp_row_view = graph_attn_comp_row_view(g, il, comp_row);
                         ok = comp_row_view &&
@@ -24579,7 +24652,8 @@ static bool graph_encode_layer_attention_batch(
                                                                 NS4_ROPE_YARN_BETA_FAST,
                                                                 NS4_ROPE_YARN_BETA_SLOW,
                                                                 NS4_RMS_EPS,
-                                                                false) != 0;
+                                                                false,
+                                                                0, NULL) != 0;
                         if (ok && emit) {
                             ok = ns4_gpu_dsv4_indexer_qat_mirror_tensor(
                                     graph_index_stage(g),
@@ -42281,8 +42355,7 @@ static bool graph_verify_decode_rows_exact(
                         graph_raw_span_for_batch(g, positions[r], 1),
                         prompt->v[start + r]);
                 if (ok && r + 1u < n_tokens && r < NS4_SPEC_PREFIX_SLOTS) {
-                    ok = graph_capture_prefix_attn_state(g, il, r) &&
-                         graph_capture_prefix_index_state(g, il, r);
+                    ok = graph_capture_prefix_states_fused(g, il, r);
                 }
                 g->cur_hc_by_tier[t] = saved_cur_hc;
                 g->after_ffn_hc_by_tier[t] = saved_after_ffn_hc;
@@ -42297,16 +42370,24 @@ static bool graph_verify_decode_rows_exact(
                                                     n_tokens,
                                                     NS4_RMS_EPS) != 0;
         }
-        for (uint32_t r = 0; ok && r < n_tokens; r++) {
-            ns4_gpu_tensor mix_row, flat_row;
-            ok = graph_borrow_tensor_view(&mix_row, batch_mix,
-                                                (uint64_t)r * mix_hc * sizeof(float),
-                                                mix_hc * sizeof(float)) &&
-                 graph_borrow_tensor_view(&flat_row, batch_flat,
-                                                (uint64_t)r * hc_dim * sizeof(float),
-                                                hc_dim * sizeof(float)) &&
-                 graph_matmul_plain_tensor(&mix_row, model, layer->hc_attn_fn,
-                                                 hc_dim, mix_hc, &flat_row, 1);
+        {
+            const int hc_fn_rows =
+                ok && layer->hc_attn_fn->type == NS4_TENSOR_F16 &&
+                ns4_gpu_matmul_f16_one_wide_rows_exact_tensor(&mix_view,
+                        model->map, model->size,
+                        layer->hc_attn_fn->abs_offset,
+                        hc_dim, mix_hc, batch_flat, n_tokens);
+            for (uint32_t r = 0; ok && !hc_fn_rows && r < n_tokens; r++) {
+                ns4_gpu_tensor mix_row, flat_row;
+                ok = graph_borrow_tensor_view(&mix_row, batch_mix,
+                                                    (uint64_t)r * mix_hc * sizeof(float),
+                                                    mix_hc * sizeof(float)) &&
+                     graph_borrow_tensor_view(&flat_row, batch_flat,
+                                                    (uint64_t)r * hc_dim * sizeof(float),
+                                                    hc_dim * sizeof(float)) &&
+                     graph_matmul_plain_tensor(&mix_row, model, layer->hc_attn_fn,
+                                                     hc_dim, mix_hc, &flat_row, 1);
+            }
         }
         if (ok) {
             ok = ns4_gpu_hc_split_weighted_sum_norm_tensor(
@@ -42342,8 +42423,7 @@ static bool graph_verify_decode_rows_exact(
                     graph_unbind_attn_pre_batch_row(g, &alias);
                 }
                 if (ok && r + 1u < n_tokens && r < NS4_SPEC_PREFIX_SLOTS) {
-                    ok = graph_capture_prefix_attn_state(g, il, r) &&
-                         graph_capture_prefix_index_state(g, il, r);
+                    ok = graph_capture_prefix_states_fused(g, il, r);
                 }
                 g->cur_hc_by_tier[t] = saved_cur_hc;
                 g->after_ffn_hc_by_tier[t] = saved_after_ffn_hc;
@@ -42400,11 +42480,93 @@ static bool graph_verify_decode_rows_exact(
                     NS4_N_HEAD_DIM, NS4_N_ROT) != 0;
         }
 
-        /* Compressor frontiers, the indexer and the routed experts are all
-         * per row: the first two are recurrent, and the experts a row selects
-         * are its own, so this half cannot share a weight read anyway.
-         * Attention reads the caches rather than weights, so running it per
-         * row costs nothing beyond a launch and keeps decode's kernel. */
+        /* Compressor frontier updates, the indexer scan and the routed
+         * experts stay per row (the frontier is recurrent, a row's experts
+         * are its own).  The attn compressor PROJECTIONS are plain
+         * shared-weight GEMVs of each row's attn norm, so they batch across
+         * the block: one pair-rows launch here, and the per-row phase skips
+         * its own pair via spec_comp_proj_external with comp_kv/sc_cur
+         * bound to this block's rows. */
+        int comp_proj_rows = 0;
+        if (ok && layer->attn_compressor_kv && layer->attn_compressor_gate &&
+            layer->attn_compressor_kv->type == NS4_TENSOR_F16 &&
+            layer->attn_compressor_gate->type == NS4_TENSOR_F16 &&
+            layer->attn_compressor_kv->dim[0] == NS4_N_EMBD &&
+            layer->attn_compressor_kv->dim[1] ==
+                (uint64_t)(ratio == 4u ? 2u : 1u) * NS4_N_HEAD_DIM &&
+            !graph_use_reference_compressor_pair_proj()) {
+            /* The attn-pre row alias binds comp_kv_cur/comp_sc_cur to
+             * batch_comp_kv/batch_comp_sc rows at stride 2*head_dim
+             * regardless of the layer's compressor width, so the rows GEMV
+             * writes at that stride to put each row's projections exactly
+             * where the phase will read them. */
+            const uint64_t comp_row_stride = 2ull * NS4_N_HEAD_DIM;
+            const uint64_t comp_proj_width =
+                layer->attn_compressor_kv->dim[1];
+            ns4_gpu_tensor ckv_rows, csc_rows;
+            comp_proj_rows =
+                graph_borrow_tensor_view(&ckv_rows, graph_batch_comp_kv(g), 0,
+                        (uint64_t)n_tokens * comp_row_stride *
+                            sizeof(float)) &&
+                graph_borrow_tensor_view(&csc_rows, graph_batch_comp_sc(g), 0,
+                        (uint64_t)n_tokens * comp_row_stride *
+                            sizeof(float)) &&
+                ns4_gpu_matmul_f16_pair_wide_rows_exact_tensor(
+                        &ckv_rows, &csc_rows, model->map, model->size,
+                        layer->attn_compressor_kv->abs_offset,
+                        layer->attn_compressor_gate->abs_offset,
+                        NS4_N_EMBD, comp_proj_width, comp_row_stride,
+                        &attn_norm_view, n_tokens);
+        }
+        /* Indexer query and projection weights: shared-weight GEMVs of each
+         * row's qr_norm/attn_norm, batched into the same batch_indexer_q /
+         * batch_indexer_weights rows the attn-pre alias binds.  The gate is
+         * a superset of any row's sparse condition (n_comp only grows by at
+         * most n_tokens inside the block); rows a phase does not index are
+         * merely unused. */
+        int indexer_q_rows = 0;
+        if (ok && ratio == 4u && layer->indexer_attn_q_b &&
+            layer->indexer_proj &&
+            layer->indexer_attn_q_b->type == NS4_TENSOR_F16 &&
+            layer->indexer_proj->type == NS4_TENSOR_F16 &&
+            layer->indexer_attn_q_b->dim[0] == q_rank &&
+            layer->indexer_attn_q_b->dim[1] ==
+                (uint64_t)NS4_N_INDEXER_HEAD * NS4_N_INDEXER_HEAD_DIM &&
+            layer->indexer_proj->dim[0] == NS4_N_EMBD &&
+            layer->indexer_proj->dim[1] == NS4_N_INDEXER_HEAD &&
+            g->layer_n_comp[il] + n_tokens >
+                graph_decode_indexer_sparse_threshold(g) &&
+            g->layer_n_index_comp[il] + n_tokens > NS4_N_INDEXER_TOP_K) {
+            const uint64_t iq_dim =
+                (uint64_t)NS4_N_INDEXER_HEAD * NS4_N_INDEXER_HEAD_DIM;
+            ns4_gpu_tensor iq_rows, iw_rows;
+            indexer_q_rows =
+                graph_borrow_tensor_view(&iq_rows, graph_batch_indexer_q(g),
+                        0, (uint64_t)n_tokens * iq_dim * sizeof(float)) &&
+                graph_borrow_tensor_view(&iw_rows,
+                        graph_batch_indexer_weights(g), 0,
+                        (uint64_t)n_tokens * NS4_N_INDEXER_HEAD *
+                            sizeof(float)) &&
+                ns4_gpu_matmul_f16_one_wide_rows_exact_tensor(&iq_rows,
+                        model->map, model->size,
+                        layer->indexer_attn_q_b->abs_offset,
+                        q_rank, iq_dim, &qr_norm_view, n_tokens) &&
+                ns4_gpu_rope_tail_decode_rows_tensor(&iq_rows, rows,
+                        n_tokens, NS4_N_INDEXER_HEAD,
+                        NS4_N_INDEXER_HEAD_DIM, NS4_N_ROT,
+                        compressed ? (uint32_t)NS4_ROPE_ORIG_CTX : 0u,
+                        false, freq_base, freq_scale, ext_factor,
+                        attn_factor, NS4_ROPE_YARN_BETA_FAST,
+                        NS4_ROPE_YARN_BETA_SLOW) != 0 &&
+                ns4_gpu_dsv4_indexer_qat_tensor(&iq_rows,
+                        n_tokens * NS4_N_INDEXER_HEAD,
+                        NS4_N_INDEXER_HEAD_DIM) != 0 &&
+                ns4_gpu_matmul_f16_one_wide_rows_exact_tensor(&iw_rows,
+                        model->map, model->size,
+                        layer->indexer_proj->abs_offset,
+                        NS4_N_EMBD, NS4_N_INDEXER_HEAD,
+                        &attn_norm_view, n_tokens);
+        }
         for (uint32_t r = 0; ok && r < n_tokens; r++) {
             graph_attn_pre_alias alias;
             const uint32_t n_raw =
@@ -42419,6 +42581,8 @@ static bool graph_verify_decode_rows_exact(
             g->cur_hc_by_tier[t] = &row_cur[r];
             g->after_ffn_hc_by_tier[t] = &row_next[r];
             g->comp_selected_by_tier[t] = &row_selected[r];
+            g->spec_comp_proj_external = comp_proj_rows != 0;
+            g->spec_indexer_q_external = indexer_q_rows != 0;
             ok = graph_bind_attn_pre_batch_row(g, g, layer, r, true, &alias);
             if (ok) {
                 ok = graph_encode_decode_layer_phase(
@@ -42427,6 +42591,8 @@ static bool graph_verify_decode_rows_exact(
                         n_raw, prompt->v[start + r],
                         METAL_DECODE_LAYER_FROM_KV_STORE_TO_ATTN);
             }
+            g->spec_comp_proj_external = false;
+            g->spec_indexer_q_external = false;
             const uint32_t n_comp = g->layer_n_comp[il];
             const bool indexed =
                 ratio == 4u &&
@@ -42459,7 +42625,10 @@ static bool graph_verify_decode_rows_exact(
                         graph_attn_comp_cache_is_f16(), n_comp, NULL, 0,
                         NS4_N_HEAD, NS4_N_HEAD_DIM) != 0;
             }
-            if (ok) {
+            /* The inverse heads rope is hoisted to one rows launch after
+             * this loop for the full rows mode (nothing between here and
+             * loop end reads heads); lower modes keep the per-row call. */
+            if (ok && rows_mode < NS4_DSPARK_ROWS_ATTN_OUT) {
                 ok = ns4_gpu_rope_tail_tensor(
                         graph_heads(g), 1, NS4_N_HEAD, NS4_N_HEAD_DIM,
                         NS4_N_ROT, positions[r],
@@ -42477,12 +42646,27 @@ static bool graph_verify_decode_rows_exact(
             }
             graph_unbind_attn_pre_batch_row(g, &alias);
             if (ok && r + 1u < n_tokens && r < NS4_SPEC_PREFIX_SLOTS) {
-                ok = graph_capture_prefix_attn_state(g, il, r) &&
-                     graph_capture_prefix_index_state(g, il, r);
+                ok = graph_capture_prefix_states_fused(g, il, r);
             }
             g->comp_selected_by_tier[t] = saved_selected;
             g->cur_hc_by_tier[t] = saved_cur_hc;
             g->after_ffn_hc_by_tier[t] = saved_after_ffn_hc;
+        }
+
+        if (ok && rows_mode >= NS4_DSPARK_ROWS_ATTN_OUT) {
+            /* Hoisted inverse heads rope: one rows launch for the block,
+             * each row's pairs rotated with its own position exactly as the
+             * per-row call did. */
+            ns4_gpu_tensor heads_rope_view;
+            ok = graph_borrow_tensor_view(&heads_rope_view, batch_heads, 0,
+                        (uint64_t)n_tokens * q_dim * sizeof(float)) &&
+                 ns4_gpu_rope_tail_decode_rows_tensor(
+                        &heads_rope_view, rows, n_tokens, NS4_N_HEAD,
+                        NS4_N_HEAD_DIM, NS4_N_ROT,
+                        compressed ? (uint32_t)NS4_ROPE_ORIG_CTX : 0u,
+                        true, freq_base, freq_scale, ext_factor, attn_factor,
+                        NS4_ROPE_YARN_BETA_FAST,
+                        NS4_ROPE_YARN_BETA_SLOW) != 0;
         }
 
         if (rows_mode >= NS4_DSPARK_ROWS_ATTN_OUT) {
@@ -42593,18 +42777,27 @@ static bool graph_verify_decode_rows_exact(
                                                             n_tokens,
                                                             NS4_RMS_EPS) != 0;
                 }
-                for (uint32_t r = 0; ok && r < n_tokens; r++) {
-                    ns4_gpu_tensor mix_row, flat_row;
-                    ok = graph_borrow_tensor_view(&mix_row, batch_mix,
-                                                        (uint64_t)r * mix_hc * sizeof(float),
-                                                        mix_hc * sizeof(float)) &&
-                         graph_borrow_tensor_view(&flat_row, batch_flat,
-                                                        (uint64_t)r * hc_dim * sizeof(float),
-                                                        hc_dim * sizeof(float)) &&
-                         graph_matmul_plain_tensor(&mix_row, model,
-                                                         layer->hc_ffn_fn,
-                                                         hc_dim, mix_hc,
-                                                         &flat_row, 1);
+                {
+                    const int hc_fn_rows =
+                        ok && layer->hc_ffn_fn->type == NS4_TENSOR_F16 &&
+                        ns4_gpu_matmul_f16_one_wide_rows_exact_tensor(
+                                &mix_view, model->map, model->size,
+                                layer->hc_ffn_fn->abs_offset,
+                                hc_dim, mix_hc, batch_flat, n_tokens);
+                    for (uint32_t r = 0; ok && !hc_fn_rows && r < n_tokens;
+                         r++) {
+                        ns4_gpu_tensor mix_row, flat_row;
+                        ok = graph_borrow_tensor_view(&mix_row, batch_mix,
+                                                            (uint64_t)r * mix_hc * sizeof(float),
+                                                            mix_hc * sizeof(float)) &&
+                             graph_borrow_tensor_view(&flat_row, batch_flat,
+                                                            (uint64_t)r * hc_dim * sizeof(float),
+                                                            hc_dim * sizeof(float)) &&
+                             graph_matmul_plain_tensor(&mix_row, model,
+                                                             layer->hc_ffn_fn,
+                                                             hc_dim, mix_hc,
+                                                             &flat_row, 1);
+                    }
                 }
                 if (ok) {
                     ok = ns4_gpu_hc_split_weighted_sum_norm_tensor(
@@ -42663,8 +42856,25 @@ static bool graph_verify_decode_rows_exact(
                     /* Per-row router, the phase's two kernels called directly
                      * (identical args, so identical selection) with the
                      * outputs landing in the batch layout -- none of the
-                     * per-row phase-entry overhead. */
+                     * per-row phase-entry overhead.  The router logits GEMV
+                     * batches across rows when the rows-exact f16 kernel is
+                     * available for it; selection stays per row. */
                     bool bok = true;
+                    int router_logits_rows = 0;
+                    {
+                        ns4_gpu_tensor logits_rows;
+                        router_logits_rows =
+                            layer->ffn_gate_inp->type == NS4_TENSOR_F16 &&
+                            graph_borrow_tensor_view(&logits_rows,
+                                    graph_batch_router_logits(g), 0,
+                                    (uint64_t)n_tokens * NS4_N_EXPERT *
+                                        sizeof(float)) &&
+                            ns4_gpu_matmul_f16_one_wide_rows_exact_tensor(
+                                    &logits_rows, model->map, model->size,
+                                    layer->ffn_gate_inp->abs_offset,
+                                    NS4_N_EMBD, NS4_N_EXPERT,
+                                    &ffn_norm_view, n_tokens);
+                    }
                     for (uint32_t r = 0; bok && r < n_tokens; r++) {
                         ns4_gpu_tensor ffn_norm_row, sel_row, wts_row;
                         ns4_gpu_tensor logits_row;
@@ -42685,10 +42895,13 @@ static bool graph_verify_decode_rows_exact(
                                       (uint64_t)r * NS4_N_EXPERT * sizeof(float),
                                       (uint64_t)NS4_N_EXPERT * sizeof(float));
                         if (!bok) break;
-                        bok = graph_matmul_plain_tensor(&logits_row, model,
-                                      layer->ffn_gate_inp,
-                                      NS4_N_EMBD, NS4_N_EXPERT,
-                                      &ffn_norm_row, 1) &&
+                        if (!router_logits_rows) {
+                            bok = graph_matmul_plain_tensor(&logits_row, model,
+                                          layer->ffn_gate_inp,
+                                          NS4_N_EMBD, NS4_N_EXPERT,
+                                          &ffn_norm_row, 1);
+                        }
+                        bok = bok &&
                               ns4_gpu_router_select_tensor(&sel_row, &wts_row,
                                       graph_router_probs(g),
                                       model->map, model->size,
@@ -42763,8 +42976,45 @@ static bool graph_verify_decode_rows_exact(
                             }
                         }
                     }
+                    /* Shared-expert down + HC expand, batched across the
+                     * block's rows: the rows twin of the fused epilogue
+                     * kernel runs each row's exact single-row arithmetic
+                     * while reading ffn_down_shexp once for the block.
+                     * When it lands, the per-row epilogue phase below has
+                     * nothing left to do and is skipped entirely. */
+                    int rows_epi_batched = 0;
+                    if (ok && rows_moe_batched &&
+                        layer->ffn_down_shexp->type == NS4_TENSOR_Q8_0 &&
+                        !graph_use_reference_shared_down_hc() &&
+                        !graph_directional_steering_ffn_enabled(g) &&
+                        !g->materialize_ffn_out &&
+                        graph_debug_get_config()->prefix == NULL) {
+                        ns4_gpu_tensor sh_out_rows, next_rows, rout_rows;
+                        rows_epi_batched =
+                            graph_borrow_tensor_view(&sh_out_rows,
+                                    graph_batch_attn_out(g), 0,
+                                    (uint64_t)n_tokens * NS4_N_EMBD *
+                                        sizeof(float)) &&
+                            graph_borrow_tensor_view(&next_rows, next_base, 0,
+                                    (uint64_t)n_tokens * hc_dim *
+                                        sizeof(float)) &&
+                            graph_borrow_tensor_view(&rout_rows,
+                                    graph_batch_routed_out(g), 0,
+                                    (uint64_t)n_tokens * NS4_N_EMBD *
+                                        sizeof(float)) &&
+                            ns4_gpu_shared_down_hc_expand_rows_exact_tensor(
+                                    &next_rows, &sh_out_rows,
+                                    model->map, model->size,
+                                    layer->ffn_down_shexp->abs_offset,
+                                    layer->ffn_down_shexp->dim[0],
+                                    NS4_N_EMBD,
+                                    &mid_rows, &rout_rows, &hc_rows,
+                                    &split_view, (uint32_t)mix_hc,
+                                    NS4_N_EMBD, NS4_N_HC, n_tokens);
+                    }
                     for (uint32_t r = 0;
-                         ok && rows_moe_batched && r < n_tokens; r++) {
+                         ok && rows_moe_batched && !rows_epi_batched &&
+                         r < n_tokens; r++) {
                         graph_attn_pre_alias alias;
                         ns4_gpu_tensor ffn_cur_row, ffn_norm_row, mid_row;
                         ns4_gpu_tensor sel_row, wts_row, rout_row;

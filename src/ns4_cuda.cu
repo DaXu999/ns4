@@ -3243,6 +3243,85 @@ extern "C" int ns4_gpu_tensor_read(const ns4_gpu_tensor *tensor, uint64_t offset
     return ok;
 }
 
+/* Up to four device-to-device copies in one launch on the decode stream.
+ * ns4_gpu_tensor_copy goes through synchronous cudaMemcpy on the legacy
+ * default stream, which blocks the host and serializes against the decode
+ * stream; the DSpark verify captures per-layer per-row state snapshots,
+ * where that round trip per copy dominates.  Values are plain byte moves,
+ * so this is trivially bit-identical. */
+__global__ static void copy_bytes4_kernel(
+        char *d0, const char *s0, uint64_t b0,
+        char *d1, const char *s1, uint64_t b1,
+        char *d2, const char *s2, uint64_t b2,
+        char *d3, const char *s3, uint64_t b3) {
+    char *d; const char *s; uint64_t b;
+    switch (blockIdx.y) {
+    case 0: d = d0; s = s0; b = b0; break;
+    case 1: d = d1; s = s1; b = b1; break;
+    case 2: d = d2; s = s2; b = b2; break;
+    default: d = d3; s = s3; b = b3; break;
+    }
+    if (!d || !s || b == 0) return;
+    const uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
+    const uint64_t base = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n16 = b >> 4;
+    for (uint64_t i = base; i < n16; i += stride) {
+        ((uint4 *)d)[i] = ((const uint4 *)s)[i];
+    }
+    for (uint64_t i = (n16 << 4) + base; i < b; i += stride) {
+        d[i] = s[i];
+    }
+}
+
+extern "C" int ns4_gpu_tensor_copy4_async_tensor(
+        ns4_gpu_tensor *dst0, uint64_t doff0, const ns4_gpu_tensor *src0, uint64_t soff0, uint64_t b0,
+        ns4_gpu_tensor *dst1, uint64_t doff1, const ns4_gpu_tensor *src1, uint64_t soff1, uint64_t b1,
+        ns4_gpu_tensor *dst2, uint64_t doff2, const ns4_gpu_tensor *src2, uint64_t soff2, uint64_t b2,
+        ns4_gpu_tensor *dst3, uint64_t doff3, const ns4_gpu_tensor *src3, uint64_t soff3, uint64_t b3) {
+    ns4_gpu_tensor *dsts[4] = {dst0, dst1, dst2, dst3};
+    const ns4_gpu_tensor *srcs[4] = {src0, src1, src2, src3};
+    const uint64_t doffs[4] = {doff0, doff1, doff2, doff3};
+    const uint64_t soffs[4] = {soff0, soff1, soff2, soff3};
+    const uint64_t lens[4] = {b0, b1, b2, b3};
+    char *dp[4] = {NULL, NULL, NULL, NULL};
+    const char *sp[4] = {NULL, NULL, NULL, NULL};
+    uint64_t maxb = 0;
+    int tier = -1;
+    int any = 0;
+    for (int i = 0; i < 4; i++) {
+        if (!dsts[i] && !srcs[i]) continue;
+        if (!dsts[i] || !srcs[i] || lens[i] == 0 ||
+            doffs[i] > dsts[i]->bytes || soffs[i] > srcs[i]->bytes ||
+            lens[i] > dsts[i]->bytes - doffs[i] ||
+            lens[i] > srcs[i]->bytes - soffs[i]) {
+            return 0;
+        }
+        const int d = ns4_tensor_device_idx(dsts[i]);
+        if (tier < 0) tier = d;
+        if (d != tier || ns4_tensor_device_idx(srcs[i]) != tier) return 0;
+        dp[i] = (char *)dsts[i]->ptr + doffs[i];
+        sp[i] = (const char *)srcs[i]->ptr + soffs[i];
+        if (lens[i] > maxb) maxb = lens[i];
+        any = 1;
+    }
+    if (!any) return 1;
+    if (tier < 0 || tier >= g_n_gpus) return 0;
+    unsigned blocks = (unsigned)((maxb / 16u + 255u) / 256u);
+    if (blocks == 0) blocks = 1;
+    if (blocks > 64u) blocks = 64u;
+    dim3 grid(blocks, 4u, 1u);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[tier].device_id) {
+        copy_bytes4_kernel<<<grid, 256, 0, cuda_decode_stream()>>>(
+                dp[0], sp[0], dp[0] ? lens[0] : 0,
+                dp[1], sp[1], dp[1] ? lens[1] : 0,
+                dp[2], sp[2], dp[2] ? lens[2] : 0,
+                dp[3], sp[3], dp[3] ? lens[3] : 0);
+        ok = cuda_ok(cudaGetLastError(), "copy4 async launch");
+    }
+    return ok;
+}
+
 extern "C" int ns4_gpu_tensor_copy(ns4_gpu_tensor *dst, uint64_t dst_offset,
                                      const ns4_gpu_tensor *src, uint64_t src_offset,
                                      uint64_t bytes) {
@@ -5089,6 +5168,69 @@ __global__ static void matmul_f16_pair_wide_kernel(
     }
 }
 
+/* Rows twin of matmul_f16_pair_wide_kernel for the DSpark verify block:
+ * grid.y carries the block row, each (out row, block row) pair runs the
+ * single-row kernel's chunk walk and reduction against its own activation
+ * row, so per-row outputs are bit-identical while the paired weights are
+ * read once per block with the extra rows served from L2. */
+template <uint32_t NT>
+__global__ static void matmul_f16_pair_wide_rows_kernel(
+        float *out0,
+        float *out1,
+        const __half *w0,
+        const __half *w1,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out0_dim,
+        uint64_t out1_dim,
+        uint64_t out_stride,
+        uint64_t n_rows) {
+    const uint64_t row = (uint64_t)blockIdx.x;
+    const uint64_t tok = (uint64_t)blockIdx.y;
+    if (tok >= n_rows) return;
+    if (row >= out0_dim && row >= out1_dim) return;
+    x += tok * in_dim;
+    out0 += tok * out_stride;
+    out1 += tok * out_stride;
+    const __half *wr0 = row < out0_dim ? w0 + row * in_dim : w0;
+    const __half *wr1 = row < out1_dim ? w1 + row * in_dim : w1;
+    const uint64_t n8 = in_dim / 8u;
+    const uint4 *v0 = (const uint4 *)wr0;
+    const uint4 *v1 = (const uint4 *)wr1;
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    for (uint64_t b = threadIdx.x; b < n8; b += NT) {
+        const uint4 a = v0[b];
+        const uint4 c = v1[b];
+        const __half *ha = (const __half *)&a;
+        const __half *hc = (const __half *)&c;
+        const float *xp = x + b * 8u;
+        #pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) {
+            const float xv = xp[j];
+            sum0 += __half2float(ha[j]) * xv;
+            sum1 += __half2float(hc[j]) * xv;
+        }
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        sum0 += __shfl_down_sync(0xffffffffu, sum0, off);
+        sum1 += __shfl_down_sync(0xffffffffu, sum1, off);
+    }
+    __shared__ float ws0[NT / 32];
+    __shared__ float ws1[NT / 32];
+    const uint32_t warp = threadIdx.x >> 5;
+    if ((threadIdx.x & 31u) == 0u) { ws0[warp] = sum0; ws1[warp] = sum1; }
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        float total0 = 0.0f;
+        float total1 = 0.0f;
+        for (uint32_t i = 0; i < NT / 32u; i++) { total0 += ws0[i]; total1 += ws1[i]; }
+        if (row < out0_dim) out0[row] = total0;
+        if (row < out1_dim) out1[row] = total1;
+    }
+}
+
 /* Single-matrix form of matmul_f16_pair_wide_kernel, for the one-token f16
  * GEMVs that currently go to cuBLAS (router, indexer projection, hc fns):
  * cuBLAS spends ~0.9 ms/token on them in nvjet/gemvx/splitKreduce launches
@@ -5106,6 +5248,47 @@ __global__ static void matmul_f16_one_wide_kernel(
         uint64_t out_dim) {
     const uint64_t row = (uint64_t)blockIdx.x;
     if (row >= out_dim) return;
+    const uint4 *v = (const uint4 *)(w + row * in_dim);
+    const uint64_t n8 = in_dim / 8u;
+    float sum = 0.0f;
+    for (uint64_t b = threadIdx.x; b < n8; b += NT) {
+        const uint4 a = v[b];
+        const __half *ha = (const __half *)&a;
+        const float *xp = x + b * 8u;
+        #pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) {
+            sum += __half2float(ha[j]) * xp[j];
+        }
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, off);
+    __shared__ float ws[NT / 32];
+    const uint32_t warp = threadIdx.x >> 5;
+    if ((threadIdx.x & 31u) == 0u) ws[warp] = sum;
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        float total = 0.0f;
+        for (uint32_t i = 0; i < NT / 32u; i++) total += ws[i];
+        out[row] = total;
+    }
+}
+
+/* Rows twin of matmul_f16_one_wide_kernel (DSpark verify): grid.y is the
+ * block row; per-row arithmetic is the single-row kernel's, unchanged. */
+template <uint32_t NT>
+__global__ static void matmul_f16_one_wide_rows_kernel(
+        float *out,
+        const __half *w,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_rows) {
+    const uint64_t row = (uint64_t)blockIdx.x;
+    const uint64_t tok = (uint64_t)blockIdx.y;
+    if (row >= out_dim || tok >= n_rows) return;
+    x += tok * in_dim;
+    out += tok * out_dim;
     const uint4 *v = (const uint4 *)(w + row * in_dim);
     const uint64_t n8 = in_dim / 8u;
     float sum = 0.0f;
@@ -6310,6 +6493,89 @@ __global__ static void matmul_q8_0_hc_expand_preq_warp8_kernel(
             if (has_add2) add_v += block_add2[d];
             block_v += add_v;
         }
+    }
+    block_v = __shfl_sync(0xffffffffu, block_v, 0);
+    const float *post = split + n_hc;
+    const float *comb = split + 2u * n_hc;
+    for (uint32_t dst_hc = lane; dst_hc < n_hc; dst_hc += 32u) {
+        float hc_acc = block_v * post[dst_hc];
+        for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
+            const float comb_v = comb[dst_hc + (uint64_t)src_hc * n_hc];
+            const float res_v = residual_hc[(uint64_t)src_hc * n_embd + d];
+            hc_acc += comb_v * res_v;
+        }
+        out_hc[(uint64_t)dst_hc * n_embd + d] = hc_acc;
+    }
+}
+
+/* Rows twin of matmul_q8_0_hc_expand_preq_warp8_kernel for the DSpark
+ * verify epilogue: one grid.y slot per block row, every (row, d) thread
+ * runs the single-row kernel's instruction stream against its own row's
+ * activations, routed output, residual and split -- per-row values are
+ * bit-identical while the shared-expert down weight is read once per
+ * block instead of once per row.  The TP owned-slot combine never
+ * appears on the single-GPU verify path, so it is not carried here. */
+__global__ static void matmul_q8_0_hc_expand_preq_warp8_rows_kernel(
+        float *out_hc,
+        float *block_out,
+        const float *block_add,
+        const float *residual_hc,
+        const float *split,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint32_t n_embd,
+        uint32_t n_hc,
+        uint64_t blocks,
+        uint32_t split_stride,
+        uint64_t n_rows,
+        int use_dp4a) {
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint64_t tok = (uint64_t)blockIdx.y;
+    const uint32_t lane = threadIdx.x & 31u;
+    if (tok >= n_rows) return;
+    const uint64_t hc_stride = (uint64_t)n_hc * n_embd;
+    xq += tok * blocks * 32u;
+    xscale += tok * blocks;
+    block_out += tok * out_dim;
+    block_add += tok * out_dim;
+    residual_hc += tok * hc_stride;
+    split += tok * split_stride;
+    out_hc += tok * hc_stride;
+    __shared__ int8_t sxq[8192];
+    __shared__ float sxs[256];
+    const int stage = blocks <= 256u;
+    if (stage) {
+        const uint64_t nbytes = blocks * 32u;
+        for (uint64_t i = threadIdx.x * 16u; i < nbytes; i += 256u * 16u) {
+            *(uint4 *)(sxq + i) = *(const uint4 *)(xq + i);
+        }
+        for (uint64_t i = threadIdx.x; i < blocks; i += 256u) sxs[i] = xscale[i];
+        __syncthreads();
+    }
+    if (row >= out_dim) return;
+    const unsigned char *wr = w + row * blocks * 34;
+    const int8_t *xq_src = stage ? sxq : xq;
+    const float *xs_src = stage ? sxs : xscale;
+    float acc = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const uint64_t i0 = b * 32;
+        const uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
+        const __half *scale_h = (const __half *)(wr + b * 34);
+        const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
+        const int8_t *xqb = xq_src + b * 32;
+        int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
+        acc += __half2float(*scale_h) * xs_src[b] * (float)dot;
+    }
+    acc = warp_sum_f32(acc);
+    acc = __shfl_sync(0xffffffffu, acc, 0);
+    const uint32_t d = (uint32_t)row;
+    float block_v = acc;
+    if (lane == 0) {
+        block_out[d] = acc;
+        block_v += block_add[d];
     }
     block_v = __shfl_sync(0xffffffffu, block_v, 0);
     const float *post = split + n_hc;
@@ -13638,6 +13904,143 @@ __global__ static void compressor_update_pool_kernel(
     row[d] = den != 0.0f ? acc / den : 0.0f;
 }
 
+/* Fused ratio-4 emit chain: pool + rms-norm + rope + shift in one launch.
+ * Each stage is the standalone kernel's body verbatim (pool per-d, the
+ * 256-thread rms partial tree, rope_tail's per-pair math, the shift moves),
+ * separated by __syncthreads() exactly where separate launches were
+ * stream-ordered -- values are bit-identical to the four-launch chain. */
+__global__ static void compressor_update_emit_fused_kernel(
+        float *crow,
+        float *state_kv,
+        float *state_score,
+        const float *norm_w,
+        uint32_t head_dim,
+        uint32_t rope_pos,
+        uint32_t n_rot,
+        uint32_t n_ctx_orig,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow,
+        float rms_eps,
+        int fp8_quant) {
+    const uint32_t ratio = 4u;
+    const uint32_t width = 2u * head_dim;
+    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float vals[8];
+        float scores[8];
+        float max_s = -INFINITY;
+        uint32_t n_cand = 0;
+        for (uint32_t r = 0; r < 4; r++) {
+            vals[n_cand] = state_kv[(uint64_t)r * width + d];
+            scores[n_cand] = state_score[(uint64_t)r * width + d];
+            max_s = fmaxf(max_s, scores[n_cand++]);
+        }
+        for (uint32_t r = 0; r < 4; r++) {
+            vals[n_cand] = state_kv[(uint64_t)(ratio + r) * width + head_dim + d];
+            scores[n_cand] = state_score[(uint64_t)(ratio + r) * width + head_dim + d];
+            max_s = fmaxf(max_s, scores[n_cand++]);
+        }
+        float den = 0.0f, acc = 0.0f;
+        for (uint32_t i = 0; i < n_cand; i++) {
+            float w = expf(scores[i] - max_s);
+            den += w;
+            acc += vals[i] * w;
+        }
+        crow[d] = den != 0.0f ? acc / den : 0.0f;
+    }
+    __syncthreads();
+    {
+        float sum = 0.0f;
+        for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
+            float v = crow[i];
+            sum += v * v;
+        }
+        __shared__ float partial[256];
+        partial[threadIdx.x] = sum;
+        __syncthreads();
+        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+            __syncthreads();
+        }
+        const float scale = rsqrtf(partial[0] / (float)head_dim + rms_eps);
+        for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
+            crow[i] = crow[i] * scale * norm_w[i];
+        }
+    }
+    __syncthreads();
+    {
+        const uint32_t n_nope = head_dim - n_rot;
+        float corr0 = 0.0f, corr1 = 0.0f;
+        if (ext_factor != 0.0f) {
+            float denom = 2.0f * logf(freq_base);
+            corr0 = floorf((float)n_rot * logf((float)n_ctx_orig / (beta_fast * 2.0f * (float)M_PI)) / denom);
+            corr1 = ceilf((float)n_rot * logf((float)n_ctx_orig / (beta_slow * 2.0f * (float)M_PI)) / denom);
+            corr0 = fmaxf(0.0f, corr0);
+            corr1 = fminf((float)(n_rot - 1), corr1);
+        }
+        for (uint32_t pair = threadIdx.x; pair < n_rot / 2u; pair += blockDim.x) {
+            uint32_t i = pair * 2u;
+            float theta_extrap = (float)rope_pos * powf(freq_base, -((float)i) / (float)n_rot);
+            float theta_interp = freq_scale * theta_extrap;
+            float theta = theta_interp;
+            float mscale = attn_factor;
+            if (ext_factor != 0.0f) {
+                float ramp_mix = rope_yarn_ramp_dev(corr0, corr1, (int)i) * ext_factor;
+                theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+                mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+            }
+            float c = cosf(theta) * mscale;
+            float s = sinf(theta) * mscale;
+            float *tail = crow + n_nope;
+            float x0 = tail[i];
+            float x1 = tail[i + 1];
+            tail[i] = x0 * c - x1 * s;
+            tail[i + 1] = x0 * s + x1 * c;
+        }
+    }
+    __syncthreads();
+    if (fp8_quant) {
+        /* fp8_kv_quantize_row's 64-thread program: lanes 64..255 idle but
+         * keep every __syncthreads, so per-element math and the 64-wide max
+         * tree are exactly the standalone kernel's. */
+        __shared__ float fp8_scratch[64];
+        const uint32_t tid = threadIdx.x;
+        const uint32_t n_nope = head_dim - n_rot;
+        for (uint32_t off = 0; off < n_nope; off += 64) {
+            float v = 0.0f;
+            if (tid < 64u) {
+                if (off + tid < n_nope) v = crow[off + tid];
+                fp8_scratch[tid] = off + tid < n_nope ? fabsf(v) : 0.0f;
+            }
+            __syncthreads();
+            for (uint32_t stride = 32; stride > 0; stride >>= 1) {
+                if (tid < stride) fp8_scratch[tid] = fmaxf(fp8_scratch[tid], fp8_scratch[tid + stride]);
+                __syncthreads();
+            }
+            float scale = exp2f(ceilf(log2f(fmaxf(fp8_scratch[0], 1.0e-4f) / 448.0f)));
+            if (tid < 64u && off + tid < n_nope) {
+                float q = dsv4_e4m3fn_dequant_dev(fminf(448.0f, fmaxf(-448.0f, v / scale))) * scale;
+                crow[off + tid] = q;
+            }
+            __syncthreads();
+        }
+    }
+    {
+        const uint64_t half = 4ull * width;
+        for (uint64_t i = threadIdx.x; i < half; i += blockDim.x) {
+            float v = state_kv[half + i];
+            float s = state_score[half + i];
+            state_kv[i] = v;
+            state_score[i] = s;
+            state_kv[half + i] = v;
+            state_score[half + i] = s;
+        }
+    }
+}
+
 __global__ static void compressor_shift_ratio4_kernel(float *state_kv, float *state_score, uint32_t width) {
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t half = 4ull * width;
@@ -18056,6 +18459,143 @@ extern "C" int ns4_gpu_matmul_f16_pair_tensor(
     return cuda_ok(cudaGetLastError(), "matmul_f16_pair_ordered_chunks launch");
 }
 
+/* Rows-exact f16 GEMVs for the DSpark verify block.  Each succeeds ONLY
+ * when the one-row entry point would take the wide ordered kernel for the
+ * same shape under the current env -- then the rows twin reproduces the
+ * per-row arithmetic bit-exactly while sharing the weight read.  Any other
+ * dispatch (cuBLAS, serial, small-out, quality) returns 0 and the caller
+ * keeps its per-row loop, so every configuration stays on the arithmetic
+ * it had. */
+extern "C" int ns4_gpu_matmul_f16_pair_wide_rows_exact_tensor(
+        ns4_gpu_tensor *out0,
+        ns4_gpu_tensor *out1,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight0_offset,
+        uint64_t weight1_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t out_stride,
+        const ns4_gpu_tensor *x,
+        uint32_t n_rows) {
+    if (!out0 || !out1 || !x || !model_map || in_dim == 0 || out_dim == 0 ||
+        n_rows == 0 || out_stride < out_dim) {
+        return 0;
+    }
+    if (getenv("NS4_CUDA_NO_F16_PAIR_MATMUL") != NULL ||
+        getenv("NS4_CUDA_SERIAL_F16_MATMUL") != NULL ||
+        getenv("NS4_CUDA_SERIAL_ROUTER") != NULL ||
+        getenv("NS4_CUDA_NO_ORDERED_F16_MATMUL") != NULL) {
+        return 0;
+    }
+    if (weight0_offset > model_size || weight1_offset > model_size ||
+        out_dim > UINT64_MAX / in_dim) {
+        return 0;
+    }
+    const uint64_t weight_bytes = out_dim * in_dim * sizeof(uint16_t);
+    const uint64_t out_span =
+        ((uint64_t)(n_rows - 1u) * out_stride + out_dim) * sizeof(float);
+    if (weight_bytes > model_size - weight0_offset ||
+        weight_bytes > model_size - weight1_offset ||
+        x->bytes < (uint64_t)n_rows * in_dim * sizeof(float) ||
+        out0->bytes < out_span ||
+        out1->bytes < out_span) {
+        return 0;
+    }
+    const int logical_tier = ns4_tensor_device_idx(out0);
+    if (ns4_tensor_device_idx(out1) != logical_tier ||
+        ns4_tensor_device_idx(x) != logical_tier) {
+        return 0;
+    }
+    const __half *w0 = (const __half *)cuda_resolve_weight_ptr(model_map, weight0_offset, weight_bytes, logical_tier, "f16_pair_rows0");
+    const __half *w1 = (const __half *)cuda_resolve_weight_ptr(model_map, weight1_offset, weight_bytes, logical_tier, "f16_pair_rows1");
+    if (!w0 || !w1) return 0;
+    const uint64_t chunk_f16 = (in_dim + 31u) / 32u;
+    const int vec4_ok =
+        (chunk_f16 % 8u) == 0u &&
+        (((uintptr_t)w0 | (uintptr_t)w1) & 15u) == 0u &&
+        getenv("NS4_CUDA_NO_F16_PAIR_VEC4") == NULL;
+    const char *wide_env = vec4_ok ? getenv("NS4_CUDA_F16_PAIR_WIDE") : NULL;
+    if (!wide_env || atoi(wide_env) == 0) return 0;
+    const int nt = atoi(wide_env);
+    dim3 grid((unsigned)out_dim, n_rows, 1u);
+    if (nt == 128) {
+        matmul_f16_pair_wide_rows_kernel<128><<<grid, 128, 0,
+                cuda_decode_stream()>>>((float *)out0->ptr, (float *)out1->ptr,
+                w0, w1, (const float *)x->ptr, in_dim, out_dim, out_dim,
+                out_stride, n_rows);
+    } else if (nt == 512) {
+        matmul_f16_pair_wide_rows_kernel<512><<<grid, 512, 0,
+                cuda_decode_stream()>>>((float *)out0->ptr, (float *)out1->ptr,
+                w0, w1, (const float *)x->ptr, in_dim, out_dim, out_dim,
+                out_stride, n_rows);
+    } else {
+        matmul_f16_pair_wide_rows_kernel<256><<<grid, 256, 0,
+                cuda_decode_stream()>>>((float *)out0->ptr, (float *)out1->ptr,
+                w0, w1, (const float *)x->ptr, in_dim, out_dim, out_dim,
+                out_stride, n_rows);
+    }
+    return cuda_ok(cudaGetLastError(), "matmul_f16_pair_wide_rows launch");
+}
+
+extern "C" int ns4_gpu_matmul_f16_one_wide_rows_exact_tensor(
+        ns4_gpu_tensor *out,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        const ns4_gpu_tensor *x,
+        uint32_t n_rows) {
+    if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 ||
+        n_rows == 0) {
+        return 0;
+    }
+    /* Mirror every gate the one-row f16 entry applies before it reaches the
+     * wide ordered kernel; any env that would steer a one-row call onto a
+     * different arithmetic path refuses the rows form too. */
+    if (getenv("NS4_CUDA_SERIAL_F16_MATMUL") != NULL || g_quality_mode) return 0;
+    if (in_dim == 4096u && out_dim == 256u &&
+        getenv("NS4_CUDA_SERIAL_ROUTER") != NULL) {
+        return 0;
+    }
+    if (out_dim <= 32u && in_dim >= 8192u &&
+        getenv("NS4_CUDA_F16_SMALL_OUT") != NULL) {
+        return 0;
+    }
+    if ((in_dim % 8u) != 0u || in_dim < 1024u) return 0;
+    if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
+    const uint64_t weight_bytes = out_dim * in_dim * sizeof(uint16_t);
+    if (weight_bytes > model_size - weight_offset ||
+        x->bytes < (uint64_t)n_rows * in_dim * sizeof(float) ||
+        out->bytes < (uint64_t)n_rows * out_dim * sizeof(float)) {
+        return 0;
+    }
+    const int logical_tier = ns4_tensor_device_idx(out);
+    if (ns4_tensor_device_idx(x) != logical_tier) return 0;
+    const __half *w = (const __half *)cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes, logical_tier, "f16_one_rows");
+    if (!w || ((uintptr_t)w & 15u) != 0u) return 0;
+    const char *one_wide = getenv("NS4_CUDA_F16_ONE_WIDE");
+    if (!one_wide) return 0;
+    const int nt = atoi(one_wide);
+    if (nt != 128 && nt != 256 && nt != 512) return 0;
+    dim3 grid((unsigned)out_dim, n_rows, 1u);
+    if (nt == 128) {
+        matmul_f16_one_wide_rows_kernel<128><<<grid, 128, 0,
+                cuda_decode_stream()>>>((float *)out->ptr, w,
+                (const float *)x->ptr, in_dim, out_dim, n_rows);
+    } else if (nt == 512) {
+        matmul_f16_one_wide_rows_kernel<512><<<grid, 512, 0,
+                cuda_decode_stream()>>>((float *)out->ptr, w,
+                (const float *)x->ptr, in_dim, out_dim, n_rows);
+    } else {
+        matmul_f16_one_wide_rows_kernel<256><<<grid, 256, 0,
+                cuda_decode_stream()>>>((float *)out->ptr, w,
+                (const float *)x->ptr, in_dim, out_dim, n_rows);
+    }
+    return cuda_ok(cudaGetLastError(), "matmul_f16_one_wide_rows launch");
+}
+
 extern "C" int ns4_gpu_matmul_f16_pair_compressor_store_tensor(
         ns4_gpu_tensor *out_kv,
         ns4_gpu_tensor *out_score,
@@ -18777,7 +19317,10 @@ extern "C" int ns4_gpu_compressor_update_tensor(
         float                   beta_fast,
         float                   beta_slow,
         float                   rms_eps,
-        bool                    state_already_stored) {
+        bool                    state_already_stored,
+        int                     fp8_emit,
+        int                    *fp8_done) {
+    if (fp8_done) *fp8_done = 0;
     if (!kv_cur || !sc_cur || !state_kv || !state_score || !comp_cache ||
         !model_map || head_dim == 0 || ratio == 0 ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||
@@ -18814,6 +19357,32 @@ extern "C" int ns4_gpu_compressor_update_tensor(
             (uint64_t)comp_row * head_dim * sizeof(float),
             (uint64_t)head_dim * sizeof(float));
     if (!comp_row_view) return 0;
+    if (ratio == 4u && n_rot != 0 &&
+        getenv("NS4_CUDA_NO_COMP_EMIT_FUSED") == NULL) {
+        const int logical_tier = ns4_tensor_device_idx(comp_cache);
+        const float *nw = (const float *)cuda_resolve_weight_ptr(
+                model_map, norm_offset, norm_bytes, logical_tier,
+                "compressor emit norm");
+        if (nw) {
+            compressor_update_emit_fused_kernel<<<1, 256, 0,
+                                                  cuda_decode_stream()>>>(
+                    (float *)comp_row_view->ptr,
+                    (float *)state_kv->ptr,
+                    (float *)state_score->ptr,
+                    nw,
+                    head_dim,
+                    pos + 1u - ratio,
+                    n_rot,
+                    n_ctx_orig,
+                    freq_base, freq_scale, ext_factor, attn_factor,
+                    beta_fast, beta_slow, rms_eps,
+                    fp8_emit);
+            ns4_gpu_tensor_free(comp_row_view);
+            if (fp8_emit && fp8_done) *fp8_done = 1;
+            return cuda_ok(cudaGetLastError(),
+                           "compressor emit fused launch");
+        }
+    }
     compressor_update_pool_kernel<<<(head_dim + 255) / 256, 256, 0, cuda_decode_stream()>>>(
             (float *)comp_row_view->ptr,
             (const float *)state_kv->ptr,
@@ -28739,6 +29308,95 @@ extern "C" int ns4_gpu_shared_down_hc_expand_q8_0_tensor(
                                         shared_mid, 1) &&
            ns4_gpu_hc_expand_add_split_tensor(out_hc, shared_out, routed_out,
 	                                                residual_hc, split, n_embd, n_hc);
+}
+
+extern "C" int ns4_gpu_shared_down_hc_expand_rows_exact_tensor(
+        ns4_gpu_tensor       *out_hc,
+        ns4_gpu_tensor       *block_out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ns4_gpu_tensor *shared_mid,
+        const ns4_gpu_tensor *routed_out,
+        const ns4_gpu_tensor *residual_hc,
+        const ns4_gpu_tensor *split,
+        uint32_t                split_stride,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        uint32_t                n_rows) {
+    /* The caller's per-row loop runs the fused single-row kernel; a build
+     * that disables the fusion must keep the per-row path so both stay on
+     * the same arithmetic. */
+    if (getenv("NS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED") != NULL) return 0;
+    if (!out_hc || !block_out || !shared_mid || !routed_out ||
+        !residual_hc || !split || !model_map ||
+        in_dim == 0 || out_dim == 0 || n_embd == 0 || n_hc == 0 ||
+        n_rows == 0 || out_dim != (uint64_t)n_embd ||
+        split_stride < 2u * n_hc + n_hc * n_hc) {
+        return 0;
+    }
+    const uint64_t blocks = (in_dim + 31) / 32;
+    if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * 34)) return 0;
+    const uint64_t weight_bytes = out_dim * blocks * 34;
+    const uint64_t hc_bytes = (uint64_t)n_hc * n_embd * sizeof(float);
+    if (weight_bytes > model_size - weight_offset ||
+        shared_mid->bytes < (uint64_t)n_rows * in_dim * sizeof(float) ||
+        block_out->bytes < (uint64_t)n_rows * out_dim * sizeof(float) ||
+        routed_out->bytes < (uint64_t)n_rows * out_dim * sizeof(float) ||
+        residual_hc->bytes < (uint64_t)n_rows * hc_bytes ||
+        out_hc->bytes < (uint64_t)n_rows * hc_bytes ||
+        split->bytes < (uint64_t)n_rows * split_stride * sizeof(float)) {
+        return 0;
+    }
+    const int logical_tier = ns4_tensor_device_idx(out_hc);
+    if (logical_tier < 0 || logical_tier >= g_n_gpus ||
+        ns4_tensor_device_idx(block_out) != logical_tier ||
+        ns4_tensor_device_idx(shared_mid) != logical_tier) {
+        return 0;
+    }
+    const char *wptr = cuda_resolve_weight_ptr(
+            model_map, weight_offset, weight_bytes, logical_tier,
+            "shared_down_hc_expand_rows");
+    if (!wptr) return 0;
+    const uint64_t xq_bytes = (uint64_t)n_rows * blocks * 32u;
+    const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+    const uint64_t tmp_bytes =
+        scale_offset + (uint64_t)n_rows * blocks * sizeof(float);
+    void *tmp = cuda_tmp_alloc_on(logical_tier, tmp_bytes,
+                                  "shared down hc expand rows prequant");
+    if (!tmp) return 0;
+    int8_t *xq = (int8_t *)tmp;
+    float *xscale = (float *)((char *)tmp + scale_offset);
+    cuda_launch_quantize_q8_0_f32(xq, xscale, (const float *)shared_mid->ptr,
+                                  in_dim, blocks, n_rows,
+                                  cuda_decode_stream());
+    if (!cuda_ok(cudaGetLastError(),
+                 "shared down hc expand rows quantize launch")) {
+        return 0;
+    }
+    dim3 grid(((unsigned)out_dim + 7u) / 8u, n_rows, 1u);
+    matmul_q8_0_hc_expand_preq_warp8_rows_kernel<<<grid, 256, 0,
+                                                   cuda_decode_stream()>>>(
+            (float *)out_hc->ptr,
+            (float *)block_out->ptr,
+            (const float *)routed_out->ptr,
+            (const float *)residual_hc->ptr,
+            (const float *)split->ptr,
+            reinterpret_cast<const unsigned char *>(wptr),
+            xq,
+            xscale,
+            in_dim,
+            out_dim,
+            n_embd,
+            n_hc,
+            blocks,
+            split_stride,
+            n_rows,
+            cuda_q8_use_dp4a());
+    return cuda_ok(cudaGetLastError(),
+                   "shared down hc expand rows launch");
 }
 
 extern "C" int ns4_gpu_shared_down_hc_expand_add_q8_0_tensor(
