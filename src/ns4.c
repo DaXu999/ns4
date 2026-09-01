@@ -13056,6 +13056,16 @@ typedef struct {
      * graph_indexer_weights arrive precomputed (rows-batched q_b GEMV,
      * rope, qat, proj) and the phase runs only the scan and top-k. */
     bool spec_indexer_q_external;
+    /* Set when the block-sequential compressor kernel prewrote this row's
+     * attn frontier store, emit, fp8 and snapshot for the whole verify
+     * block; the phase skips the attn compressor section and layer_n_comp
+     * already carries the row's value. */
+    bool spec_comp_update_external;
+    /* Same for the indexer compressor (proj, store, emit, fp4 mirror). */
+    bool spec_index_update_external;
+    /* Set when the rows-batched indexer scan + top-k already filled this
+     * row's comp_selected; the phase skips its own scan and top-k. */
+    bool spec_indexer_scan_external;
     uint32_t raw_cap;
     /* Maximum compressed-row capacity across layers.  Shared work buffers use
      * this worst-case size because ratio-4 indexer layers can still reach it. */
@@ -13200,6 +13210,8 @@ typedef struct {
     ns4_gpu_tensor *batch_kv_by_tier[NS4_MAX_GPUS];
     ns4_gpu_tensor *batch_comp_kv_by_tier[NS4_MAX_GPUS];
     ns4_gpu_tensor *batch_comp_sc_by_tier[NS4_MAX_GPUS];
+    ns4_gpu_tensor *batch_index_ckv_by_tier[NS4_MAX_GPUS];
+    ns4_gpu_tensor *batch_index_csc_by_tier[NS4_MAX_GPUS];
     ns4_gpu_tensor *batch_indexer_q_by_tier[NS4_MAX_GPUS];
     ns4_gpu_tensor *batch_indexer_weights_by_tier[NS4_MAX_GPUS];
     ns4_gpu_tensor *batch_heads_by_tier[NS4_MAX_GPUS];
@@ -13312,6 +13324,8 @@ typedef struct {
     X(batch_indexer_q)                      \
     X(batch_comp_sc)                        \
     X(batch_comp_kv)                        \
+    X(batch_index_ckv)                      \
+    X(batch_index_csc)                      \
     X(batch_kv)                             \
     X(batch_kv_raw)                         \
     X(batch_q)                              \
@@ -13423,6 +13437,8 @@ NS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_q)
 NS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_kv_raw)
 NS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_kv)
 NS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_comp_kv)
+NS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_index_ckv)
+NS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_index_csc)
 NS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_comp_sc)
 NS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_indexer_q)
 NS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_indexer_weights)
@@ -15181,6 +15197,8 @@ static bool graph_alloc_raw_cap(
             g->batch_kv_by_tier[t] = ns4_gpu_tensor_alloc_ptr_on(t, pc * NS4_N_HEAD_DIM * sizeof(float));
             g->batch_comp_kv_by_tier[t] = ns4_gpu_tensor_alloc_ptr_on(t, pc * comp_width_max * sizeof(float));
             g->batch_comp_sc_by_tier[t] = ns4_gpu_tensor_alloc_ptr_on(t, pc * comp_width_max * sizeof(float));
+            g->batch_index_ckv_by_tier[t] = ns4_gpu_tensor_alloc_ptr_on(t, pc * 2u * NS4_N_INDEXER_HEAD_DIM * sizeof(float));
+            g->batch_index_csc_by_tier[t] = ns4_gpu_tensor_alloc_ptr_on(t, pc * 2u * NS4_N_INDEXER_HEAD_DIM * sizeof(float));
             g->batch_indexer_q_by_tier[t] = ns4_gpu_tensor_alloc_ptr_on(t, pc * indexer_q_dim * sizeof(float));
             g->batch_indexer_weights_by_tier[t] = ns4_gpu_tensor_alloc_ptr_on(t, pc * NS4_N_INDEXER_HEAD * sizeof(float));
             g->batch_heads_by_tier[t] = ns4_gpu_tensor_alloc_ptr_on(t, pc * q_dim * sizeof(float));
@@ -15274,6 +15292,7 @@ static bool graph_alloc_raw_cap(
             g->batch_qr_by_tier[t] && g->batch_qr_norm_by_tier[t] && g->batch_q_by_tier[t] &&
             g->batch_kv_raw_by_tier[t] && g->batch_kv_by_tier[t] &&
             g->batch_comp_kv_by_tier[t] && g->batch_comp_sc_by_tier[t] &&
+            g->batch_index_ckv_by_tier[t] && g->batch_index_csc_by_tier[t] &&
             g->batch_indexer_q_by_tier[t] && g->batch_indexer_weights_by_tier[t] &&
             g->batch_heads_by_tier[t] && g->batch_attn_low_by_tier[t] && g->batch_attn_out_by_tier[t] &&
             g->batch_group_tmp_by_tier[t] && g->batch_low_tmp_by_tier[t] && g->batch_after_attn_hc_by_tier[t] &&
@@ -17193,6 +17212,18 @@ static bool graph_use_reference_compressor_pair_proj(void) {
     return graph_env_flag("NS4_CUDA_DISABLE_COMPRESSOR_PAIR_PROJ", &cache);
 }
 
+/* The block-sequential compressor kernel replaces the per-row phase's
+ * compressor sections, so it must stand down when the user opted out or
+ * when a graph dump could want the per-row KVcompress emit rows. */
+static bool graph_comp_block_enabled(void) {
+    static int cache = -1;
+    if (cache < 0) {
+        cache = getenv("NS4_CUDA_NO_COMP_BLOCK") == NULL &&
+                getenv("NS4_CUDA_GRAPH_DUMP_PREFIX") == NULL;
+    }
+    return cache != 0;
+}
+
 static bool graph_use_reference_hc_norm_decode(void) {
     static int cache = -1;
     return graph_env_flag("NS4_CUDA_DISABLE_HC_NORM_FUSION", &cache);
@@ -18980,6 +19011,11 @@ static bool graph_encode_decode_layer_phase(
         const uint32_t coff = ratio == 4 ? 2u : 1u;
         const uint32_t comp_width = coff * NS4_N_HEAD_DIM;
         const bool emit = ((pos + 1u) % ratio) == 0u;
+        if (g->spec_comp_update_external) {
+            /* The block-sequential compressor kernel prewrote this row's
+             * frontier store, emit and fp8 quantize for the whole verify
+             * block; layer_n_comp already carries this row's value. */
+        } else {
         if (!layer->attn_compressor_kv || !layer->attn_compressor_gate ||
             !layer->attn_compressor_ape || !layer->attn_compressor_norm ||
             layer->attn_compressor_kv->type != NS4_TENSOR_F16 ||
@@ -19091,8 +19127,14 @@ static bool graph_encode_decode_layer_phase(
             NS4_CUDA_PROFILE_DECODE_STAGE("compressor_commit");
         }
         if (ok && emit) g->layer_n_comp[il]++;
+        }
 
         if (ok && ratio == 4) {
+            if (g->spec_index_update_external) {
+            /* The block-sequential compressor kernel prewrote this row's
+             * indexer projections, frontier store, emit and fp4 mirror;
+             * layer_n_index_comp already carries this row's value. */
+            } else {
             const uint32_t index_width = coff * NS4_N_INDEXER_HEAD_DIM;
             if (!layer->indexer_compressor_kv || !layer->indexer_compressor_gate ||
                 !layer->indexer_compressor_ape || !layer->indexer_compressor_norm ||
@@ -19193,6 +19235,7 @@ static bool graph_encode_decode_layer_phase(
                 NS4_CUDA_PROFILE_DECODE_STAGE("indexer_compressor_qat");
             }
             if (ok && emit) g->layer_n_index_comp[il]++;
+            }
             const uint32_t decode_sparse_threshold =
                 graph_decode_indexer_sparse_threshold(g);
             if (ok &&
@@ -19255,6 +19298,10 @@ static bool graph_encode_decode_layer_phase(
                                                                     g->layer_n_index_comp[il],
                                                                     &decode_index_stage_t0);
                 }
+                if (g->spec_indexer_scan_external) {
+                /* comp_selected for this row arrived precomputed from the
+                 * rows-batched scan + top-k. */
+                } else {
                 if (ok) ok = ns4_gpu_indexer_score_one_tensor(graph_indexer_scores(g),
                                                                 graph_indexer_q(g),
                                                                 graph_indexer_weights(g),
@@ -19283,6 +19330,7 @@ static bool graph_encode_decode_layer_phase(
                                                                     1,
                                                                     g->layer_n_index_comp[il],
                                                                     &decode_index_stage_t0);
+                }
                 }
                 /* Decode used to materialize a dense compressed-row mask and
                  * call the generic gathered FlashAttention wrapper below.
@@ -33082,6 +33130,8 @@ static size_t engine_per_tier_graph_overhead_bytes(const ns4_engine *e) {
     total += pc * (uint64_t)NS4_N_HEAD_DIM * sizeof(float);/* batch_kv_by_tier */
     total += pc * comp_width_max * sizeof(float);          /* batch_comp_kv_by_tier */
     total += pc * comp_width_max * sizeof(float);          /* batch_comp_sc_by_tier */
+    total += pc * 2u * (uint64_t)NS4_N_INDEXER_HEAD_DIM * sizeof(float); /* batch_index_ckv */
+    total += pc * 2u * (uint64_t)NS4_N_INDEXER_HEAD_DIM * sizeof(float); /* batch_index_csc */
     total += pc * indexer_q_dim * sizeof(float);           /* batch_indexer_q_by_tier */
     total += pc * (uint64_t)NS4_N_INDEXER_HEAD * sizeof(float); /* batch_indexer_weights */
     total += pc * q_dim * sizeof(float);                   /* batch_heads_by_tier */
@@ -42567,6 +42617,147 @@ static bool graph_verify_decode_rows_exact(
                         NS4_N_EMBD, NS4_N_INDEXER_HEAD,
                         &attn_norm_view, n_tokens);
         }
+        /* Block-sequential compressor: every frontier store, ratio-4 emit
+         * (with the fp8 quantize for the attn cache, the fp4 mirror encode
+         * for the indexer) and per-row prefix snapshot for the block in ONE
+         * launch per compressor, replacing the per-row store/emit/quantize/
+         * snapshot chains.  The kernel runs the rows in order, so each
+         * row's phase sees exactly the per-row values; rows only prewrite
+         * cache/mirror entries beyond that row's n_comp/n_index_comp, which
+         * nothing reads.  Ratio-128 layers batch stores only (their emit is
+         * the unfused chain) and only for emit-free blocks; their snapshots
+         * keep the async copies below -- rows those catch early are
+         * rewritten before the next emit reads them. */
+        int comp_block = 0;
+        int index_block = 0;
+        uint32_t comp_cum[rows_cap];
+        {
+            uint32_t acc = 0;
+            for (uint32_t r = 0; r < n_tokens; r++) {
+                if (ratio != 0u && (positions[r] + 1u) % ratio == 0u) acc++;
+                comp_cum[r] = acc;
+            }
+        }
+        const uint32_t comp_base = ratio != 0u ? g->layer_n_comp[il] : 0u;
+        const uint32_t index_base = ratio == 4u ? g->layer_n_index_comp[il] : 0u;
+        const uint32_t cap_slots =
+            g->spec_capture_prefixes && n_tokens > 1u
+                ? (n_tokens - 1u < NS4_SPEC_PREFIX_SLOTS ? n_tokens - 1u
+                                                         : (uint32_t)NS4_SPEC_PREFIX_SLOTS)
+                : 0u;
+        if (ok && comp_proj_rows && ratio != 0u && graph_comp_block_enabled() &&
+            !NS4_GPU_ATTN_COMP_CACHE_F16 &&
+            layer->attn_compressor_ape && layer->attn_compressor_norm &&
+            comp_base + comp_cum[n_tokens - 1u] <= g->layer_comp_cap[il] &&
+            (ratio == 4u || comp_cum[n_tokens - 1u] == 0u)) {
+            comp_block = ns4_gpu_compressor_block_rows_tensor(
+                    graph_batch_comp_kv(g), graph_batch_comp_sc(g),
+                    2u * NS4_N_HEAD_DIM,
+                    g->layer_attn_state_kv[il], g->layer_attn_state_score[il],
+                    g->layer_attn_comp_cache[il], NULL,
+                    cap_slots ? g->spec_prefix1_attn_state_kv[il] : NULL,
+                    cap_slots ? g->spec_prefix1_attn_state_score[il] : NULL,
+                    ratio == 4u ? cap_slots : 0u,
+                    model->map, model->size,
+                    layer->attn_compressor_ape->abs_offset,
+                    layer->attn_compressor_ape->type,
+                    layer->attn_compressor_norm->abs_offset,
+                    layer->attn_compressor_norm->type,
+                    NS4_N_HEAD_DIM, ratio, positions[0], n_tokens, comp_base,
+                    NS4_N_ROT, compressed ? (uint32_t)NS4_ROPE_ORIG_CTX : 0u,
+                    freq_base, freq_scale, ext_factor, attn_factor,
+                    NS4_ROPE_YARN_BETA_FAST, NS4_ROPE_YARN_BETA_SLOW,
+                    NS4_RMS_EPS, 1);
+        }
+        if (ok && comp_block && ratio == 4u &&
+            layer->indexer_compressor_kv && layer->indexer_compressor_gate &&
+            layer->indexer_compressor_ape && layer->indexer_compressor_norm &&
+            layer->indexer_compressor_kv->type == NS4_TENSOR_F16 &&
+            layer->indexer_compressor_gate->type == NS4_TENSOR_F16 &&
+            layer->indexer_compressor_kv->dim[0] == NS4_N_EMBD &&
+            layer->indexer_compressor_gate->dim[0] == NS4_N_EMBD &&
+            layer->indexer_compressor_kv->dim[1] == 2u * NS4_N_INDEXER_HEAD_DIM &&
+            layer->indexer_compressor_gate->dim[1] == 2u * NS4_N_INDEXER_HEAD_DIM &&
+            index_base + comp_cum[n_tokens - 1u] <= g->layer_comp_cap[il]) {
+            const uint32_t index_width = 2u * NS4_N_INDEXER_HEAD_DIM;
+            ns4_gpu_tensor ickv_rows, icsc_rows;
+            index_block =
+                graph_borrow_tensor_view(&ickv_rows, graph_batch_index_ckv(g), 0,
+                        (uint64_t)n_tokens * index_width * sizeof(float)) &&
+                graph_borrow_tensor_view(&icsc_rows, graph_batch_index_csc(g), 0,
+                        (uint64_t)n_tokens * index_width * sizeof(float)) &&
+                ns4_gpu_matmul_f16_pair_wide_rows_exact_tensor(
+                        &ickv_rows, &icsc_rows, model->map, model->size,
+                        layer->indexer_compressor_kv->abs_offset,
+                        layer->indexer_compressor_gate->abs_offset,
+                        NS4_N_EMBD, index_width, index_width,
+                        &attn_norm_view, n_tokens) &&
+                ns4_gpu_compressor_block_rows_tensor(
+                        &ickv_rows, &icsc_rows, index_width,
+                        g->layer_index_state_kv[il],
+                        g->layer_index_state_score[il],
+                        graph_index_stage(g), g->layer_index_mirror[il],
+                        cap_slots ? g->spec_prefix1_index_state_kv[il] : NULL,
+                        cap_slots ? g->spec_prefix1_index_state_score[il] : NULL,
+                        cap_slots,
+                        model->map, model->size,
+                        layer->indexer_compressor_ape->abs_offset,
+                        layer->indexer_compressor_ape->type,
+                        layer->indexer_compressor_norm->abs_offset,
+                        layer->indexer_compressor_norm->type,
+                        NS4_N_INDEXER_HEAD_DIM, ratio, positions[0], n_tokens,
+                        index_base,
+                        NS4_N_ROT, compressed ? (uint32_t)NS4_ROPE_ORIG_CTX : 0u,
+                        freq_base, freq_scale, ext_factor, attn_factor,
+                        NS4_ROPE_YARN_BETA_FAST, NS4_ROPE_YARN_BETA_SLOW,
+                        NS4_RMS_EPS, 0);
+        }
+        /* Rows-batched indexer scan + top-k: when every row of the block is
+         * past the sparse threshold and the mirror rows and query batch are
+         * prewritten, one launch trio fills all rows' comp_selected.  Rows
+         * only read mirror rows below their own n_index_comp, so the
+         * prewritten later rows are invisible to earlier rows' scans. */
+        int scan_rows = 0;
+        if (ok && comp_block && index_block && indexer_q_rows &&
+            ratio == 4u && NS4_N_INDEXER_HEAD == 64u &&
+            NS4_N_INDEXER_HEAD_DIM == 128u &&
+            comp_base + comp_cum[0] >
+                graph_decode_indexer_sparse_threshold(g) &&
+            index_base + comp_cum[0] > NS4_N_INDEXER_TOP_K) {
+            uint32_t scan_n_comp[rows_cap];
+            for (uint32_t r = 0; r < n_tokens; r++) {
+                scan_n_comp[r] = index_base + comp_cum[r];
+            }
+            const float index_scale = 1.0f /
+                sqrtf((float)(NS4_N_INDEXER_HEAD_DIM * NS4_N_INDEXER_HEAD));
+            const uint64_t iq_dim =
+                (uint64_t)NS4_N_INDEXER_HEAD * NS4_N_INDEXER_HEAD_DIM;
+            ns4_gpu_tensor iq_scan, iw_scan, sc_scan;
+            scan_rows =
+                graph_borrow_tensor_view(&iq_scan, graph_batch_indexer_q(g),
+                        0, (uint64_t)n_tokens * iq_dim * sizeof(float)) &&
+                graph_borrow_tensor_view(&iw_scan,
+                        graph_batch_indexer_weights(g), 0,
+                        (uint64_t)n_tokens * NS4_N_INDEXER_HEAD *
+                            sizeof(float)) &&
+                graph_borrow_tensor_view(&sc_scan, graph_indexer_scores(g),
+                        0, (uint64_t)g->comp_cap * n_tokens *
+                            sizeof(float)) &&
+                ns4_gpu_indexer_scan_topk_rows_tensor(&sc_scan,
+                        g->comp_cap, &iq_scan, &iw_scan,
+                        g->layer_index_mirror[il], selected_base,
+                        top_k_slots, scan_n_comp, n_tokens,
+                        NS4_N_INDEXER_TOP_K, index_scale);
+        }
+        /* Rows-batched attention: each row's exact one-row call shape is
+         * recorded here as the phase loop runs, and the calls launch as one
+         * flash2+combine pair after the loop (per-row calls in row order as
+         * the fallback).  Relocation is safe in ATTN_OUT+ modes: the
+         * block's raw rows were stored before the loop, comp/mirror rows
+         * are append-only with each desc pinning its row's n_comp, and
+         * nothing inside the loop reads heads. */
+        const bool attn_rows_defer = rows_mode >= NS4_DSPARK_ROWS_ATTN_OUT;
+        ns4_gpu_attn_row_desc attn_rows[rows_cap];
         for (uint32_t r = 0; ok && r < n_tokens; r++) {
             graph_attn_pre_alias alias;
             const uint32_t n_raw =
@@ -42583,6 +42774,13 @@ static bool graph_verify_decode_rows_exact(
             g->comp_selected_by_tier[t] = &row_selected[r];
             g->spec_comp_proj_external = comp_proj_rows != 0;
             g->spec_indexer_q_external = indexer_q_rows != 0;
+            g->spec_comp_update_external = comp_block != 0;
+            g->spec_index_update_external = index_block != 0;
+            g->spec_indexer_scan_external = scan_rows != 0;
+            if (comp_block) g->layer_n_comp[il] = comp_base + comp_cum[r];
+            if (index_block) {
+                g->layer_n_index_comp[il] = index_base + comp_cum[r];
+            }
             ok = graph_bind_attn_pre_batch_row(g, g, layer, r, true, &alias);
             if (ok) {
                 ok = graph_encode_decode_layer_phase(
@@ -42593,6 +42791,9 @@ static bool graph_verify_decode_rows_exact(
             }
             g->spec_comp_proj_external = false;
             g->spec_indexer_q_external = false;
+            g->spec_comp_update_external = false;
+            g->spec_index_update_external = false;
+            g->spec_indexer_scan_external = false;
             const uint32_t n_comp = g->layer_n_comp[il];
             const bool indexed =
                 ratio == 4u &&
@@ -42604,7 +42805,15 @@ static bool graph_verify_decode_rows_exact(
                 : 0u;
             const uint32_t raw_start =
                 graph_raw_start_for_span(g, positions[r], n_raw);
-            if (ok && indexed) {
+            attn_rows[r].pos0 = indexed ? positions[r] : 0u;
+            attn_rows[r].n_raw = n_raw;
+            attn_rows[r].raw_start = raw_start;
+            attn_rows[r].n_comp = n_comp;
+            attn_rows[r].top_k = n_selected;
+            attn_rows[r].window = indexed ? g->raw_window : 0u;
+            attn_rows[r].ratio = indexed ? ratio : 0u;
+            attn_rows[r].indexed = indexed ? 1u : 0u;
+            if (ok && !attn_rows_defer && indexed) {
                 ok = ns4_gpu_attention_indexed_mixed_batch_heads_tensor(
                         graph_heads(g), model->map, model->size,
                         layer->attn_sinks->abs_offset,
@@ -42615,7 +42824,7 @@ static bool graph_verify_decode_rows_exact(
                         g->raw_cap, raw_start, n_comp, n_selected,
                         g->raw_window, ratio, NS4_N_HEAD,
                         NS4_N_HEAD_DIM) != 0;
-            } else if (ok) {
+            } else if (ok && !attn_rows_defer) {
                 ok = ns4_gpu_attention_decode_heads_tensor(
                         graph_heads(g), model->map, model->size,
                         layer->attn_sinks->abs_offset,
@@ -42646,11 +42855,86 @@ static bool graph_verify_decode_rows_exact(
             }
             graph_unbind_attn_pre_batch_row(g, &alias);
             if (ok && r + 1u < n_tokens && r < NS4_SPEC_PREFIX_SLOTS) {
-                ok = graph_capture_prefix_states_fused(g, il, r);
+                /* Snapshots the block kernel already wrote at this row's
+                 * point in its sequence need only the counters recorded;
+                 * anything not folded keeps its copy.  Ratio-128 layers
+                 * always take the copy (attn only) -- with the emit-free
+                 * block guarantee its early image is equivalent. */
+                const bool attn_snap_folded = comp_block != 0 && ratio == 4u;
+                const bool index_snap_folded = index_block != 0;
+                if (g->spec_capture_prefixes) {
+                    if (attn_snap_folded) {
+                        g->spec_prefix_n_comp[r][il] = g->layer_n_comp[il];
+                    }
+                    if (index_snap_folded) {
+                        g->spec_prefix_n_index_comp[r][il] =
+                            g->layer_n_index_comp[il];
+                    }
+                }
+                if (!attn_snap_folded && !index_snap_folded) {
+                    ok = graph_capture_prefix_states_fused(g, il, r);
+                } else if (!attn_snap_folded) {
+                    ok = graph_capture_prefix_attn_state(g, il, r);
+                } else if (ratio == 4u && !index_snap_folded) {
+                    ok = graph_capture_prefix_index_state(g, il, r);
+                }
             }
             g->comp_selected_by_tier[t] = saved_selected;
             g->cur_hc_by_tier[t] = saved_cur_hc;
             g->after_ffn_hc_by_tier[t] = saved_after_ffn_hc;
+        }
+
+        if (ok && attn_rows_defer) {
+            ns4_gpu_tensor heads_rows_view, q_rows_view;
+            int rows_attn =
+                graph_borrow_tensor_view(&heads_rows_view, batch_heads, 0,
+                        (uint64_t)n_tokens * q_dim * sizeof(float)) &&
+                graph_borrow_tensor_view(&q_rows_view, batch_q, 0,
+                        (uint64_t)n_tokens * q_dim * sizeof(float)) &&
+                ns4_gpu_attention_flash2_decode_rows_tensor(
+                        &heads_rows_view, &q_rows_view, q_dim,
+                        model->map, model->size,
+                        layer->attn_sinks->abs_offset,
+                        g->layer_raw_cache[il], g->raw_cap,
+                        g->layer_attn_comp_cache[il],
+                        graph_attn_comp_cache_is_f16(),
+                        selected_base, top_k_slots,
+                        attn_rows, n_tokens, NS4_N_HEAD, NS4_N_HEAD_DIM);
+            for (uint32_t r = 0; ok && !rows_attn && r < n_tokens; r++) {
+                ns4_gpu_tensor heads_row, q_row;
+                ok = graph_borrow_tensor_view(&heads_row, batch_heads,
+                            (uint64_t)r * q_dim * sizeof(float),
+                            (uint64_t)q_dim * sizeof(float)) &&
+                     graph_borrow_tensor_view(&q_row, batch_q,
+                            (uint64_t)r * q_dim * sizeof(float),
+                            (uint64_t)q_dim * sizeof(float));
+                if (!ok) break;
+                if (attn_rows[r].indexed) {
+                    ok = ns4_gpu_attention_indexed_mixed_batch_heads_tensor(
+                            &heads_row, model->map, model->size,
+                            layer->attn_sinks->abs_offset,
+                            &q_row, g->layer_raw_cache[il],
+                            g->layer_attn_comp_cache[il],
+                            graph_attn_comp_cache_is_f16(),
+                            &row_selected[r], 1, attn_rows[r].pos0,
+                            attn_rows[r].n_raw, g->raw_cap,
+                            attn_rows[r].raw_start, attn_rows[r].n_comp,
+                            attn_rows[r].top_k, g->raw_window, ratio,
+                            NS4_N_HEAD, NS4_N_HEAD_DIM) != 0;
+                } else {
+                    ok = ns4_gpu_attention_decode_heads_tensor(
+                            &heads_row, model->map, model->size,
+                            layer->attn_sinks->abs_offset,
+                            &q_row, g->layer_raw_cache[il],
+                            attn_rows[r].n_raw, g->raw_cap,
+                            attn_rows[r].raw_start,
+                            attn_rows[r].n_comp
+                                ? g->layer_attn_comp_cache[il] : NULL,
+                            graph_attn_comp_cache_is_f16(),
+                            attn_rows[r].n_comp, NULL, 0,
+                            NS4_N_HEAD, NS4_N_HEAD_DIM) != 0;
+                }
+            }
         }
 
         if (ok && rows_mode >= NS4_DSPARK_ROWS_ATTN_OUT) {
@@ -42699,7 +42983,28 @@ static bool graph_verify_decode_rows_exact(
                         layer->attn_output_b->abs_offset, low_dim,
                         NS4_N_EMBD, &low_view, n_tokens) != 0;
             }
-            for (uint32_t r = 0; ok && r < n_tokens; r++) {
+            /* The expand+split epilogue is elementwise with per-token
+             * indexing that matches the batch buffers exactly, so in SHARED
+             * mode (nothing else left in this loop) one call covers every
+             * row; the wrapper derives n_tokens from the view size. */
+            int hc_expand_rows = 0;
+            if (ok && rows_mode >= NS4_DSPARK_ROWS_SHARED) {
+                ns4_gpu_tensor hc_all, out_all, cur_all, split_all;
+                hc_expand_rows =
+                    graph_borrow_tensor_view(&hc_all,
+                            graph_batch_after_attn_hc(g), 0,
+                            (uint64_t)n_tokens * hc_dim * sizeof(float)) &&
+                    graph_borrow_tensor_view(&out_all,
+                            graph_batch_attn_out(g), 0,
+                            (uint64_t)n_tokens * NS4_N_EMBD * sizeof(float)) &&
+                    graph_borrow_tensor_view(&cur_all, cur_base, 0,
+                            (uint64_t)n_tokens * hc_dim * sizeof(float)) &&
+                    graph_borrow_tensor_view(&split_all, batch_split, 0,
+                            (uint64_t)n_tokens * mix_hc * sizeof(float)) &&
+                    ns4_gpu_hc_expand_split_tensor(&hc_all, &out_all,
+                            &cur_all, &split_all, NS4_N_EMBD, NS4_N_HC);
+            }
+            for (uint32_t r = 0; ok && !hc_expand_rows && r < n_tokens; r++) {
                 graph_attn_pre_alias alias;
                 ns4_gpu_tensor out_row, hc_row, split_row;
                 ok = graph_borrow_tensor_view(&row_cur[r], cur_base,
@@ -42875,7 +43180,41 @@ static bool graph_verify_decode_rows_exact(
                                     NS4_N_EMBD, NS4_N_EXPERT,
                                     &ffn_norm_view, n_tokens);
                     }
-                    for (uint32_t r = 0; bok && r < n_tokens; r++) {
+                    /* Selection batches too when the logits already sit in
+                     * the batch layout: the batch wrapper runs the same
+                     * warp-topk program per token (its tokens array is
+                     * hash-only, unused by the learned router). */
+                    int router_select_rows = 0;
+                    if (bok && router_logits_rows) {
+                        ns4_gpu_tensor sel_all, wts_all, logits_all, probs_all;
+                        router_select_rows =
+                            graph_borrow_tensor_view(&sel_all,
+                                    graph_batch_router_selected(g), 0,
+                                    (uint64_t)n_tokens * sel_row_bytes) &&
+                            graph_borrow_tensor_view(&wts_all,
+                                    graph_batch_router_weights(g), 0,
+                                    (uint64_t)n_tokens * wts_row_bytes) &&
+                            graph_borrow_tensor_view(&logits_all,
+                                    graph_batch_router_logits(g), 0,
+                                    (uint64_t)n_tokens * NS4_N_EXPERT *
+                                        sizeof(float)) &&
+                            graph_borrow_tensor_view(&probs_all,
+                                    graph_batch_router_probs(g), 0,
+                                    (uint64_t)n_tokens * NS4_N_EXPERT *
+                                        sizeof(float)) &&
+                            ns4_gpu_router_select_batch_tensor(&sel_all,
+                                    &wts_all, &probs_all,
+                                    model->map, model->size,
+                                    layer->ffn_exp_probs_b ?
+                                        layer->ffn_exp_probs_b->abs_offset : 0,
+                                    0, 0, 0, 0,
+                                    layer->ffn_exp_probs_b != NULL, false,
+                                    &logits_all, NULL,
+                                    NS4_N_EXPERT, NS4_N_EXPERT_USED,
+                                    NS4_EXPERT_WEIGHT_SCALE, n_tokens);
+                    }
+                    for (uint32_t r = 0; bok && !router_select_rows &&
+                                         r < n_tokens; r++) {
                         ns4_gpu_tensor ffn_norm_row, sel_row, wts_row;
                         ns4_gpu_tensor logits_row;
                         bok = graph_borrow_tensor_view(&ffn_norm_row,

@@ -453,6 +453,9 @@ static int g_tt_scratch_device = -1;
  * scan.  Freed in ns4_gpu_cleanup next to the other persistent scratches. */
 static unsigned char *g_indexer_qm_scratch;
 static int g_indexer_qm_scratch_device = -1;
+/* Same mirror for the rows verifier: up to 8 rows' worth of q codes. */
+static unsigned char *g_indexer_qm_rows_scratch;
+static int g_indexer_qm_rows_scratch_device = -1;
 /* 256-bin pass-0 histogram the int scan pre-builds for the top-k radix
  * select; the (scores ptr, n_comp) tag says whether it matches the scores the
  * next topk call will see. */
@@ -2905,6 +2908,12 @@ extern "C" void ns4_gpu_cleanup(void) {
             (void)cudaFree(g_indexer_qm_scratch);
             g_indexer_qm_scratch = NULL;
             g_indexer_qm_scratch_device = -1;
+        }
+        if (g_indexer_qm_rows_scratch &&
+            g_indexer_qm_rows_scratch_device == c->device_id) {
+            (void)cudaFree(g_indexer_qm_rows_scratch);
+            g_indexer_qm_rows_scratch = NULL;
+            g_indexer_qm_rows_scratch_device = -1;
         }
         if (g_topk_hist_scratch &&
             g_topk_hist_scratch_device == c->device_id) {
@@ -11307,6 +11316,299 @@ static void attention_flash_decode_combine_kernel(
  * fd_row_geom / fd_compute_geom, so it has to be included after them. */
 #include "cuda/flash2_decode.cuh"
 
+/* Rows twins of the flash2 decode pair: one launch runs every verify row's
+ * attention, with blockIdx.z selecting the row and each z-slice executing
+ * exactly the one-row grid's work with that row's parameters (its own split
+ * count included), so per-row values are bit-identical by construction. */
+static constexpr uint32_t kFD2RowsMax = 8u;
+
+/* Mirrors the public `ns4_gpu_attn_row_desc` decl in ns4_gpu.h (this file
+ * does not include that header by project convention). */
+typedef struct {
+    uint32_t pos0;
+    uint32_t n_raw;
+    uint32_t raw_start;
+    uint32_t n_comp;
+    uint32_t top_k;
+    uint32_t window;
+    uint32_t ratio;
+    uint32_t indexed;
+} ns4_gpu_attn_row_desc;
+
+struct fd2_rows_desc {
+    const float *q;
+    float *heads;
+    const int32_t *topk;
+    float *part_o;
+    float2 *part_ml;
+    uint32_t pos0, n_raw, raw_start, n_comp, top_k, window, ratio, n_split;
+};
+struct fd2_rows_args {
+    fd2_rows_desc row[kFD2RowsMax];
+};
+
+__global__ static void __launch_bounds__(kFD2Threads, 2)
+attention_flash2_decode_rows_kernel(
+        fd2_rows_args args,
+        const float *raw_kv,
+        const float *comp_kv,
+        uint32_t n_head,
+        uint32_t raw_cap,
+        uint32_t n_rows) {
+    __shared__ half  qs[kFD2Heads * kFD2Dim];
+    __shared__ half  ks[kFD2Tile * kFD2Dim];
+    __shared__ float sp[2][kFD2Heads][kFD2Tile];   /* QK partials, per k-half */
+    __shared__ half  ps[kFD2Heads * kFD2PStride];
+    __shared__ float m_s[kFD2Heads], l_s[kFD2Heads], a_s[kFD2Heads];
+    __shared__ uint32_t valid_s[kFD2Tile];
+
+    if (blockIdx.z >= n_rows) return;
+    const fd2_rows_desc rd = args.row[blockIdx.z];
+    const float *q = rd.q;
+    float *part_o = rd.part_o;
+    float2 *part_ml = rd.part_ml;
+    const int32_t *topk = rd.topk;
+    const uint32_t n_split = rd.n_split;
+
+    const uint32_t tid   = threadIdx.x;
+    const uint32_t lane  = tid & 31u;
+    const uint32_t warp  = tid >> 5u;
+    const uint32_t head0 = blockIdx.x * kFD2Heads;
+    const uint32_t split = blockIdx.y;
+    if (split >= n_split) return;
+
+    const fd_row_geom geom = fd_compute_geom(
+        rd.pos0, rd.n_raw, rd.n_comp, rd.top_k, rd.window, rd.ratio,
+        topk != NULL);
+
+    const uint32_t tiles_total = (geom.n_score + kFD2Tile - 1u) / kFD2Tile;
+    const uint32_t tiles_per   = (tiles_total + n_split - 1u) / n_split;
+    const uint32_t row_begin   = split * tiles_per * kFD2Tile;
+    uint32_t row_end = row_begin + tiles_per * kFD2Tile;
+    if (row_end > geom.n_score) row_end = geom.n_score;
+
+    /* ---- stage Q for this block's 16 heads, once ---- */
+    for (uint32_t idx = tid; idx < kFD2Heads * kFD2Chunks; idx += kFD2Threads) {
+        const uint32_t h = idx / kFD2Chunks;
+        const uint32_t c = idx % kFD2Chunks;
+        const uint32_t gh = head0 + h;
+        if (gh < n_head) {
+            fd2_store_chunk(qs, h, c, q + (uint64_t)gh * kFD2Dim + c * kFD2ChunkHalves);
+        } else {
+            fd2_store_chunk_zero(qs, h, c);
+        }
+    }
+
+    float o_acc[kFD2PvNTiles][4];
+#pragma unroll
+    for (uint32_t t = 0; t < kFD2PvNTiles; t++)
+#pragma unroll
+        for (uint32_t l = 0; l < 4u; l++) o_acc[t][l] = 0.0f;
+
+    if (tid < kFD2Heads) { m_s[tid] = -INFINITY; l_s[tid] = 0.0f; }
+
+    const float scale = rsqrtf((float)kFD2Dim);
+    const uint32_t qk_ntile = warp >> 1u;          /* 0..1 : 8 rows each   */
+    const uint32_t qk_khalf = warp & 1u;           /* 0..1 : 256 dims each */
+
+    for (uint32_t row0 = row_begin; row0 < row_end; row0 += kFD2Tile) {
+        const uint32_t nr = row_end - row0 < kFD2Tile ? row_end - row0 : kFD2Tile;
+        __syncthreads();
+
+        /* ---- stage KV rows (raw ring, then top-k / dense compressed) ---- */
+        for (uint32_t idx = tid; idx < kFD2Tile * kFD2Chunks; idx += kFD2Threads) {
+            const uint32_t r = idx / kFD2Chunks;
+            const uint32_t c = idx % kFD2Chunks;
+            uint32_t ok = 0u;
+            const float *base = NULL;
+            uint32_t src = 0u;
+            if (r < nr) {
+                const uint32_t gr = row0 + r;
+                if (gr < geom.raw_count) {
+                    src = (rd.raw_start + geom.raw_first_idx + gr) % raw_cap;
+                    base = raw_kv;
+                    ok = 1u;
+                } else {
+                    const uint32_t slot = gr - geom.raw_count;
+                    const int32_t cc = topk ? topk[slot] : (int32_t)slot;
+                    ok = (cc >= 0 && (uint32_t)cc < geom.visible_comp) ? 1u : 0u;
+                    src = ok ? (uint32_t)cc : 0u;
+                    base = comp_kv;
+                }
+            }
+            if (c == 0u) valid_s[r] = ok;
+            if (ok) {
+                fd2_store_chunk(ks, r, c, base + (uint64_t)src * kFD2Dim + c * kFD2ChunkHalves);
+            } else {
+                fd2_store_chunk_zero(ks, r, c);
+            }
+        }
+        /* zero both score partial planes before the MMA writes land */
+        for (uint32_t idx = tid; idx < 2u * kFD2Heads * kFD2Tile; idx += kFD2Threads) {
+            sp[idx / (kFD2Heads * kFD2Tile)][(idx / kFD2Tile) % kFD2Heads][idx % kFD2Tile] = 0.0f;
+        }
+        __syncthreads();
+
+        /* ---- S = Q * K^T on tensor cores ---- */
+        {
+            float s_frag[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            const unsigned q_base = fd2_smem_addr(qs);
+            const unsigned k_base = fd2_smem_addr(ks);
+            const uint32_t a_row = lane & 15u;              /* head    */
+            const uint32_t a_half = lane >> 4u;             /* k half  */
+            const uint32_t b_row = qk_ntile * 8u + (lane & 7u);   /* kv row */
+            const uint32_t b_half = (lane >> 3u) & 1u;
+            const uint32_t ksteps = (kFD2Dim / 16u) / 2u;   /* 16 per k-half */
+#pragma unroll 4
+            for (uint32_t kt = 0; kt < ksteps; kt++) {
+                const uint32_t kchunk = (qk_khalf * ksteps + kt) * 2u;
+                uint32_t a[4], b[2];
+                fd2_ldmatrix_x4(a, q_base + fd2_off_bytes(a_row, kchunk + a_half));
+                fd2_ldmatrix_x2(b, k_base + fd2_off_bytes(b_row, kchunk + b_half));
+                fd2_mma(s_frag, a, b);
+            }
+#pragma unroll
+            for (uint32_t l = 0; l < 4u; l++) {
+                const uint32_t i = fd2_c_i(lane, l);
+                const uint32_t j = qk_ntile * 8u + fd2_c_j(lane, l);
+                sp[qk_khalf][i][j] = s_frag[l];
+            }
+        }
+        __syncthreads();
+
+        /* ---- online softmax, one lane per head ---- */
+        if (warp == 0u && lane < kFD2Heads) {
+            const uint32_t h = lane;
+            float tile_max = -INFINITY;
+            float s_row[kFD2Tile];
+#pragma unroll
+            for (uint32_t r = 0; r < kFD2Tile; r++) {
+                float v = (r < nr && valid_s[r])
+                              ? (sp[0][h][r] + sp[1][h][r]) * scale : -INFINITY;
+                s_row[r] = v;
+                tile_max = fmaxf(tile_max, v);
+            }
+            const float m_old = m_s[h];
+            const float m_new = fmaxf(m_old, tile_max);
+            const float alpha = (m_old == -INFINITY) ? 0.0f : __expf(m_old - m_new);
+            float l_add = 0.0f;
+            if (tile_max == -INFINITY) {
+                a_s[h] = 1.0f;                     /* nothing to add */
+#pragma unroll
+                for (uint32_t r = 0; r < kFD2Tile; r++) ps[h * kFD2PStride + r] = __float2half(0.0f);
+            } else {
+#pragma unroll
+                for (uint32_t r = 0; r < kFD2Tile; r++) {
+                    const float p = (s_row[r] == -INFINITY) ? 0.0f : __expf(s_row[r] - m_new);
+                    l_add += p;
+                    ps[h * kFD2PStride + r] = __float2half(p);
+                }
+                a_s[h] = alpha;
+                m_s[h] = m_new;
+                l_s[h] = l_s[h] * alpha + l_add;
+            }
+        }
+        __syncthreads();
+
+        /* ---- rescale the running output, then O += P * V ---- */
+        {
+            const unsigned p_base = fd2_smem_addr(ps);
+            const unsigned k_base = fd2_smem_addr(ks);
+            uint32_t a[4];
+            fd2_ldmatrix_x4(a, p_base +
+                            (unsigned)(((lane & 15u) * kFD2PStride + (lane >> 4u) * 8u) * sizeof(half)));
+            const uint32_t v_row = lane & 15u;
+#pragma unroll
+            for (uint32_t t = 0; t < kFD2PvNTiles; t++) {
+                const uint32_t nchunk = warp * kFD2PvNTiles + t;
+#pragma unroll
+                for (uint32_t l = 0; l < 4u; l++) {
+                    o_acc[t][l] *= a_s[fd2_c_i(lane, l)];
+                }
+                uint32_t b[2];
+                fd2_ldmatrix_x2_trans(b, k_base + fd2_off_bytes(v_row, nchunk));
+                fd2_mma(o_acc[t], a, b);
+            }
+        }
+    }
+
+    /* ---- write this split's unnormalised partial ---- */
+    __syncthreads();
+#pragma unroll
+    for (uint32_t t = 0; t < kFD2PvNTiles; t++) {
+        const uint32_t nchunk = warp * kFD2PvNTiles + t;
+#pragma unroll
+        for (uint32_t l = 0; l < 4u; l++) {
+            const uint32_t h = fd2_c_i(lane, l);
+            const uint32_t d = nchunk * 8u + fd2_c_j(lane, l);
+            const uint32_t gh = head0 + h;
+            if (gh < n_head) {
+                part_o[((uint64_t)split * n_head + gh) * kFD2Dim + d] = o_acc[t][l];
+            }
+        }
+    }
+    if (tid < kFD2Heads && head0 + tid < n_head) {
+        part_ml[(uint64_t)split * n_head + head0 + tid] =
+            make_float2(m_s[tid], l_s[tid]);
+    }
+}
+
+__global__ __launch_bounds__(kFDCombDims)
+static void attention_flash_decode_combine_rows_kernel(
+        fd2_rows_args args,
+        const float *sinks,
+        uint32_t n_head,
+        uint32_t n_rows) {
+    /* [n_split] rescale weights, then [n_split] partial denominators. */
+    extern __shared__ float fd_sh[];
+    __shared__ float fd_inv;
+
+    if (blockIdx.z >= n_rows) return;
+    const fd2_rows_desc rd = args.row[blockIdx.z];
+    float *heads = rd.heads;
+    const float *part_o = rd.part_o;
+    const float2 *part_ml = rd.part_ml;
+    const uint32_t n_split = rd.n_split;
+    float *fd_w = fd_sh;
+    float *fd_y = fd_sh + n_split;
+
+    const uint32_t head = blockIdx.x;
+    if (head >= n_head) return;
+    const uint32_t d0 = blockIdx.y * kFDCombDims;
+
+    if (threadIdx.x < 32u) {
+        const uint32_t lane = threadIdx.x;
+        float m = -INFINITY;
+        for (uint32_t s = lane; s < n_split; s += 32u)
+            m = fmaxf(m, part_ml[(uint64_t)s * n_head + head].x);
+        for (uint32_t off = 16u; off; off >>= 1u)
+            m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, off));
+        const float m_max = fmaxf(sinks[head], __shfl_sync(0xffffffffu, m, 0));
+        for (uint32_t s = lane; s < n_split; s += 32u) {
+            const float2 ml = part_ml[(uint64_t)s * n_head + head];
+            fd_w[s] = ml.x == -INFINITY ? 0.0f : expf(ml.x - m_max);
+            fd_y[s] = ml.y;
+        }
+        __syncwarp();
+        if (lane == 0u) {
+            float denom = expf(sinks[head] - m_max);
+            for (uint32_t s = 0; s < n_split; s++) denom += fd_y[s] * fd_w[s];
+            fd_inv = 1.0f / denom;
+        }
+    }
+    __syncthreads();
+
+    const float inv = fd_inv;
+    const uint32_t dend = d0 + kFDCombDims < kFDDim ? d0 + kFDCombDims : kFDDim;
+    for (uint32_t d = d0 + threadIdx.x; d < dend; d += blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t s = 0; s < n_split; s++) {
+            acc += part_o[((uint64_t)s * n_head + head) * kFDDim + d] * fd_w[s];
+        }
+        heads[(uint64_t)head * kFDDim + d] = acc * inv;
+    }
+}
+
 static bool cuda_flash_decode_enabled(void) {
     if (g_quality_mode) return false;
     if (cuda_env_flag_enabled("NS4_CUDA_NO_FLASH_ATTN", 0)) return false;
@@ -11499,6 +11801,208 @@ static int attention_flash2_decode_launch(
     if (!cuda_ok(cudaGetLastError(), "flash2 decode combine launch")) return 0;
     (void)logical_tier;
     return 1;
+}
+
+/* Every verify row's flash2 attention in one kernel pair.  Per-row split
+ * counts, geometry and scratch layout are computed exactly as the one-row
+ * launcher above computes them, so each z-slice reproduces that row's
+ * one-row launch bit for bit.  Returns 0 (caller keeps its per-row loop)
+ * whenever any row could not take the one-row flash2 path. */
+static int attention_flash2_decode_rows_launch(
+        float *heads_base,
+        const float *q_base,
+        uint64_t row_stride_f32,
+        const float *sinks,
+        const float *raw_kv,
+        const float *comp_kv,
+        const int32_t *topk_base,
+        uint32_t topk_row_stride,
+        const ns4_gpu_attn_row_desc *rows,
+        uint32_t n_rows,
+        uint32_t raw_cap,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    if (head_dim != kFD2Dim || n_head == 0u || n_rows == 0u ||
+        n_rows > kFD2RowsMax) {
+        return 0;
+    }
+    if (!cuda_flash2_decode_enabled()) return 0;
+    if (heads_base == NULL || sinks == NULL || q_base == NULL ||
+        raw_kv == NULL || comp_kv == NULL) {
+        return 0;
+    }
+    if (getenv("NS4_CUDA_NO_ATTN_ROWS") != NULL) return 0;
+
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(cuda_decode_stream(), &capture) != cudaSuccess ||
+        capture != cudaStreamCaptureStatusNone) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    const char *split_env = getenv("NS4_CUDA_FLASH_ATTN_SPLIT");
+    long split_override = 0;
+    if (split_env && split_env[0]) {
+        const long v = strtol(split_env, NULL, 10);
+        if (v > 0) split_override = v;
+    }
+
+    fd2_rows_args args;
+    uint64_t off = 0;
+    uint32_t max_split = 0;
+    for (uint32_t r = 0; r < n_rows; r++) {
+        const ns4_gpu_attn_row_desc *d = &rows[r];
+        if (d->n_raw == 0u || raw_cap == 0u || d->raw_start >= raw_cap) return 0;
+        /* Mirror the one-row dispatch for the two verify call shapes: the
+         * dense caller reaches flash2 only when the score buffer fits and
+         * the heads8-online branch would not fire first; the indexed caller
+         * requires a live top-k. */
+        if (d->indexed) {
+            if (d->n_comp == 0u || d->top_k == 0u || d->top_k > 512u ||
+                topk_base == NULL) {
+                return 0;
+            }
+        } else {
+            if (!cuda_attention_score_buffer_fits(d->n_comp)) return 0;
+            if (g_cuda_decode_heads8_online && !g_cuda_no_window_attention) {
+                return 0;
+            }
+        }
+        const int32_t *topk = d->indexed
+            ? topk_base + (uint64_t)r * topk_row_stride : NULL;
+        const fd_row_geom geom = fd_compute_geom(
+            d->pos0, d->n_raw, d->n_comp, d->top_k, d->window, d->ratio,
+            topk != NULL);
+        if (geom.n_score == 0u) return 0;
+        const uint32_t tiles_total = (geom.n_score + kFD2Tile - 1u) / kFD2Tile;
+        const uint32_t tiles_per_split = (kFDRowsPerSplit + kFD2Tile - 1u) / kFD2Tile;
+        uint32_t n_split = (tiles_total + tiles_per_split - 1u) / tiles_per_split;
+        if (split_override > 0) n_split = (uint32_t)split_override;
+        if (n_split < 1u) n_split = 1u;
+        if (n_split > kFDMaxSplit) n_split = kFDMaxSplit;
+        if (n_split > max_split) max_split = n_split;
+
+        fd2_rows_desc *rd = &args.row[r];
+        rd->q = q_base + (uint64_t)r * row_stride_f32;
+        rd->heads = heads_base + (uint64_t)r * row_stride_f32;
+        rd->topk = topk;
+        rd->pos0 = d->pos0;
+        rd->n_raw = d->n_raw;
+        rd->raw_start = d->raw_start;
+        rd->n_comp = d->n_comp;
+        rd->top_k = d->top_k;
+        rd->window = d->window;
+        rd->ratio = d->ratio;
+        rd->n_split = n_split;
+        const uint64_t o_bytes =
+            (uint64_t)n_split * n_head * kFD2Dim * sizeof(float);
+        const uint64_t o_span = (o_bytes + 255ull) & ~255ull;
+        const uint64_t ml_bytes = (uint64_t)n_split * n_head * sizeof(float2);
+        const uint64_t ml_span = (ml_bytes + 255ull) & ~255ull;
+        /* Store spans now, fix up base pointers once the scratch exists. */
+        rd->part_o = (float *)(uintptr_t)off;
+        off += o_span;
+        rd->part_ml = (float2 *)(uintptr_t)off;
+        off += ml_span;
+    }
+
+    int device = -1;
+    if (!cuda_ok(cudaGetDevice(&device), "get device for flash2 rows scratch")) return 0;
+    unsigned char *scratch = (unsigned char *)fd_scratch_ensure(off, device);
+    if (!scratch) return 0;
+    for (uint32_t r = 0; r < n_rows; r++) {
+        args.row[r].part_o = (float *)(scratch + (uintptr_t)args.row[r].part_o);
+        args.row[r].part_ml = (float2 *)(scratch + (uintptr_t)args.row[r].part_ml);
+    }
+
+    cudaStream_t stream = cuda_decode_stream();
+    const dim3 grid((n_head + kFD2Heads - 1u) / kFD2Heads, max_split, n_rows);
+    attention_flash2_decode_rows_kernel<<<grid, kFD2Threads, 0, stream>>>(
+            args, raw_kv, comp_kv, n_head, raw_cap, n_rows);
+    if (!cuda_ok(cudaGetLastError(), "flash2 rows attention launch")) return 0;
+
+    const dim3 comb_grid(n_head, (kFD2Dim + kFDCombDims - 1u) / kFDCombDims, n_rows);
+    attention_flash_decode_combine_rows_kernel
+        <<<comb_grid, kFDCombDims, 2u * max_split * sizeof(float), stream>>>(
+            args, sinks, n_head, n_rows);
+    if (!cuda_ok(cudaGetLastError(), "flash2 rows combine launch")) return 0;
+    return 1;
+}
+
+extern "C" int ns4_gpu_attention_flash2_decode_rows_tensor(
+        ns4_gpu_tensor       *heads_batch,
+        const ns4_gpu_tensor *q_batch,
+        uint64_t                row_stride_f32,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ns4_gpu_tensor *raw_kv,
+        uint32_t                raw_cap,
+        const ns4_gpu_tensor *comp_kv,
+        uint32_t                comp_kv_f16,
+        const ns4_gpu_tensor *topk_batch,
+        uint32_t                topk_row_stride,
+        const ns4_gpu_attn_row_desc *rows,
+        uint32_t                n_rows,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    if (comp_kv_f16 || !heads_batch || !q_batch || !raw_kv || !model_map ||
+        !rows || n_rows == 0u || n_rows > kFD2RowsMax ||
+        sinks_offset > model_size ||
+        (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
+        row_stride_f32 < (uint64_t)n_head * head_dim ||
+        heads_batch->bytes < ((uint64_t)(n_rows - 1u) * row_stride_f32 +
+                              (uint64_t)n_head * head_dim) * sizeof(float) ||
+        q_batch->bytes < ((uint64_t)(n_rows - 1u) * row_stride_f32 +
+                          (uint64_t)n_head * head_dim) * sizeof(float) ||
+        raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float)) {
+        return 0;
+    }
+    uint32_t max_comp = 0;
+    int any_topk = 0;
+    for (uint32_t r = 0; r < n_rows; r++) {
+        if (rows[r].n_comp > max_comp) max_comp = rows[r].n_comp;
+        if (rows[r].indexed) any_topk = 1;
+    }
+    if (max_comp > 0 &&
+        (!comp_kv ||
+         comp_kv->bytes < (uint64_t)max_comp * head_dim * sizeof(float))) {
+        return 0;
+    }
+    if (any_topk) {
+        if (!topk_batch || topk_row_stride == 0u) return 0;
+        uint64_t need = 0;
+        for (uint32_t r = 0; r < n_rows; r++) {
+            if (!rows[r].indexed) continue;
+            const uint64_t end =
+                ((uint64_t)r * topk_row_stride + rows[r].top_k) *
+                sizeof(int32_t);
+            if (end > need) need = end;
+        }
+        if (topk_batch->bytes < need) return 0;
+    }
+    const int logical_tier = ns4_tensor_device_idx(heads_batch);
+    if (ns4_tensor_device_idx(q_batch) != logical_tier ||
+        ns4_tensor_device_idx(raw_kv) != logical_tier ||
+        (max_comp > 0 && ns4_tensor_device_idx(comp_kv) != logical_tier) ||
+        (any_topk && ns4_tensor_device_idx(topk_batch) != logical_tier)) {
+        return 0;
+    }
+    const float *sinks = (const float *)cuda_resolve_weight_ptr(
+            model_map, sinks_offset, (uint64_t)n_head * sizeof(float),
+            logical_tier, "attn_sinks");
+    if (!sinks) return 0;
+    return attention_flash2_decode_rows_launch(
+            (float *)heads_batch->ptr,
+            (const float *)q_batch->ptr,
+            row_stride_f32,
+            sinks,
+            (const float *)raw_kv->ptr,
+            max_comp > 0 ? (const float *)comp_kv->ptr
+                         : (const float *)raw_kv->ptr,
+            any_topk ? (const int32_t *)topk_batch->ptr : NULL,
+            topk_row_stride,
+            rows, n_rows, raw_cap, n_head, head_dim);
 }
 
 __global__ static void attention_indexed_mixed_decode_rows_kernel(
@@ -14053,6 +14557,297 @@ __global__ static void compressor_shift_ratio4_kernel(float *state_kv, float *st
     state_score[half + i] = s;
 }
 
+/* Block-sequential compressor: one verify block's frontier stores, ratio-4
+ * emit chains and prefix-state snapshots for one compressor in a single
+ * launch.  Each stage is the standalone kernel's body verbatim (the store,
+ * the fused emit's pool/rms/rope/fp8/shift stages, the 128-lane
+ * hadamard/fp4 mirror program), run in the exact sequence the per-row
+ * launches were stream-ordered, with __syncthreads at every former launch
+ * boundary -- per-row values and snapshots are bit-identical by
+ * construction.  Emits are the ratio-4 fused chain only; the wrapper
+ * refuses ratio!=4 blocks that contain an emit. */
+__global__ static void compressor_block_rows_kernel(
+        float *state_kv,
+        float *state_score,
+        const float *kv_rows,
+        const float *sc_rows,
+        uint32_t row_stride,
+        const void *ape,
+        uint32_t ape_type,
+        const float *norm_w,
+        float *emit_out,          /* attn: comp cache base; indexer: stage row */
+        unsigned char *mirror,    /* indexer fp4 mirror, NULL for attn */
+        float *cap_kv,
+        float *cap_score,
+        uint32_t cap_slots,
+        uint64_t cap_len,         /* f32 elements per snapshot slot */
+        uint32_t head_dim,
+        uint32_t ratio,
+        uint32_t pos0,
+        uint32_t n_rows,
+        uint32_t emit_row0,
+        uint32_t n_rot,
+        uint32_t n_ctx_orig,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow,
+        float rms_eps,
+        int fp8_quant) {
+    const uint32_t width = (ratio == 4u ? 2u : 1u) * head_dim;
+    const uint32_t tid = threadIdx.x;
+    __shared__ float partial[256];
+    __shared__ float fp8_scratch[64];
+    __shared__ float had_vals[128];
+    __shared__ float had_abs[128];
+    __shared__ unsigned char had_codes[128];
+    uint32_t emits = 0;
+    for (uint32_t r = 0; r < n_rows; r++) {
+        const uint32_t pos = pos0 + r;
+        const uint32_t pos_mod = pos % ratio;
+        const uint32_t dst_row = ratio == 4u ? ratio + pos_mod : pos_mod;
+        if ((width & 3u) == 0 && (row_stride & 3u) == 0 &&
+            ((((uintptr_t)state_kv | (uintptr_t)state_score |
+               (uintptr_t)kv_rows | (uintptr_t)sc_rows) & 15u) == 0)) {
+            /* Element-wise copy and per-element ape add: the wide loads
+             * change nothing about per-element values. */
+            const float4 *kv4 = (const float4 *)(kv_rows + (uint64_t)r * row_stride);
+            const float4 *sc4 = (const float4 *)(sc_rows + (uint64_t)r * row_stride);
+            float4 *dkv4 = (float4 *)(state_kv + (uint64_t)dst_row * width);
+            float4 *dsc4 = (float4 *)(state_score + (uint64_t)dst_row * width);
+            const uint32_t w4 = width >> 2;
+            for (uint32_t j = tid; j < w4; j += blockDim.x) {
+                const uint64_t a = (uint64_t)pos_mod * width + 4ull * j;
+                float4 s = sc4[j];
+                s.x += model_scalar_dev(ape, 0, ape_type, a);
+                s.y += model_scalar_dev(ape, 0, ape_type, a + 1u);
+                s.z += model_scalar_dev(ape, 0, ape_type, a + 2u);
+                s.w += model_scalar_dev(ape, 0, ape_type, a + 3u);
+                dkv4[j] = kv4[j];
+                dsc4[j] = s;
+            }
+        } else {
+            for (uint32_t j = tid; j < width; j += blockDim.x) {
+                state_kv[(uint64_t)dst_row * width + j] =
+                    kv_rows[(uint64_t)r * row_stride + j];
+                state_score[(uint64_t)dst_row * width + j] =
+                    sc_rows[(uint64_t)r * row_stride + j] +
+                    model_scalar_dev(ape, 0, ape_type,
+                                     (uint64_t)pos_mod * width + j);
+            }
+        }
+        __syncthreads();
+        if (ratio == 4u && (pos + 1u) % 4u == 0u) {
+            float *crow = mirror
+                ? emit_out
+                : emit_out + (uint64_t)(emit_row0 + emits) * head_dim;
+            const uint32_t rope_pos = pos + 1u - 4u;
+            for (uint32_t d = tid; d < head_dim; d += blockDim.x) {
+                float vals[8];
+                float scores[8];
+                float max_s = -INFINITY;
+                uint32_t n_cand = 0;
+                for (uint32_t q = 0; q < 4; q++) {
+                    vals[n_cand] = state_kv[(uint64_t)q * width + d];
+                    scores[n_cand] = state_score[(uint64_t)q * width + d];
+                    max_s = fmaxf(max_s, scores[n_cand++]);
+                }
+                for (uint32_t q = 0; q < 4; q++) {
+                    vals[n_cand] = state_kv[(uint64_t)(4u + q) * width + head_dim + d];
+                    scores[n_cand] = state_score[(uint64_t)(4u + q) * width + head_dim + d];
+                    max_s = fmaxf(max_s, scores[n_cand++]);
+                }
+                float den = 0.0f, acc = 0.0f;
+                for (uint32_t i = 0; i < n_cand; i++) {
+                    float w = expf(scores[i] - max_s);
+                    den += w;
+                    acc += vals[i] * w;
+                }
+                crow[d] = den != 0.0f ? acc / den : 0.0f;
+            }
+            __syncthreads();
+            {
+                float sum = 0.0f;
+                for (uint32_t i = tid; i < head_dim; i += blockDim.x) {
+                    float v = crow[i];
+                    sum += v * v;
+                }
+                partial[tid] = sum;
+                __syncthreads();
+                for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+                    if (tid < stride) partial[tid] += partial[tid + stride];
+                    __syncthreads();
+                }
+                const float scale = rsqrtf(partial[0] / (float)head_dim + rms_eps);
+                for (uint32_t i = tid; i < head_dim; i += blockDim.x) {
+                    crow[i] = crow[i] * scale * norm_w[i];
+                }
+            }
+            __syncthreads();
+            {
+                const uint32_t n_nope = head_dim - n_rot;
+                float corr0 = 0.0f, corr1 = 0.0f;
+                if (ext_factor != 0.0f) {
+                    float denom = 2.0f * logf(freq_base);
+                    corr0 = floorf((float)n_rot * logf((float)n_ctx_orig / (beta_fast * 2.0f * (float)M_PI)) / denom);
+                    corr1 = ceilf((float)n_rot * logf((float)n_ctx_orig / (beta_slow * 2.0f * (float)M_PI)) / denom);
+                    corr0 = fmaxf(0.0f, corr0);
+                    corr1 = fminf((float)(n_rot - 1), corr1);
+                }
+                for (uint32_t pair = tid; pair < n_rot / 2u; pair += blockDim.x) {
+                    uint32_t i = pair * 2u;
+                    float theta_extrap = (float)rope_pos * powf(freq_base, -((float)i) / (float)n_rot);
+                    float theta_interp = freq_scale * theta_extrap;
+                    float theta = theta_interp;
+                    float mscale = attn_factor;
+                    if (ext_factor != 0.0f) {
+                        float ramp_mix = rope_yarn_ramp_dev(corr0, corr1, (int)i) * ext_factor;
+                        theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+                        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+                    }
+                    float c = cosf(theta) * mscale;
+                    float s = sinf(theta) * mscale;
+                    float *tail = crow + n_nope;
+                    float x0 = tail[i];
+                    float x1 = tail[i + 1];
+                    tail[i] = x0 * c - x1 * s;
+                    tail[i + 1] = x0 * s + x1 * c;
+                }
+            }
+            __syncthreads();
+            if (fp8_quant) {
+                const uint32_t n_nope = head_dim - n_rot;
+                for (uint32_t off = 0; off < n_nope; off += 64) {
+                    float v = 0.0f;
+                    if (tid < 64u) {
+                        if (off + tid < n_nope) v = crow[off + tid];
+                        fp8_scratch[tid] = off + tid < n_nope ? fabsf(v) : 0.0f;
+                    }
+                    __syncthreads();
+                    for (uint32_t stride = 32; stride > 0; stride >>= 1) {
+                        if (tid < stride) fp8_scratch[tid] = fmaxf(fp8_scratch[tid], fp8_scratch[tid + stride]);
+                        __syncthreads();
+                    }
+                    float scale = exp2f(ceilf(log2f(fmaxf(fp8_scratch[0], 1.0e-4f) / 448.0f)));
+                    if (tid < 64u && off + tid < n_nope) {
+                        float q = dsv4_e4m3fn_dequant_dev(fminf(448.0f, fmaxf(-448.0f, v / scale))) * scale;
+                        crow[off + tid] = q;
+                    }
+                    __syncthreads();
+                }
+            }
+            {
+                const uint64_t half = 4ull * width;
+                if ((half & 3u) == 0 &&
+                    ((((uintptr_t)state_kv | (uintptr_t)state_score) & 15u) == 0)) {
+                    /* Pure copies; vector width is free to choose. */
+                    float4 *kv4 = (float4 *)state_kv;
+                    float4 *sc4 = (float4 *)state_score;
+                    const uint64_t h4 = half >> 2;
+                    for (uint64_t i = tid; i < h4; i += blockDim.x) {
+                        float4 v = kv4[h4 + i];
+                        float4 s = sc4[h4 + i];
+                        kv4[i] = v;
+                        sc4[i] = s;
+                        kv4[h4 + i] = v;
+                        sc4[h4 + i] = s;
+                    }
+                } else {
+                    for (uint64_t i = tid; i < half; i += blockDim.x) {
+                        float v = state_kv[half + i];
+                        float s = state_score[half + i];
+                        state_kv[i] = v;
+                        state_score[i] = s;
+                        state_kv[half + i] = v;
+                        state_score[half + i] = s;
+                    }
+                }
+            }
+            __syncthreads();
+            if (mirror) {
+                /* The 128-lane hadamard/fp4 program with lanes 128..255 idle;
+                 * every barrier stays at top level so all 256 threads meet it. */
+                const uint32_t hlane = tid & 31u;
+                const uint32_t hblock = (tid >> 5u) & 3u;
+                const uint32_t hblock_base = hblock * 32u;
+                float v = 0.0f;
+                if (tid < 128u) had_vals[tid] = crow[tid];
+                __syncthreads();
+                for (uint32_t stride = 1u; stride < 128u; stride <<= 1u) {
+                    if (tid < 128u && (tid & stride) == 0u) {
+                        uint32_t base = (tid & ~(2u * stride - 1u)) + (tid & (stride - 1u));
+                        float a = had_vals[base];
+                        float b = had_vals[base + stride];
+                        had_vals[base] = a + b;
+                        had_vals[base + stride] = a - b;
+                    }
+                    __syncthreads();
+                }
+                if (tid < 128u) {
+                    v = had_vals[tid] * 0.08838834764831845f;
+                    had_abs[tid] = fabsf(v);
+                }
+                __syncthreads();
+                for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
+                    if (tid < 128u && hlane < stride) {
+                        had_abs[hblock_base + hlane] = fmaxf(had_abs[hblock_base + hlane],
+                                                             had_abs[hblock_base + hlane + stride]);
+                    }
+                    __syncthreads();
+                }
+                float scale = 0.0f;
+                if (tid < 128u) {
+                    float amax = fmaxf(had_abs[hblock_base], 7.052966104933725e-38f);
+                    scale = exp2f(ceilf(log2f(amax / 6.0f)));
+                    float clamped = fminf(6.0f, fmaxf(-6.0f, v / scale));
+                    int code = dsv4_e2m1fn_code_dev(clamped);
+                    if (clamped < 0.0f) code |= 8;
+                    crow[tid] = dsv4_e2m1fn_dequant_dev(clamped) * scale;
+                    had_codes[tid] = (unsigned char)code;
+                }
+                __syncthreads();
+                if (tid < 128u) {
+                    unsigned char *mrow = mirror +
+                        (uint64_t)(emit_row0 + emits) * NS4_CUDA_INDEXER_MIRROR_ROW_BYTES;
+                    if (tid < 64u) {
+                        mrow[tid] = (unsigned char)((had_codes[2u * tid] & 0xFu) |
+                                                    ((had_codes[2u * tid + 1u] & 0xFu) << 4u));
+                    }
+                    if (hlane == 0u) ((float *)(mrow + 64u))[hblock] = scale;
+                }
+                __syncthreads();
+            }
+            emits++;
+        }
+        if (cap_kv && r < cap_slots) {
+            /* Snapshot is a plain copy, so vector width is free to choose. */
+            const uint64_t coffset = (uint64_t)r * cap_len;
+            if ((cap_len & 3u) == 0 &&
+                ((((uintptr_t)state_kv | (uintptr_t)state_score |
+                   (uintptr_t)(cap_kv + coffset) |
+                   (uintptr_t)(cap_score + coffset)) & 15u) == 0)) {
+                const uint64_t n4 = cap_len >> 2;
+                const float4 *skv4 = (const float4 *)state_kv;
+                const float4 *ssc4 = (const float4 *)state_score;
+                float4 *ckv4 = (float4 *)(cap_kv + coffset);
+                float4 *csc4 = (float4 *)(cap_score + coffset);
+                for (uint64_t j = tid; j < n4; j += blockDim.x) {
+                    ckv4[j] = skv4[j];
+                    csc4[j] = ssc4[j];
+                }
+            } else {
+                for (uint64_t j = tid; j < cap_len; j += blockDim.x) {
+                    cap_kv[coffset + j] = state_kv[j];
+                    cap_score[coffset + j] = state_score[j];
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
 __device__ static float softplus_dev(float x) {
     if (x > 20.0f) return x;
     if (x < -20.0f) return expf(x);
@@ -16306,6 +17101,268 @@ __global__ static void indexer_topk_radix_select_kernel(
     }
 }
 
+/* Rows twins of the decode indexer scan + radix top-k: one launch pair for
+ * every verify row, blockIdx.y/x selecting the row and each slice running
+ * the one-row kernel's program with that row's q codes, weights, score row
+ * and visible-comp count -- per-row selections are bit-identical by
+ * construction.  The scan twin drops the histogram side-product; the top-k
+ * twin therefore always runs its full pass-0 count, which the one-row
+ * prehist merely precomputed (counts are counts: selection unchanged). */
+struct idx_rows_desc {
+    const unsigned char *qm;   /* this row's 64 reencoded q rows */
+    const float *weights;
+    float *scores;
+    uint32_t *selected;
+    uint32_t n_comp;
+};
+struct idx_rows_args {
+    idx_rows_desc row[kFD2RowsMax];
+};
+
+__global__ static void indexer_score_one_int_rows_kernel(
+        idx_rows_args args,
+        const unsigned char *k_mirror,
+        float scale,
+        uint32_t n_rows) {
+    if (blockIdx.y >= n_rows) return;
+    const idx_rows_desc rd = args.row[blockIdx.y];
+    float *scores = rd.scores;
+    const unsigned char *q_mirror = rd.qm;
+    const float *weights = rd.weights;
+    const uint32_t n_comp = rd.n_comp;
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t col = tid & 31u;
+    const uint32_t quarter = tid >> 5u;
+    const uint32_t c0 = blockIdx.x * 32u;
+
+    __shared__ uint32_t qdec[64][32];
+    __shared__ float qsc[64][4];
+    __shared__ float tail[32][12];
+
+    for (uint32_t i = tid; i < 64u * 32u; i += 128u) {
+        const uint32_t r = i >> 5u, wd = i & 31u;
+        const unsigned char *mrow = q_mirror +
+            (uint64_t)r * NS4_CUDA_INDEXER_MIRROR_ROW_BYTES;
+        const unsigned char b0 = mrow[2u * wd];
+        const unsigned char b1 = mrow[2u * wd + 1u];
+        const int v0 = e2m1_nibble_to_i8(b0 & 0xFu);
+        const int v1 = e2m1_nibble_to_i8(b0 >> 4u);
+        const int v2 = e2m1_nibble_to_i8(b1 & 0xFu);
+        const int v3 = e2m1_nibble_to_i8(b1 >> 4u);
+        qdec[r][wd] = (uint32_t)(v0 & 0xFF) | ((uint32_t)(v1 & 0xFF) << 8) |
+                      ((uint32_t)(v2 & 0xFF) << 16) | ((uint32_t)(v3 & 0xFF) << 24);
+        if (wd < 4u) qsc[r][wd] = ((const float *)(mrow + 64u))[wd] * 0.5f;
+    }
+    __syncthreads();
+
+    const uint32_t c = c0 + col;
+    if (c >= n_comp) return;
+
+    uint32_t kdec[32];
+    float ksc[4];
+    {
+        const unsigned char *mrow = k_mirror +
+            (uint64_t)c * NS4_CUDA_INDEXER_MIRROR_ROW_BYTES;
+        #pragma unroll
+        for (uint32_t wd = 0; wd < 32u; wd++) {
+            const unsigned char b0 = mrow[2u * wd];
+            const unsigned char b1 = mrow[2u * wd + 1u];
+            const int v0 = e2m1_nibble_to_i8(b0 & 0xFu);
+            const int v1 = e2m1_nibble_to_i8(b0 >> 4u);
+            const int v2 = e2m1_nibble_to_i8(b1 & 0xFu);
+            const int v3 = e2m1_nibble_to_i8(b1 >> 4u);
+            kdec[wd] = (uint32_t)(v0 & 0xFF) | ((uint32_t)(v1 & 0xFF) << 8) |
+                       ((uint32_t)(v2 & 0xFF) << 16) | ((uint32_t)(v3 & 0xFF) << 24);
+        }
+        #pragma unroll
+        for (uint32_t g = 0; g < 4u; g++)
+            ksc[g] = ((const float *)(mrow + 64u))[g] * 0.5f;
+    }
+
+    float total = 0.0f;
+    float t4[4];
+    #pragma unroll 1
+    for (uint32_t i = 0; i < 16u; i++) {
+        const uint32_t h = quarter * 16u + i;
+        int acc[4] = {0, 0, 0, 0};
+        #pragma unroll
+        for (uint32_t g = 0; g < 4u; g++) {
+            #pragma unroll
+            for (uint32_t wd = 0; wd < 8u; wd++) {
+                acc[g] = __dp4a((int)kdec[g * 8u + wd],
+                                (int)qdec[h][g * 8u + wd], acc[g]);
+            }
+        }
+        float dot = __fadd_rn(__fadd_rn(__fadd_rn(
+                (float)acc[0] * __fmul_rn(ksc[0], qsc[h][0]),
+                (float)acc[1] * __fmul_rn(ksc[1], qsc[h][1])),
+                (float)acc[2] * __fmul_rn(ksc[2], qsc[h][2])),
+                (float)acc[3] * __fmul_rn(ksc[3], qsc[h][3]));
+        t4[i & 3u] = __fmul_rn(__fmul_rn(fmaxf(dot, 0.0f), __ldg(weights + h)), scale);
+        if ((i & 3u) == 3u) {
+            const float g4 = __fadd_rn(__fadd_rn(__fadd_rn(t4[0], t4[1]), t4[2]), t4[3]);
+            if (quarter == 0u) total = __fadd_rn(total, g4);
+            else tail[col][(quarter - 1u) * 4u + (i >> 2u)] = g4;
+        }
+    }
+    __syncthreads();
+    if (quarter == 0u) {
+        #pragma unroll
+        for (uint32_t j = 0; j < 12u; j++) total = __fadd_rn(total, tail[col][j]);
+        scores[c] = total;
+    }
+}
+
+template <uint32_t CAP, uint32_t NT>
+__global__ static void indexer_topk_radix_select_rows_kernel(
+        idx_rows_args args,
+        uint32_t top_k,
+        uint32_t n_rows) {
+    const uint32_t t = blockIdx.x;
+    if (t >= n_rows) return;
+    const idx_rows_desc rdsc = args.row[t];
+    const uint32_t tid = threadIdx.x;
+    const float *__restrict__ row = rdsc.scores;
+    uint32_t *__restrict__ out = rdsc.selected;
+    const uint32_t n_comp = rdsc.n_comp;
+
+    __shared__ uint32_t hist[256];
+    __shared__ uint64_t buf[CAP];
+    __shared__ uint32_t s_digit, s_above, s_ndigit, s_count;
+
+    /* `above` counts elements strictly greater than the prefix, `need` how
+     * many of the equal-prefix ones are still wanted; above + need == top_k
+     * throughout, and need <= n_digit, so above + n_digit >= top_k. */
+    uint32_t prefix = 0u, hi_mask = 0u, above = 0u, need = top_k, n_digit = 0u;
+    for (int pass = 0; pass < 4; ++pass) {
+        const int shift = 24 - 8 * pass;
+        for (uint32_t i = tid; i < 256u; i += NT) hist[i] = 0u;
+        __syncthreads();
+        for (uint32_t i = tid; i < n_comp; i += NT) {
+            const uint32_t k = topk_sortable_key(row[i]);
+            if ((k & hi_mask) == prefix) atomicAdd(&hist[(k >> shift) & 0xffu], 1u);
+        }
+        __syncthreads();
+        /* Suffix-scan the bins from the top and stop where the running count
+         * first reaches `need`. One warp: lane l owns the eight bins ending at
+         * 255-8l and a shuffle scan supplies its running total, so exactly one
+         * lane straddles the crossing and finds its own bin. Serially on
+         * thread 0 this cost ~2.5 us a pass, a fifth of the kernel. */
+        if (tid < 32u) {
+            uint32_t local[8], sum = 0u;
+            for (uint32_t q = 0u; q < 8u; ++q) {
+                local[q] = hist[255u - (tid * 8u + q)];
+                sum += local[q];
+            }
+            uint32_t v = sum;
+            for (uint32_t off = 1u; off < 32u; off <<= 1u) {
+                const uint32_t o = __shfl_up_sync(0xffffffffu, v, off);
+                if (tid >= off) v += o;
+            }
+            const uint32_t excl = v - sum;
+            if (excl < need && excl + sum >= need) {
+                uint32_t acc = excl;
+                for (uint32_t q = 0u; q < 8u; ++q) {
+                    if (acc + local[q] >= need) {
+                        s_digit  = 255u - (tid * 8u + q);
+                        s_above  = acc;
+                        s_ndigit = local[q];
+                        break;
+                    }
+                    acc += local[q];
+                }
+            }
+        }
+        __syncthreads();
+        above  += s_above;
+        need   -= s_above;
+        prefix |= s_digit << shift;
+        hi_mask = (shift == 0) ? 0xffffffffu : (hi_mask | (0xffu << shift));
+        n_digit = s_ndigit;
+        if (above + n_digit <= CAP) break;
+    }
+
+    /* Common exit: every element with key >= prefix fits the buffer, so one
+     * sort settles the selection and the tie order together. */
+    if (above + n_digit <= CAP) {
+        if (tid == 0) s_count = 0u;
+        __syncthreads();
+        for (uint32_t i = tid; i < n_comp; i += NT) {
+            const uint32_t k = topk_sortable_key(row[i]);
+            if (k >= prefix) {
+                const uint32_t p = atomicAdd(&s_count, 1u);
+                if (p < CAP) buf[p] = topk_composite(k, i);
+            }
+        }
+        __syncthreads();
+        const uint32_t m = s_count < CAP ? s_count : CAP;
+        uint32_t m2 = 1u;
+        while (m2 < m) m2 <<= 1u;
+        if (m2 < top_k) m2 = top_k;
+        for (uint32_t i = m + tid; i < m2; i += NT) buf[i] = 0ull;
+        __syncthreads();
+        topk_bitonic_sort_desc<NT>(buf, m2, tid);
+        for (uint32_t i = tid; i < top_k; i += NT) out[i] = topk_composite_index(buf[i]);
+        return;
+    }
+
+    /* Degenerate exit: more than CAP elements share the whole 32-bit key, so
+     * the cut runs through a run of identical scores and the tie-break is
+     * purely by index. The `above` strictly-greater ones (fewer than top_k)
+     * sort as usual; the rest are the `need` smallest indices with key ==
+     * prefix, which is also their output order because equal scores rank by
+     * ascending index. */
+    if (tid == 0) s_count = 0u;
+    __syncthreads();
+    for (uint32_t i = tid; i < n_comp; i += NT) {
+        const uint32_t k = topk_sortable_key(row[i]);
+        if (k > prefix) {
+            const uint32_t p = atomicAdd(&s_count, 1u);
+            if (p < CAP) buf[p] = topk_composite(k, i);
+        }
+    }
+    __syncthreads();
+    {
+        uint32_t m2 = 1u;
+        while (m2 < above) m2 <<= 1u;
+        if (m2 < 2u) m2 = 2u;
+        for (uint32_t i = above + tid; i < m2; i += NT) buf[i] = 0ull;
+        __syncthreads();
+        topk_bitonic_sort_desc<NT>(buf, m2, tid);
+    }
+    for (uint32_t i = tid; i < above; i += NT) out[i] = topk_composite_index(buf[i]);
+
+    __shared__ uint32_t s_warp[NT / 32u];
+    __shared__ uint32_t s_base, s_tile;
+    if (tid == 0) { s_base = 0u; s_tile = 0u; }
+    __syncthreads();
+    for (uint32_t tile = 0u; tile < n_comp; tile += NT) {
+        const uint32_t i = tile + tid;
+        const uint32_t pred =
+            (i < n_comp && topk_sortable_key(row[i]) == prefix) ? 1u : 0u;
+        const uint32_t lane = tid & 31u, warp = tid >> 5u;
+        const uint32_t mask = __ballot_sync(0xffffffffu, pred);
+        if (lane == 0u) s_warp[warp] = (uint32_t)__popc(mask);
+        __syncthreads();
+        if (tid == 0) {
+            uint32_t acc = 0u;
+            for (uint32_t w = 0u; w < NT / 32u; ++w) {
+                const uint32_t c = s_warp[w]; s_warp[w] = acc; acc += c;
+            }
+            s_tile = acc;
+        }
+        __syncthreads();
+        const uint32_t rank =
+            s_base + s_warp[warp] + (uint32_t)__popc(mask & ((1u << lane) - 1u));
+        if (pred && rank < need) out[above + rank] = i;
+        __syncthreads();
+        if (tid == 0) s_base += s_tile;
+        __syncthreads();
+        if (s_base >= need) break;
+    }
+}
+
 /* Exact streaming top-512 for wide prefill rows. The threshold is the
  * 512th-best key seen so far, so it can only discard candidates that cannot
  * belong to the final top set. Packing supplies the same value/index total
@@ -16674,6 +17731,99 @@ static int indexer_scores_launch(
                                          n_comp, n_tokens, pos0, n_head,
                                          head_dim, ratio, scale, causal ? 1 : 0);
     return cuda_ok(cudaGetLastError(), "indexer scores launch");
+}
+
+/* Every verify row's indexer scan + top-k in three launches (one reencode
+ * over all rows' q, one rows scan, one rows radix select), bit-identical to
+ * the per-row int-scan chain.  Returns 0 (caller keeps its per-row calls)
+ * when the per-row dispatch would not have taken that chain. */
+extern "C" int ns4_gpu_indexer_scan_topk_rows_tensor(
+        ns4_gpu_tensor       *scores_buf,
+        uint64_t                scores_row_stride,
+        const ns4_gpu_tensor *iq_batch,
+        const ns4_gpu_tensor *iw_batch,
+        const ns4_gpu_tensor *index_mirror,
+        ns4_gpu_tensor       *selected_batch,
+        uint32_t                selected_row_stride,
+        const uint32_t       *n_comp_rows,
+        uint32_t                n_rows,
+        uint32_t                top_k,
+        float                   scale) {
+    if (!scores_buf || !iq_batch || !iw_batch || !index_mirror ||
+        !selected_batch || !n_comp_rows || n_rows == 0u ||
+        n_rows > kFD2RowsMax || top_k == 0u) {
+        return 0;
+    }
+    /* Mirror the per-row dispatch: the int scan must be the live path and
+     * the radix select must be the live top-k tier. */
+    if (!g_cuda_indexer_scan_int) return 0;
+    if (top_k == 1u && !g_cuda_no_top1) return 0;
+    if (top_k > 1024u || g_cuda_no_topk_radix) return 0;
+    if (getenv("NS4_CUDA_NO_SCAN_ROWS") != NULL) return 0;
+    uint32_t max_comp = 0;
+    for (uint32_t r = 0; r < n_rows; r++) {
+        if (n_comp_rows[r] == 0u || top_k > n_comp_rows[r]) return 0;
+        if (n_comp_rows[r] > max_comp) max_comp = n_comp_rows[r];
+        if (scores_row_stride < n_comp_rows[r]) return 0;
+    }
+    if (selected_row_stride < top_k) return 0;
+    if (iq_batch->bytes < (uint64_t)n_rows * 64u * 128u * sizeof(float) ||
+        iw_batch->bytes < (uint64_t)n_rows * 64u * sizeof(float) ||
+        index_mirror->bytes <
+            (uint64_t)max_comp * NS4_CUDA_INDEXER_MIRROR_ROW_BYTES ||
+        scores_buf->bytes < ((uint64_t)(n_rows - 1u) * scores_row_stride +
+                             max_comp) * sizeof(float) ||
+        selected_batch->bytes <
+            ((uint64_t)(n_rows - 1u) * selected_row_stride + top_k) *
+                sizeof(uint32_t)) {
+        return 0;
+    }
+    const int logical_tier = ns4_tensor_device_idx(scores_buf);
+    if (ns4_tensor_device_idx(iq_batch) != logical_tier ||
+        ns4_tensor_device_idx(iw_batch) != logical_tier ||
+        ns4_tensor_device_idx(index_mirror) != logical_tier ||
+        ns4_tensor_device_idx(selected_batch) != logical_tier) {
+        return 0;
+    }
+    if (!g_indexer_qm_rows_scratch) {
+        int device = -1;
+        if (cudaGetDevice(&device) == cudaSuccess &&
+            cudaMalloc((void **)&g_indexer_qm_rows_scratch,
+                       (uint64_t)kFD2RowsMax * 64u *
+                           NS4_CUDA_INDEXER_MIRROR_ROW_BYTES) == cudaSuccess) {
+            g_indexer_qm_rows_scratch_device = device;
+        } else {
+            g_indexer_qm_rows_scratch = NULL;
+            return 0;
+        }
+    }
+    /* q went through the same hadamard-fp4 qat as the cache rows, so the
+     * restore-path re-encode recovers every row's codes exactly. */
+    indexer_mirror_reencode_kernel<<<64u * n_rows, 128, 0,
+                                     cuda_decode_stream()>>>(
+            (const float *)iq_batch->ptr, g_indexer_qm_rows_scratch, 0u,
+            64u * n_rows);
+    if (!cuda_ok(cudaGetLastError(), "indexer rows reencode launch")) return 0;
+    idx_rows_args args;
+    for (uint32_t r = 0; r < n_rows; r++) {
+        args.row[r].qm = g_indexer_qm_rows_scratch +
+            (uint64_t)r * 64u * NS4_CUDA_INDEXER_MIRROR_ROW_BYTES;
+        args.row[r].weights = (const float *)iw_batch->ptr + (uint64_t)r * 64u;
+        args.row[r].scores =
+            (float *)scores_buf->ptr + (uint64_t)r * scores_row_stride;
+        args.row[r].selected =
+            (uint32_t *)selected_batch->ptr +
+            (uint64_t)r * selected_row_stride;
+        args.row[r].n_comp = n_comp_rows[r];
+    }
+    const dim3 scan_grid((max_comp + 31u) / 32u, n_rows, 1);
+    indexer_score_one_int_rows_kernel<<<scan_grid, 128, 0,
+                                        cuda_decode_stream()>>>(
+            args, (const unsigned char *)index_mirror->ptr, scale, n_rows);
+    if (!cuda_ok(cudaGetLastError(), "indexer rows scan launch")) return 0;
+    indexer_topk_radix_select_rows_kernel<1024, 1024>
+        <<<n_rows, 1024, 0, cuda_decode_stream()>>>(args, top_k, n_rows);
+    return cuda_ok(cudaGetLastError(), "indexer rows topk launch");
 }
 
 extern "C" int ns4_gpu_indexer_score_one_tensor(
@@ -19406,6 +20556,153 @@ extern "C" int ns4_gpu_compressor_update_tensor(
     }
     return ok;
 }
+
+/* One verify block's compressor work in a single block-sequential launch:
+ * stores for every row, the ratio-4 fused emit chain (with the fp8 quantize
+ * for the attn cache, or the fp4 mirror encode for the indexer) and the
+ * per-row prefix-state snapshots.  Engages only where the per-row chain
+ * would have used the exact kernels this one embeds; returns 0 so the
+ * caller keeps its per-row loop otherwise.  Ratio!=4 blocks must be
+ * emit-free (their emit path is the unfused pool/norm/rope chain). */
+extern "C" int ns4_gpu_compressor_block_rows_tensor(
+        const ns4_gpu_tensor *kv_rows,
+        const ns4_gpu_tensor *sc_rows,
+        uint32_t              row_stride,
+        ns4_gpu_tensor       *state_kv,
+        ns4_gpu_tensor       *state_score,
+        ns4_gpu_tensor       *emit_out,
+        ns4_gpu_tensor       *mirror,
+        ns4_gpu_tensor       *cap_kv,
+        ns4_gpu_tensor       *cap_score,
+        uint32_t              cap_slots,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                ape_offset,
+        uint32_t                ape_type,
+        uint64_t                norm_offset,
+        uint32_t                norm_type,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        uint32_t                pos0,
+        uint32_t                n_rows,
+        uint32_t                emit_row0,
+        uint32_t                n_rot,
+        uint32_t                n_ctx_orig,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow,
+        float                   rms_eps,
+        int                     fp8_emit) {
+    if (!kv_rows || !sc_rows || !state_kv || !state_score || !model_map ||
+        head_dim == 0 || ratio == 0 || n_rows == 0 ||
+        n_rot > head_dim || (n_rot & 1u) != 0 ||
+        (ape_type != 0u && ape_type != 1u) || norm_type != 0u) {
+        return 0;
+    }
+    if (getenv("NS4_CUDA_NO_COMP_BLOCK") != NULL) return 0;
+    const uint32_t coff = ratio == 4u ? 2u : 1u;
+    const uint32_t width = coff * head_dim;
+    const uint32_t state_rows = coff * ratio;
+    if (row_stride < width) return 0;
+    uint32_t emits = 0;
+    for (uint32_t r = 0; r < n_rows; r++) {
+        if ((pos0 + r + 1u) % ratio == 0u) emits++;
+    }
+    if (emits > 0) {
+        /* Emits embed the fused ratio-4 chain; refuse whenever the per-row
+         * dispatch would not have taken it. */
+        if (ratio != 4u || n_rot == 0 || !emit_out ||
+            getenv("NS4_CUDA_NO_COMP_EMIT_FUSED") != NULL) {
+            return 0;
+        }
+        if (mirror && fp8_emit) return 0;
+    }
+    const uint64_t elem_ape = ape_type == 1u ? 2u : 4u;
+    const uint64_t rows_bytes =
+        ((uint64_t)(n_rows - 1u) * row_stride + width) * sizeof(float);
+    const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
+    const uint64_t ape_bytes = (uint64_t)width * ratio * elem_ape;
+    const uint64_t norm_bytes = (uint64_t)head_dim * sizeof(float);
+    if (ape_offset > model_size || ape_bytes > model_size - ape_offset ||
+        kv_rows->bytes < rows_bytes || sc_rows->bytes < rows_bytes ||
+        state_kv->bytes < state_bytes || state_score->bytes < state_bytes) {
+        return 0;
+    }
+    if (emits > 0) {
+        if (norm_offset > model_size || norm_bytes > model_size - norm_offset) {
+            return 0;
+        }
+        if (mirror) {
+            if (head_dim != 128u ||
+                emit_out->bytes < (uint64_t)head_dim * sizeof(float) ||
+                mirror->bytes < ((uint64_t)emit_row0 + emits) *
+                                NS4_CUDA_INDEXER_MIRROR_ROW_BYTES) {
+                return 0;
+            }
+        } else if (emit_out->bytes <
+                   ((uint64_t)emit_row0 + emits) * head_dim * sizeof(float)) {
+            return 0;
+        }
+    }
+    const uint64_t cap_len = state_kv->bytes / sizeof(float);
+    if (cap_slots > 0) {
+        if (!cap_kv || !cap_score ||
+            state_score->bytes != cap_len * sizeof(float) ||
+            cap_kv->bytes < (uint64_t)cap_slots * cap_len * sizeof(float) ||
+            cap_score->bytes < (uint64_t)cap_slots * cap_len * sizeof(float)) {
+            return 0;
+        }
+    }
+    const int logical_tier = ns4_tensor_device_idx(state_kv);
+    if (ns4_tensor_device_idx(kv_rows) != logical_tier ||
+        ns4_tensor_device_idx(sc_rows) != logical_tier ||
+        ns4_tensor_device_idx(state_score) != logical_tier ||
+        (emits > 0 && ns4_tensor_device_idx(emit_out) != logical_tier) ||
+        (emits > 0 && mirror && ns4_tensor_device_idx(mirror) != logical_tier) ||
+        (cap_slots > 0 && (ns4_tensor_device_idx(cap_kv) != logical_tier ||
+                           ns4_tensor_device_idx(cap_score) != logical_tier))) {
+        return 0;
+    }
+    const char *ape = cuda_resolve_weight_ptr(model_map, ape_offset, ape_bytes,
+                                              logical_tier, "compressor_ape");
+    if (!ape) return 0;
+    const float *nw = NULL;
+    if (emits > 0) {
+        nw = (const float *)cuda_resolve_weight_ptr(model_map, norm_offset,
+                                                    norm_bytes, logical_tier,
+                                                    "compressor emit norm");
+        if (!nw) return 0;
+    }
+    compressor_block_rows_kernel<<<1, 256, 0, cuda_decode_stream()>>>(
+            (float *)state_kv->ptr,
+            (float *)state_score->ptr,
+            (const float *)kv_rows->ptr,
+            (const float *)sc_rows->ptr,
+            row_stride,
+            ape,
+            ape_type,
+            nw,
+            emits > 0 ? (float *)emit_out->ptr : NULL,
+            emits > 0 && mirror ? (unsigned char *)mirror->ptr : NULL,
+            cap_slots > 0 ? (float *)cap_kv->ptr : NULL,
+            cap_slots > 0 ? (float *)cap_score->ptr : NULL,
+            cap_slots,
+            cap_len,
+            head_dim,
+            ratio,
+            pos0,
+            n_rows,
+            emit_row0,
+            n_rot,
+            n_ctx_orig,
+            freq_base, freq_scale, ext_factor, attn_factor,
+            beta_fast, beta_slow, rms_eps,
+            fp8_emit);
+    return cuda_ok(cudaGetLastError(), "compressor block rows launch");
+}
 extern "C" int ns4_gpu_compressor_prefill_tensor(
         ns4_gpu_tensor       *comp_cache,
         ns4_gpu_tensor       *state_kv,
@@ -21552,7 +22849,9 @@ extern "C" int ns4_gpu_router_select_tensor(ns4_gpu_tensor *selected, ns4_gpu_te
 }
 extern "C" int ns4_gpu_router_select_batch_tensor(ns4_gpu_tensor *selected, ns4_gpu_tensor *weights, ns4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ns4_gpu_tensor *logits, const ns4_gpu_tensor *tokens, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens) {
     if (n_expert != 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) return 0;
-    if (!selected || !weights || !probs || !logits || !tokens || !model_map || n_tokens == 0 ||
+    /* tokens feeds only the hash lookup; the learned-router path never
+     * reads it, so callers without per-token ids may pass NULL there. */
+    if (!selected || !weights || !probs || !logits || (hash_mode && !tokens) || !model_map || n_tokens == 0 ||
         n_expert_groups > 1u || n_group_used > 0u ||
         logits->bytes < (uint64_t)n_tokens * 256u * sizeof(float) ||
         probs->bytes < (uint64_t)n_tokens * 256u * sizeof(float) ||
@@ -21574,6 +22873,7 @@ extern "C" int ns4_gpu_router_select_batch_tensor(ns4_gpu_tensor *selected, ns4_
         hash = (const int32_t *)cuda_resolve_weight_ptr(model_map, hash_offset, hash_bytes, logical_tier, "router_hash");
         if (!hash) return 0;
     }
+    const int32_t *tok_ptr = tokens ? (const int32_t *)tokens->ptr : NULL;
     if (getenv("NS4_CUDA_NO_WARP_ROUTER_SELECT") == NULL &&
         getenv("NS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
         dim3 block(32, 4, 1);
@@ -21583,7 +22883,7 @@ extern "C" int ns4_gpu_router_select_batch_tensor(ns4_gpu_tensor *selected, ns4_
                                                                         bias,
                                                                         hash,
                                                                         (const float *)logits->ptr,
-                                                                        (const int32_t *)tokens->ptr,
+                                                                        tok_ptr,
                                                                         0,
                                                                         hash_rows,
                                                                         n_tokens,
@@ -21596,7 +22896,7 @@ extern "C" int ns4_gpu_router_select_batch_tensor(ns4_gpu_tensor *selected, ns4_
                                                          bias,
                                                          hash,
                                                          (const float *)logits->ptr,
-                                                         (const int32_t *)tokens->ptr,
+                                                         tok_ptr,
                                                          0,
                                                          hash_rows,
                                                          n_tokens,
@@ -21609,7 +22909,7 @@ extern "C" int ns4_gpu_router_select_batch_tensor(ns4_gpu_tensor *selected, ns4_
                                               bias,
                                               hash,
                                               (const float *)logits->ptr,
-                                              (const int32_t *)tokens->ptr,
+                                              tok_ptr,
                                               0,
                                               hash_rows,
                                               n_tokens,

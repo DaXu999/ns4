@@ -291,6 +291,25 @@ int ns4_gpu_indexer_topk_tensor(
         uint32_t                n_tokens,
         uint32_t                top_k);
 
+/* Every verify row's indexer scan + top-k in three launches, bit-identical
+ * to the per-row int-scan chain; returns 0 (caller keeps its per-row
+ * calls) when that chain is not the live per-row path.  iq_batch holds
+ * n_rows x 64 x 128 query floats, iw_batch n_rows x 64 weights; row r
+ * scores land at r * scores_row_stride floats and its top-k at
+ * r * selected_row_stride u32s. */
+int ns4_gpu_indexer_scan_topk_rows_tensor(
+        ns4_gpu_tensor       *scores_buf,
+        uint64_t                scores_row_stride,
+        const ns4_gpu_tensor *iq_batch,
+        const ns4_gpu_tensor *iw_batch,
+        const ns4_gpu_tensor *index_mirror,
+        ns4_gpu_tensor       *selected_batch,
+        uint32_t                selected_row_stride,
+        const uint32_t       *n_comp_rows,
+        uint32_t                n_rows,
+        uint32_t                top_k,
+        float                   scale);
+
 int ns4_gpu_indexer_top1_value_tensor(
         ns4_gpu_tensor       *selected,
         ns4_gpu_tensor       *values,
@@ -845,6 +864,83 @@ int ns4_gpu_compressor_store_batch_tensor(
         uint32_t                ratio,
         uint32_t                pos0,
         uint32_t                n_tokens);
+
+/* One verify row's attention call shape, recorded by the rows verifier at
+ * the point the per-row call would have been made.  Dense rows use the
+ * decode caller's single_all convention (pos0/top_k/window/ratio zero);
+ * indexed rows carry the row's position, top-k and window. */
+typedef struct {
+    uint32_t pos0;
+    uint32_t n_raw;
+    uint32_t raw_start;
+    uint32_t n_comp;
+    uint32_t top_k;
+    uint32_t window;
+    uint32_t ratio;
+    uint32_t indexed;
+} ns4_gpu_attn_row_desc;
+
+/* Every verify row's flash2 decode attention in one kernel pair, each row
+ * reproducing its one-row launch bit for bit.  Returns 0 (caller keeps the
+ * per-row calls) when any row could not take the one-row flash2 path.
+ * q/heads rows live at row_stride_f32 floats; indexed rows read their
+ * top-k list at row r * topk_row_stride int32s of topk_batch. */
+int ns4_gpu_attention_flash2_decode_rows_tensor(
+        ns4_gpu_tensor       *heads_batch,
+        const ns4_gpu_tensor *q_batch,
+        uint64_t                row_stride_f32,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ns4_gpu_tensor *raw_kv,
+        uint32_t                raw_cap,
+        const ns4_gpu_tensor *comp_kv,
+        uint32_t                comp_kv_f16,
+        const ns4_gpu_tensor *topk_batch,
+        uint32_t                topk_row_stride,
+        const ns4_gpu_attn_row_desc *rows,
+        uint32_t                n_rows,
+        uint32_t                n_head,
+        uint32_t                head_dim);
+
+/* One verify block's frontier stores, ratio-4 emits (fp8 for the attn
+ * cache, fp4 mirror encode for the indexer) and per-row prefix snapshots
+ * in a single block-sequential launch.  Bit-identical to the per-row
+ * chain; returns 0 (caller keeps its per-row loop) when any per-row
+ * dispatch under the current env would differ.  kv/sc rows are read at
+ * row_stride; ratio!=4 blocks must contain no emit. */
+int ns4_gpu_compressor_block_rows_tensor(
+        const ns4_gpu_tensor *kv_rows,
+        const ns4_gpu_tensor *sc_rows,
+        uint32_t              row_stride,
+        ns4_gpu_tensor       *state_kv,
+        ns4_gpu_tensor       *state_score,
+        ns4_gpu_tensor       *emit_out,
+        ns4_gpu_tensor       *mirror,
+        ns4_gpu_tensor       *cap_kv,
+        ns4_gpu_tensor       *cap_score,
+        uint32_t              cap_slots,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                ape_offset,
+        uint32_t                ape_type,
+        uint64_t                norm_offset,
+        uint32_t                norm_type,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        uint32_t                pos0,
+        uint32_t                n_rows,
+        uint32_t                emit_row0,
+        uint32_t                n_rot,
+        uint32_t                n_ctx_orig,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow,
+        float                   rms_eps,
+        int                     fp8_emit);
 
 int ns4_gpu_compressor_prefill_tensor(
         ns4_gpu_tensor       *comp_cache,
