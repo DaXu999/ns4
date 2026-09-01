@@ -5524,29 +5524,77 @@ __global__ static void matmul_q8_0_preq_warp8_rows_kernel(
     const uint64_t row =
         (uint64_t)blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u);
     const uint32_t lane = threadIdx.x & 31u;
-    __shared__ __align__(16) int8_t sxq[16384];
-    __shared__ float sxs[512];
+    const uint32_t warp = threadIdx.x >> 5u;
+    /* Per-warp weight staging: a warp's iteration reads 32 consecutive q8_0
+     * blocks = one contiguous 1088-byte span, but per-lane those are 34-byte
+     * strided accesses that leave the kernel L1-transaction-bound (31.5 of 32
+     * sectors per request even after the u16 widening).  Loading the span
+     * cooperatively as uint4s and letting each lane take its block from
+     * shared makes the global traffic fully coalesced without touching which
+     * lane computes what, so the accumulation order is unchanged.
+     *
+     * The weight stage and the activation stage are never live together: when
+     * weights are staged the activations are read from L2 (the quantize
+     * kernel just wrote them), because paying for both stages' shared memory
+     * halves blocks-per-SM, which the latency-bound profile can't afford
+     * (matmul rows measured 46% DRAM with both vs 59% for the identically
+     * staged grouped kernel that has no activation stage).  Hence the union. */
+    __shared__ __align__(16) union rows_shared {
+        struct { int8_t xq[16384]; float xs[512]; } act;
+        int8_t wq[8][2u * 1088u];
+    } sh;
+    const int wstaged = use_dp4a && (in_dim & 31u) == 0u &&
+                        ((blocks * 34u) & 15u) == 0u &&
+                        (((uintptr_t)w) & 15u) == 0u;
     const uint64_t row_elems = (uint64_t)NR * blocks;
-    const int stage = row_elems * 32u <= sizeof(sxq) && row_elems <= 512u;
+    const int stage = !wstaged &&
+                      row_elems * 32u <= sizeof(sh.act.xq) && row_elems <= 512u;
     if (stage) {
         const uint64_t nbytes = row_elems * 32u;
         for (uint64_t i = threadIdx.x * 16u; i < nbytes;
              i += (uint64_t)blockDim.x * 16u) {
-            *(uint4 *)(sxq + i) = *(const uint4 *)(xq + i);
+            *(uint4 *)(sh.act.xq + i) = *(const uint4 *)(xq + i);
         }
         for (uint64_t i = threadIdx.x; i < row_elems; i += blockDim.x) {
-            sxs[i] = xscale[i];
+            sh.act.xs[i] = xscale[i];
         }
         __syncthreads();
     }
     if (row >= out_dim) return;
     const unsigned char *wr = w + row * blocks * 34;
-    const int8_t *xqb0 = stage ? sxq : xq;
-    const float *xsb0 = stage ? sxs : xscale;
+    const int8_t *xqb0 = stage ? sh.act.xq : xq;
+    const float *xsb0 = stage ? sh.act.xs : xscale;
     float acc[NR];
 #pragma unroll
     for (uint32_t r = 0; r < NR; r++) acc[r] = 0.0f;
-    for (uint64_t b = lane; b < blocks; b += 32u) {
+    uint64_t btail = 0;
+    if (wstaged) {
+        int8_t *wst = sh.wq[warp];
+        const uint32_t nspan = (uint32_t)(blocks >> 5u);
+        for (uint32_t c = 0u; c < nspan; c += 2u) {
+            const uint32_t nd = nspan - c < 2u ? nspan - c : 2u;
+            const uint4 *src = (const uint4 *)(wr + (uint64_t)c * 1088u);
+            __syncwarp();
+            for (uint32_t i = lane; i < nd * 68u; i += 32u) {
+                ((uint4 *)wst)[i] = src[i];
+            }
+            __syncwarp();
+            for (uint32_t d = 0u; d < nd; d++) {
+                const uint64_t b = ((uint64_t)(c + d)) * 32u + lane;
+                const int8_t *blk = wst + d * 1088u + lane * 34u;
+                const float ws = __half2float(*(const __half *)blk);
+                const int8_t *qs = blk + 2;
+#pragma unroll
+                for (uint32_t r = 0; r < NR; r++) {
+                    const uint64_t off = (uint64_t)r * blocks + b;
+                    const int dot = dot_i8x32_dp4a_a2b16(qs, xqb0 + off * 32);
+                    acc[r] += ws * xsb0[off] * (float)dot;
+                }
+            }
+        }
+        btail = (uint64_t)nspan * 32u;
+    }
+    for (uint64_t b = btail + lane; b < blocks; b += 32u) {
         const uint64_t i0 = b * 32;
         const uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
         const __half *scale_h = (const __half *)(wr + b * 34);
