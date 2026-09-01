@@ -39977,7 +39977,18 @@ static bool ns4_session_prepare_dspark_draft_impl(ns4_session *s,
         const bool captured_batch_end_ok =
             s->graph.dspark_capture_batch_tokens != 0 &&
             captured_batch_end <= UINT32_MAX;
+        /* Seeding the ring from the prefill captures poisons the proposer:
+         * with the prefill-derived window in place draft acceptance collapses
+         * (3% vs 76% at ctx 8192, measured), and the verified-block commit
+         * faithfully extends the poisoned window forever.  The replay path
+         * masked this because its commits dropped the window as a side
+         * effect.  Until the prefill capture is proven row-equal to the
+         * decode capture, start the ring cold and let decode-captured rows
+         * build it; NS4_DSPARK_PREFILL_SEED=1 restores the seeding for A/B. */
+        const bool prefill_seed_enabled =
+            getenv("NS4_DSPARK_PREFILL_SEED") != NULL;
         const bool initial_cache_ready =
+            prefill_seed_enabled &&
             batch_capture_ok &&
             draft_cache_ready &&
             captured_batch_end_ok &&
