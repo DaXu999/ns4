@@ -3354,6 +3354,70 @@ extern "C" int ns4_gpu_tensor_copy(ns4_gpu_tensor *dst, uint64_t dst_offset,
     return ok;
 }
 
+/* Batched device-to-device tensor copies in one launch.  The DSpark frontier
+ * snapshot/restore issues ~4 tiny state copies per layer per cycle, and
+ * ns4_gpu_tensor_copy is a synchronous cudaMemcpy -- a host round trip per
+ * copy.  One kernel over a by-value descriptor array replaces the storm; the
+ * copies are pure and the spans are distinct allocations, so concurrent
+ * per-block execution is value-identical to the sequential memcpys. */
+#define CUDA_COPY_BATCH_MAX 256u
+struct cuda_copy_batch_desc {
+    const float4 *src;
+    float4       *dst;
+    uint32_t      n4;
+    uint32_t      pad;
+};
+struct cuda_copy_batch_args {
+    cuda_copy_batch_desc e[CUDA_COPY_BATCH_MAX];
+};
+
+__global__ static void tensor_copy_batch_kernel(
+        const cuda_copy_batch_args args,
+        uint32_t n) {
+    const uint32_t e = blockIdx.x;
+    if (e >= n) return;
+    const float4 *src = args.e[e].src;
+    float4 *dst = args.e[e].dst;
+    const uint32_t n4 = args.e[e].n4;
+    for (uint32_t i = threadIdx.x; i < n4; i += blockDim.x) dst[i] = src[i];
+}
+
+extern "C" int ns4_gpu_tensor_copy_batch(ns4_gpu_tensor *const *dst,
+                                          const ns4_gpu_tensor *const *src,
+                                          const uint64_t *bytes,
+                                          uint32_t n) {
+    if (!dst || !src || !bytes || n == 0 || n > CUDA_COPY_BATCH_MAX) return 0;
+    static int batch_off = -1;
+    if (batch_off < 0) batch_off = getenv("NS4_CUDA_NO_COPY_BATCH") ? 1 : 0;
+    if (batch_off) return 0;
+    static cuda_copy_batch_args args;   /* single-threaded decode path */
+    const int tier = ns4_tensor_device_idx(dst[0]);
+    if (tier < 0 || tier >= g_n_gpus) return 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const ns4_gpu_tensor *s = src[i];
+        ns4_gpu_tensor *d = dst[i];
+        const uint64_t b = bytes[i];
+        if (!s || !d || b == 0 || (b & 15u) != 0u ||
+            b > s->bytes || b > d->bytes ||
+            (((uintptr_t)s->ptr | (uintptr_t)d->ptr) & 15u) != 0u ||
+            ns4_tensor_device_idx(d) != tier ||
+            ns4_tensor_device_idx(s) != tier ||
+            b / 16u > UINT32_MAX) {
+            return 0;
+        }
+        args.e[i].src = (const float4 *)s->ptr;
+        args.e[i].dst = (float4 *)d->ptr;
+        args.e[i].n4 = (uint32_t)(b / 16u);
+        args.e[i].pad = 0;
+    }
+    int ok = 0;
+    WITH_DEVICE(g_gpu[tier].device_id) {
+        tensor_copy_batch_kernel<<<n, 256, 0, cuda_decode_stream()>>>(args, n);
+        ok = cuda_ok(cudaGetLastError(), "tensor copy batch launch");
+    }
+    return ok;
+}
+
 __global__ static void moe_handoff_pack_kernel(
         unsigned char *packed,
         const float *ffn_norm,
@@ -5324,6 +5388,82 @@ __global__ static void matmul_f16_one_wide_rows_kernel(
     }
 }
 
+/* Weight-shared form of the f16 pair rows twin: the grid.y twin re-reads
+ * both weight rows once per token; here the token loop sits inside the load
+ * loop so each uint4 of weight is read once and every row accumulates from
+ * it.  Each (row, token) keeps the single-row kernel's accumulation chain --
+ * same b sequence, same 8-wide unroll, same warp tree and cross-warp chain --
+ * so results are bit-identical to the per-row form.  (The one-matrix f16
+ * rows twin measured WORSE in this form and keeps its grid.y shape; see the
+ * note at its launch site.) */
+template <uint32_t NT, uint32_t NR>
+__global__ static void matmul_f16_pair_wide_rows_shared_kernel(
+        float *out0,
+        float *out1,
+        const __half *w0,
+        const __half *w1,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out0_dim,
+        uint64_t out1_dim,
+        uint64_t out_stride) {
+    const uint64_t row = (uint64_t)blockIdx.x;
+    if (row >= out0_dim && row >= out1_dim) return;
+    const __half *wr0 = row < out0_dim ? w0 + row * in_dim : w0;
+    const __half *wr1 = row < out1_dim ? w1 + row * in_dim : w1;
+    const uint64_t n8 = in_dim / 8u;
+    const uint4 *v0 = (const uint4 *)wr0;
+    const uint4 *v1 = (const uint4 *)wr1;
+    float sum0[NR];
+    float sum1[NR];
+    #pragma unroll
+    for (uint32_t r = 0; r < NR; r++) { sum0[r] = 0.0f; sum1[r] = 0.0f; }
+    for (uint64_t b = threadIdx.x; b < n8; b += NT) {
+        const uint4 a = v0[b];
+        const uint4 c = v1[b];
+        const __half *ha = (const __half *)&a;
+        const __half *hc = (const __half *)&c;
+        #pragma unroll
+        for (uint32_t r = 0; r < NR; r++) {
+            const float *xp = x + r * in_dim + b * 8u;
+            #pragma unroll
+            for (uint32_t j = 0; j < 8u; j++) {
+                const float xv = xp[j];
+                sum0[r] += __half2float(ha[j]) * xv;
+                sum1[r] += __half2float(hc[j]) * xv;
+            }
+        }
+    }
+    __shared__ float ws0[NR][NT / 32];
+    __shared__ float ws1[NR][NT / 32];
+    const uint32_t warp = threadIdx.x >> 5;
+    #pragma unroll
+    for (uint32_t r = 0; r < NR; r++) {
+        float s0 = sum0[r];
+        float s1 = sum1[r];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            s0 += __shfl_down_sync(0xffffffffu, s0, off);
+            s1 += __shfl_down_sync(0xffffffffu, s1, off);
+        }
+        if ((threadIdx.x & 31u) == 0u) { ws0[r][warp] = s0; ws1[r][warp] = s1; }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        #pragma unroll
+        for (uint32_t r = 0; r < NR; r++) {
+            float total0 = 0.0f;
+            float total1 = 0.0f;
+            for (uint32_t i = 0; i < NT / 32u; i++) {
+                total0 += ws0[r][i];
+                total1 += ws1[r][i];
+            }
+            if (row < out0_dim) out0[r * out_stride + row] = total0;
+            if (row < out1_dim) out1[r * out_stride + row] = total1;
+        }
+    }
+}
+
 __global__ static void matmul_f32_kernel(
         float *out,
         const float *w,
@@ -6597,6 +6737,133 @@ __global__ static void matmul_q8_0_hc_expand_preq_warp8_rows_kernel(
             hc_acc += comb_v * res_v;
         }
         out_hc[(uint64_t)dst_hc * n_embd + d] = hc_acc;
+    }
+}
+
+/* Weight-shared form of the hc-expand rows twin above: same construction as
+ * matmul_q8_0_preq_warp8_rows_kernel (per-warp weight staging, token loop
+ * inside the K-block loop, unchanged per-lane accumulation order), with the
+ * twin's hc-expand epilogue run per token off the same accumulators.  The
+ * integer block dots are exact, so routing them through the staged a2b16
+ * readers leaves every float in the chain identical to the per-token twin. */
+template<uint32_t NR>
+__global__ static void matmul_q8_0_hc_expand_preq_warp8_rows_shared_kernel(
+        float *out_hc,
+        float *block_out,
+        const float *block_add,
+        const float *residual_hc,
+        const float *split,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint32_t n_embd,
+        uint32_t n_hc,
+        uint64_t blocks,
+        uint32_t split_stride,
+        int use_dp4a) {
+    const uint64_t row =
+        (uint64_t)blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    __shared__ __align__(16) union hc_rows_shared {
+        struct { int8_t xq[16384]; float xs[512]; } act;
+        int8_t wq[8][2u * 1088u];
+    } sh;
+    const int wstaged = use_dp4a && (in_dim & 31u) == 0u &&
+                        ((blocks * 34u) & 15u) == 0u &&
+                        (((uintptr_t)w) & 15u) == 0u;
+    const uint64_t row_elems = (uint64_t)NR * blocks;
+    const int stage = !wstaged &&
+                      row_elems * 32u <= sizeof(sh.act.xq) && row_elems <= 512u;
+    if (stage) {
+        const uint64_t nbytes = row_elems * 32u;
+        for (uint64_t i = threadIdx.x * 16u; i < nbytes;
+             i += (uint64_t)blockDim.x * 16u) {
+            *(uint4 *)(sh.act.xq + i) = *(const uint4 *)(xq + i);
+        }
+        for (uint64_t i = threadIdx.x; i < row_elems; i += blockDim.x) {
+            sh.act.xs[i] = xscale[i];
+        }
+        __syncthreads();
+    }
+    if (row >= out_dim) return;
+    const unsigned char *wr = w + row * blocks * 34;
+    const int8_t *xqb0 = stage ? sh.act.xq : xq;
+    const float *xsb0 = stage ? sh.act.xs : xscale;
+    float acc[NR];
+#pragma unroll
+    for (uint32_t r = 0; r < NR; r++) acc[r] = 0.0f;
+    uint64_t btail = 0;
+    if (wstaged) {
+        int8_t *wst = sh.wq[warp];
+        const uint32_t nspan = (uint32_t)(blocks >> 5u);
+        for (uint32_t c = 0u; c < nspan; c += 2u) {
+            const uint32_t nd = nspan - c < 2u ? nspan - c : 2u;
+            const uint4 *src = (const uint4 *)(wr + (uint64_t)c * 1088u);
+            __syncwarp();
+            for (uint32_t i = lane; i < nd * 68u; i += 32u) {
+                ((uint4 *)wst)[i] = src[i];
+            }
+            __syncwarp();
+            for (uint32_t d = 0u; d < nd; d++) {
+                const uint64_t b = ((uint64_t)(c + d)) * 32u + lane;
+                const int8_t *blk = wst + d * 1088u + lane * 34u;
+                const float ws = __half2float(*(const __half *)blk);
+                const int8_t *qs = blk + 2;
+#pragma unroll
+                for (uint32_t r = 0; r < NR; r++) {
+                    const uint64_t off = (uint64_t)r * blocks + b;
+                    const int dot = dot_i8x32_dp4a_a2b16(qs, xqb0 + off * 32);
+                    acc[r] += ws * xsb0[off] * (float)dot;
+                }
+            }
+        }
+        btail = (uint64_t)nspan * 32u;
+    }
+    for (uint64_t b = btail + lane; b < blocks; b += 32u) {
+        const uint64_t i0 = b * 32;
+        const uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
+        const __half *scale_h = (const __half *)(wr + b * 34);
+        const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
+        const float ws = __half2float(*scale_h);
+#pragma unroll
+        for (uint32_t r = 0; r < NR; r++) {
+            const uint64_t off = (uint64_t)r * blocks + b;
+            const int dot =
+                dot_i8_block_a2b16(qs, xqb0 + off * 32, bn, use_dp4a);
+            acc[r] += ws * xsb0[off] * (float)dot;
+        }
+    }
+    const uint64_t hc_stride = (uint64_t)n_hc * n_embd;
+    const uint32_t d_out = (uint32_t)row;
+#pragma unroll
+    for (uint32_t r = 0; r < NR; r++) {
+        float sum = warp_sum_f32(acc[r]);
+        sum = __shfl_sync(0xffffffffu, sum, 0);
+        float *block_out_r = block_out + (uint64_t)r * out_dim;
+        const float *block_add_r = block_add + (uint64_t)r * out_dim;
+        const float *residual_r = residual_hc + (uint64_t)r * hc_stride;
+        const float *split_r = split + (uint64_t)r * split_stride;
+        float *out_hc_r = out_hc + (uint64_t)r * hc_stride;
+        float block_v = sum;
+        if (lane == 0) {
+            block_out_r[d_out] = sum;
+            block_v += block_add_r[d_out];
+        }
+        block_v = __shfl_sync(0xffffffffu, block_v, 0);
+        const float *post = split_r + n_hc;
+        const float *comb = split_r + 2u * n_hc;
+        for (uint32_t dst_hc = lane; dst_hc < n_hc; dst_hc += 32u) {
+            float hc_acc = block_v * post[dst_hc];
+            for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
+                const float comb_v = comb[dst_hc + (uint64_t)src_hc * n_hc];
+                const float res_v = residual_r[(uint64_t)src_hc * n_embd + d_out];
+                hc_acc += comb_v * res_v;
+            }
+            out_hc_r[(uint64_t)dst_hc * n_embd + d_out] = hc_acc;
+        }
     }
 }
 
@@ -19668,6 +19935,34 @@ extern "C" int ns4_gpu_matmul_f16_pair_wide_rows_exact_tensor(
     const char *wide_env = vec4_ok ? getenv("NS4_CUDA_F16_PAIR_WIDE") : NULL;
     if (!wide_env || atoi(wide_env) == 0) return 0;
     const int nt = atoi(wide_env);
+    /* Small row counts share the weight read across rows (same convention as
+     * the q8_0 rows GEMV); wider batches keep the grid.y-per-token twin. */
+    if (n_rows > 1u && n_rows <= 8u &&
+        getenv("NS4_CUDA_NO_F16_ROWS_SHARED") == NULL) {
+        dim3 grid_s((unsigned)out_dim, 1u, 1u);
+#define NS4_F16_PAIR_ROWS_SHARED(NTV, NRV) \
+        matmul_f16_pair_wide_rows_shared_kernel<NTV, NRV> \
+            <<<grid_s, NTV, 0, cuda_decode_stream()>>>( \
+                (float *)out0->ptr, (float *)out1->ptr, w0, w1, \
+                (const float *)x->ptr, in_dim, out_dim, out_dim, out_stride)
+#define NS4_F16_PAIR_ROWS_NT(NTV) \
+        switch (n_rows) { \
+        case 2u: NS4_F16_PAIR_ROWS_SHARED(NTV, 2u); break; \
+        case 3u: NS4_F16_PAIR_ROWS_SHARED(NTV, 3u); break; \
+        case 4u: NS4_F16_PAIR_ROWS_SHARED(NTV, 4u); break; \
+        case 5u: NS4_F16_PAIR_ROWS_SHARED(NTV, 5u); break; \
+        case 6u: NS4_F16_PAIR_ROWS_SHARED(NTV, 6u); break; \
+        case 7u: NS4_F16_PAIR_ROWS_SHARED(NTV, 7u); break; \
+        default: NS4_F16_PAIR_ROWS_SHARED(NTV, 8u); break; \
+        }
+        if (nt == 128) { NS4_F16_PAIR_ROWS_NT(128u) }
+        else if (nt == 512) { NS4_F16_PAIR_ROWS_NT(512u) }
+        else { NS4_F16_PAIR_ROWS_NT(256u) }
+#undef NS4_F16_PAIR_ROWS_NT
+#undef NS4_F16_PAIR_ROWS_SHARED
+        return cuda_ok(cudaGetLastError(),
+                       "matmul_f16_pair_wide_rows_shared launch");
+    }
     dim3 grid((unsigned)out_dim, n_rows, 1u);
     if (nt == 128) {
         matmul_f16_pair_wide_rows_kernel<128><<<grid, 128, 0,
@@ -19729,6 +20024,13 @@ extern "C" int ns4_gpu_matmul_f16_one_wide_rows_exact_tensor(
     if (!one_wide) return 0;
     const int nt = atoi(one_wide);
     if (nt != 128 && nt != 256 && nt != 512) return 0;
+    /* NOTE: a weight-shared form (token loop inside the load loop, like the
+     * q8_0 rows GEMV) was measured 2026-09-01 and REGRESSED here (+44 ms per
+     * 400 tok @8k): these matrices are small enough to stay L2-resident
+     * across the grid.y twin's rows and the loads are already uint4-
+     * coalesced, so sharing saved no traffic and cost out_dim*NR -> out_dim
+     * parallelism.  The pair and hc-expand rows forms keep their shared
+     * variants; this one stays on the twin. */
     dim3 grid((unsigned)out_dim, n_rows, 1u);
     if (nt == 128) {
         matmul_f16_one_wide_rows_kernel<128><<<grid, 128, 0,
@@ -30675,6 +30977,33 @@ extern "C" int ns4_gpu_shared_down_hc_expand_rows_exact_tensor(
     if (!cuda_ok(cudaGetLastError(),
                  "shared down hc expand rows quantize launch")) {
         return 0;
+    }
+    /* Small row counts share the weight read across rows (same convention as
+     * the q8_0 rows GEMV); wider batches keep the grid.y-per-token twin. */
+    if (n_rows > 1u && n_rows <= 8u &&
+        getenv("NS4_CUDA_NO_Q8_ROWS_SHARED") == NULL) {
+        const dim3 grid_s(((unsigned)out_dim + 7u) / 8u, 1u, 1u);
+#define NS4_HC_ROWS_SHARED(NR) \
+        matmul_q8_0_hc_expand_preq_warp8_rows_shared_kernel<NR> \
+            <<<grid_s, 256, 0, cuda_decode_stream()>>>( \
+                (float *)out_hc->ptr, (float *)block_out->ptr, \
+                (const float *)routed_out->ptr, \
+                (const float *)residual_hc->ptr, (const float *)split->ptr, \
+                reinterpret_cast<const unsigned char *>(wptr), xq, xscale, \
+                in_dim, out_dim, n_embd, n_hc, blocks, split_stride, \
+                cuda_q8_use_dp4a())
+        switch (n_rows) {
+        case 2u: NS4_HC_ROWS_SHARED(2u); break;
+        case 3u: NS4_HC_ROWS_SHARED(3u); break;
+        case 4u: NS4_HC_ROWS_SHARED(4u); break;
+        case 5u: NS4_HC_ROWS_SHARED(5u); break;
+        case 6u: NS4_HC_ROWS_SHARED(6u); break;
+        case 7u: NS4_HC_ROWS_SHARED(7u); break;
+        default: NS4_HC_ROWS_SHARED(8u); break;
+        }
+#undef NS4_HC_ROWS_SHARED
+        return cuda_ok(cudaGetLastError(),
+                       "shared down hc expand rows shared launch");
     }
     dim3 grid(((unsigned)out_dim + 7u) / 8u, n_rows, 1u);
     matmul_q8_0_hc_expand_preq_warp8_rows_kernel<<<grid, 256, 0,

@@ -34683,9 +34683,42 @@ static bool spec_frontier_snapshot(ns4_spec_frontier *f, ns4_session *s) {
     f->dspark_cache_len = g->dspark_cache_len;
 
     bool ok = ns4_gpu_begin_commands() != 0;
+    /* Collect the per-layer state copies and issue them as one batched
+     * launch; each ns4_gpu_tensor_copy is a blocking cudaMemcpy, and the
+     * ~4-per-layer storm was ~0.3 ms of host time per DSpark cycle.  The
+     * loop below is the fallback when the batch refuses. */
+    ns4_gpu_tensor *cb_dst[256];
+    const ns4_gpu_tensor *cb_src[256];
+    uint64_t cb_bytes[256];
+    uint32_t cb_n = 0;
+    bool cb_fits = true;
     for (uint32_t il = 0; ok && il < NS4_N_LAYER; il++) {
         f->n_comp[il] = g->layer_n_comp[il];
         f->n_index_comp[il] = g->layer_n_index_comp[il];
+        const uint32_t ratio = ns4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        const uint64_t ab = ns4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
+        const uint64_t ib = ratio == 4
+            ? ns4_gpu_tensor_bytes(g->layer_index_state_kv[il]) : 0;
+        if (!cb_fits || cb_n + 4u > 256u) { cb_fits = false; continue; }
+        cb_dst[cb_n] = g->spec_attn_state_kv[il];
+        cb_src[cb_n] = g->layer_attn_state_kv[il];
+        cb_bytes[cb_n++] = ab;
+        cb_dst[cb_n] = g->spec_attn_state_score[il];
+        cb_src[cb_n] = g->layer_attn_state_score[il];
+        cb_bytes[cb_n++] = ab;
+        if (ratio == 4) {
+            cb_dst[cb_n] = g->spec_index_state_kv[il];
+            cb_src[cb_n] = g->layer_index_state_kv[il];
+            cb_bytes[cb_n++] = ib;
+            cb_dst[cb_n] = g->spec_index_state_score[il];
+            cb_src[cb_n] = g->layer_index_state_score[il];
+            cb_bytes[cb_n++] = ib;
+        }
+    }
+    const bool cb_done = ok && cb_fits && cb_n != 0 &&
+        ns4_gpu_tensor_copy_batch(cb_dst, cb_src, cb_bytes, cb_n) != 0;
+    for (uint32_t il = 0; ok && !cb_done && il < NS4_N_LAYER; il++) {
         const uint32_t ratio = ns4_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const uint64_t ab = ns4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
@@ -34725,9 +34758,39 @@ static bool spec_frontier_restore(ns4_spec_frontier *f, ns4_session *s) {
                                                  f->dspark_cache_token_start,
                                                  f->dspark_cache_len);
     }
+    /* Mirror of the snapshot's batched copy, in the restore direction. */
+    ns4_gpu_tensor *cb_dst[256];
+    const ns4_gpu_tensor *cb_src[256];
+    uint64_t cb_bytes[256];
+    uint32_t cb_n = 0;
+    bool cb_fits = true;
     for (uint32_t il = 0; ok && il < NS4_N_LAYER; il++) {
         g->layer_n_comp[il] = f->n_comp[il];
         g->layer_n_index_comp[il] = f->n_index_comp[il];
+        const uint32_t ratio = ns4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        const uint64_t ab = ns4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
+        const uint64_t ib = ratio == 4
+            ? ns4_gpu_tensor_bytes(g->layer_index_state_kv[il]) : 0;
+        if (!cb_fits || cb_n + 4u > 256u) { cb_fits = false; continue; }
+        cb_dst[cb_n] = g->layer_attn_state_kv[il];
+        cb_src[cb_n] = g->spec_attn_state_kv[il];
+        cb_bytes[cb_n++] = ab;
+        cb_dst[cb_n] = g->layer_attn_state_score[il];
+        cb_src[cb_n] = g->spec_attn_state_score[il];
+        cb_bytes[cb_n++] = ab;
+        if (ratio == 4) {
+            cb_dst[cb_n] = g->layer_index_state_kv[il];
+            cb_src[cb_n] = g->spec_index_state_kv[il];
+            cb_bytes[cb_n++] = ib;
+            cb_dst[cb_n] = g->layer_index_state_score[il];
+            cb_src[cb_n] = g->spec_index_state_score[il];
+            cb_bytes[cb_n++] = ib;
+        }
+    }
+    const bool cb_done = ok && cb_fits && cb_n != 0 &&
+        ns4_gpu_tensor_copy_batch(cb_dst, cb_src, cb_bytes, cb_n) != 0;
+    for (uint32_t il = 0; ok && !cb_done && il < NS4_N_LAYER; il++) {
         const uint32_t ratio = ns4_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const uint64_t ab = ns4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
