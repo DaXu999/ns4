@@ -33368,6 +33368,11 @@ typedef struct ns4_dspark_spec_stats {
     uint64_t verifier_fused_head;
     double replay_ms;
     double total_ms;
+    /* Host time inside the spec cycle but outside the verify bracket:
+     * entry-to-verify (draft head, target argmax, checkpoint pushes) and
+     * verify-to-return (accept walk, commits, logits handoff). */
+    double pre_verify_ms;
+    double post_verify_ms;
 } ns4_dspark_spec_stats;
 
 #endif
@@ -34717,7 +34722,7 @@ static bool spec_frontier_snapshot(ns4_spec_frontier *f, ns4_session *s) {
         }
     }
     const bool cb_done = ok && cb_fits && cb_n != 0 &&
-        ns4_gpu_tensor_copy_batch(cb_dst, cb_src, cb_bytes, cb_n) != 0;
+        ns4_gpu_tensor_copy_batch(cb_dst, cb_src, NULL, cb_bytes, cb_n) != 0;
     for (uint32_t il = 0; ok && !cb_done && il < NS4_N_LAYER; il++) {
         const uint32_t ratio = ns4_layer_compress_ratio(il);
         if (ratio == 0) continue;
@@ -34789,7 +34794,7 @@ static bool spec_frontier_restore(ns4_spec_frontier *f, ns4_session *s) {
         }
     }
     const bool cb_done = ok && cb_fits && cb_n != 0 &&
-        ns4_gpu_tensor_copy_batch(cb_dst, cb_src, cb_bytes, cb_n) != 0;
+        ns4_gpu_tensor_copy_batch(cb_dst, cb_src, NULL, cb_bytes, cb_n) != 0;
     for (uint32_t il = 0; ok && !cb_done && il < NS4_N_LAYER; il++) {
         const uint32_t ratio = ns4_layer_compress_ratio(il);
         if (ratio == 0) continue;
@@ -34822,11 +34827,50 @@ static bool spec_frontier_commit_prefix(ns4_session *s, uint32_t prefix_len) {
     const uint32_t slot = prefix_len - 1u;
     ns4_gpu_graph *g = &s->graph;
     bool ok = ns4_gpu_begin_commands() != 0;
+    /* Same batched-copy shape as snapshot/restore, reading each state from
+     * its captured prefix slot (a nonzero source offset). */
+    ns4_gpu_tensor *cb_dst[256];
+    const ns4_gpu_tensor *cb_src[256];
+    uint64_t cb_off[256];
+    uint64_t cb_bytes[256];
+    uint32_t cb_n = 0;
+    bool cb_fits = true;
     for (uint32_t il = 0; ok && il < NS4_N_LAYER; il++) {
         const uint32_t ratio = ns4_layer_compress_ratio(il);
         if (ratio == 0) continue;
-
         g->layer_n_comp[il] = g->spec_prefix_n_comp[slot][il];
+        if (ratio == 4) {
+            g->layer_n_index_comp[il] =
+                g->spec_prefix_n_index_comp[slot][il];
+        }
+        const uint64_t ab = ns4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
+        const uint64_t ib = ratio == 4
+            ? ns4_gpu_tensor_bytes(g->layer_index_state_kv[il]) : 0;
+        if (!cb_fits || cb_n + 4u > 256u) { cb_fits = false; continue; }
+        cb_dst[cb_n] = g->layer_attn_state_kv[il];
+        cb_src[cb_n] = g->spec_prefix1_attn_state_kv[il];
+        cb_off[cb_n] = (uint64_t)slot * ab;
+        cb_bytes[cb_n++] = ab;
+        cb_dst[cb_n] = g->layer_attn_state_score[il];
+        cb_src[cb_n] = g->spec_prefix1_attn_state_score[il];
+        cb_off[cb_n] = (uint64_t)slot * ab;
+        cb_bytes[cb_n++] = ab;
+        if (ratio == 4) {
+            cb_dst[cb_n] = g->layer_index_state_kv[il];
+            cb_src[cb_n] = g->spec_prefix1_index_state_kv[il];
+            cb_off[cb_n] = (uint64_t)slot * ib;
+            cb_bytes[cb_n++] = ib;
+            cb_dst[cb_n] = g->layer_index_state_score[il];
+            cb_src[cb_n] = g->spec_prefix1_index_state_score[il];
+            cb_off[cb_n] = (uint64_t)slot * ib;
+            cb_bytes[cb_n++] = ib;
+        }
+    }
+    const bool cb_done = ok && cb_fits && cb_n != 0 &&
+        ns4_gpu_tensor_copy_batch(cb_dst, cb_src, cb_off, cb_bytes, cb_n) != 0;
+    for (uint32_t il = 0; ok && !cb_done && il < NS4_N_LAYER; il++) {
+        const uint32_t ratio = ns4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
         const uint64_t ab = ns4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
         const uint64_t aoff = (uint64_t)slot * ab;
         ok = ns4_gpu_tensor_copy(g->layer_attn_state_kv[il], 0,
@@ -34834,8 +34878,6 @@ static bool spec_frontier_commit_prefix(ns4_session *s, uint32_t prefix_len) {
              ns4_gpu_tensor_copy(g->layer_attn_state_score[il], 0,
                                    g->spec_prefix1_attn_state_score[il], aoff, ab) != 0;
         if (ok && ratio == 4) {
-            g->layer_n_index_comp[il] =
-                g->spec_prefix_n_index_comp[slot][il];
             const uint64_t ib = ns4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
             const uint64_t ioff = (uint64_t)slot * ib;
             ok = ns4_gpu_tensor_copy(g->layer_index_state_kv[il], 0,
@@ -38722,6 +38764,7 @@ static void ns4_session_print_dspark_stats(const ns4_session *s) {
             "snapshot=%.3f verify=%.3f verify_upload=%.3f "
             "verify_layer=%.3f verify_head=%.3f verify_read=%.3f "
             "verify_fused_head=%llu replay=%.3f spec_total=%.3f "
+            "pre_verify=%.3f post_verify=%.3f "
             "target=%.3f saved=%.3f net_saved=%.3f "
             "draft_len_hist=%s accepted_len_hist=%s\n",
             (unsigned long long)st->cycles,
@@ -38760,6 +38803,8 @@ static void ns4_session_print_dspark_stats(const ns4_session *s) {
             (unsigned long long)st->verifier_fused_head,
             st->replay_ms,
             st->total_ms,
+            st->pre_verify_ms,
+            st->post_verify_ms,
             st->target_ms,
             st->saved_ms,
             net_saved_ms,
@@ -41015,8 +41060,11 @@ static bool dspark_commit_verified_block(ns4_session *s,
     ns4_gpu_graph *g = &s->graph;
 
     /* Read before rewinding: this is the only fallible step that must not run
-     * after the frontiers move. */
-    if (!graph_read_spec_logits_row(g, (uint32_t)(commit - 1), row_logits)) {
+     * after the frontiers move.  Read straight into the (pinned) session
+     * logits rather than staging through row_logits -- a failed or partial
+     * read is benign because every fallback path overwrites s->logits before
+     * anything consumes it. */
+    if (!graph_read_spec_logits_row(g, (uint32_t)(commit - 1), s->logits)) {
         return false;
     }
     if (commit < draft_n &&
@@ -41025,7 +41073,6 @@ static bool dspark_commit_verified_block(ns4_session *s,
     }
 
     s->checkpoint.len = (int)start + commit;
-    memcpy(s->logits, row_logits, (size_t)NS4_N_VOCAB * sizeof(s->logits[0]));
     s->checkpoint_valid = true;
 
     /* Batch row `lead` is position `start`: the decode-then-verify cycle put
@@ -41086,9 +41133,15 @@ static int ns4_session_eval_dspark_speculative_argmax(
         (stats_enabled ||
          (scheduler_enabled && ns4_dspark_scheduler_timing_enabled()))
             ? now_sec() : 0.0;
+    double verify_end_t = 0.0;
 #define NS4_DSPARK_STATS_FINISH() do {                                      \
         if (stats_enabled) {                                                \
-            s->dspark_stats.total_ms += (now_sec() - stats_t0) * 1000.0;    \
+            const double fin_now = now_sec();                               \
+            s->dspark_stats.total_ms += (fin_now - stats_t0) * 1000.0;      \
+            if (verify_end_t != 0.0) {                                      \
+                s->dspark_stats.post_verify_ms +=                           \
+                    (fin_now - verify_end_t) * 1000.0;                      \
+            }                                                               \
         }                                                                   \
     } while (0)
 #define NS4_DSPARK_SCHED_EXTRA_MS()                                         \
@@ -41245,7 +41298,9 @@ static int ns4_session_eval_dspark_speculative_argmax(
                                             NULL,
                                             stats_enabled ? &verify_timing : NULL);
         if (stats_enabled) {
-            s->dspark_stats.verify_ms += (now_sec() - verify_t0) * 1000.0;
+            verify_end_t = now_sec();
+            s->dspark_stats.verify_ms += (verify_end_t - verify_t0) * 1000.0;
+            s->dspark_stats.pre_verify_ms += (verify_t0 - stats_t0) * 1000.0;
             s->dspark_stats.verify_upload_ms += verify_timing.upload_ms;
             s->dspark_stats.verify_layer_ms += verify_timing.layer_ms;
             s->dspark_stats.verify_head_ms += verify_timing.head_ms;

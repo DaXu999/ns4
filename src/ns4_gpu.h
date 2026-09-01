@@ -63,12 +63,14 @@ int ns4_gpu_tensor_copy4_async_tensor(
         ns4_gpu_tensor *dst1, uint64_t doff1, const ns4_gpu_tensor *src1, uint64_t soff1, uint64_t b1,
         ns4_gpu_tensor *dst2, uint64_t doff2, const ns4_gpu_tensor *src2, uint64_t soff2, uint64_t b2,
         ns4_gpu_tensor *dst3, uint64_t doff3, const ns4_gpu_tensor *src3, uint64_t soff3, uint64_t b3);
-/* Up to 256 same-tier full-prefix device copies (offset 0, bytes[i] from the
- * start of each tensor, 16-byte-multiple sizes) in ONE launch on the decode
- * stream, asynchronous to the host.  Refuses (returns 0) on any shape it
- * cannot take; the caller keeps its per-copy loop as the fallback. */
+/* Up to 256 same-tier device copies (16-byte-aligned source offsets --
+ * src_off may be NULL for all-zero -- into offset 0 of each destination,
+ * 16-byte-multiple sizes) in ONE launch on the decode stream, asynchronous
+ * to the host.  Refuses (returns 0) on any shape it cannot take; the caller
+ * keeps its per-copy loop as the fallback. */
 int ns4_gpu_tensor_copy_batch(ns4_gpu_tensor *const *dst,
                               const ns4_gpu_tensor *const *src,
+                              const uint64_t *src_off,
                               const uint64_t *bytes,
                               uint32_t n);
 int ns4_gpu_tensor_copy_f32_to_f16(ns4_gpu_tensor *dst, uint64_t dst_offset,

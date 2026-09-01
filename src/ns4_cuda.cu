@@ -3384,6 +3384,7 @@ __global__ static void tensor_copy_batch_kernel(
 
 extern "C" int ns4_gpu_tensor_copy_batch(ns4_gpu_tensor *const *dst,
                                           const ns4_gpu_tensor *const *src,
+                                          const uint64_t *src_off,
                                           const uint64_t *bytes,
                                           uint32_t n) {
     if (!dst || !src || !bytes || n == 0 || n > CUDA_COPY_BATCH_MAX) return 0;
@@ -3397,15 +3398,16 @@ extern "C" int ns4_gpu_tensor_copy_batch(ns4_gpu_tensor *const *dst,
         const ns4_gpu_tensor *s = src[i];
         ns4_gpu_tensor *d = dst[i];
         const uint64_t b = bytes[i];
-        if (!s || !d || b == 0 || (b & 15u) != 0u ||
-            b > s->bytes || b > d->bytes ||
+        const uint64_t soff = src_off ? src_off[i] : 0;
+        if (!s || !d || b == 0 || (b & 15u) != 0u || (soff & 15u) != 0u ||
+            soff > s->bytes || b > s->bytes - soff || b > d->bytes ||
             (((uintptr_t)s->ptr | (uintptr_t)d->ptr) & 15u) != 0u ||
             ns4_tensor_device_idx(d) != tier ||
             ns4_tensor_device_idx(s) != tier ||
             b / 16u > UINT32_MAX) {
             return 0;
         }
-        args.e[i].src = (const float4 *)s->ptr;
+        args.e[i].src = (const float4 *)((const char *)s->ptr + soff);
         args.e[i].dst = (float4 *)d->ptr;
         args.e[i].n4 = (uint32_t)(b / 16u);
         args.e[i].pad = 0;
