@@ -449,6 +449,30 @@ static uint64_t g_cuda_tmp_bytes;
 static void *g_tt_scratch;
 static uint64_t g_tt_scratch_bytes;
 static int g_tt_scratch_device = -1;
+
+/* Small-batch preference.  The DSpark proposer sets this around its
+ * support-model work so 2..8-row dense GEMMs and the routed MoE take the
+ * weight-shared decode rows kernels instead of the MMQ/cuBLAS batch paths
+ * (four launches and a pool scratch alloc per GEMM, ~150 us of host stall
+ * in front of each).  Per-row numerics become decode's own; the proposer
+ * only drafts, so the exact verify never sees the difference. */
+static int g_small_batch_rows_pref = 0;
+extern "C" void ns4_gpu_small_batch_rows_pref(int on) {
+    g_small_batch_rows_pref = on ? 1 : 0;
+}
+extern "C" int ns4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+        ns4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ns4_gpu_tensor *x, uint32_t n_rows);
+extern "C" int ns4_gpu_matmul_f16_one_wide_rows_exact_tensor(
+        ns4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ns4_gpu_tensor *x, uint32_t n_rows);
+extern "C" int ns4_gpu_attention_output_low_q8_rows_exact_tensor(
+        ns4_gpu_tensor *low, const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t group_dim, uint64_t rank,
+        uint32_t n_groups_total, uint32_t group0, uint32_t group_cnt,
+        const ns4_gpu_tensor *heads, uint32_t n_rows);
 /* 64-row fp4 mirror of the decode indexer q (5120 B), for the exact-integer
  * scan.  Freed in ns4_gpu_cleanup next to the other persistent scratches. */
 static unsigned char *g_indexer_qm_scratch;
@@ -3280,6 +3304,36 @@ __global__ static void copy_bytes4_kernel(
     for (uint64_t i = (n16 << 4) + base; i < b; i += stride) {
         d[i] = s[i];
     }
+}
+
+/* Write up to 16 host int32 values into a device tensor from a by-value
+ * argument block on the decode stream: an asynchronous alternative to the
+ * blocking ns4_gpu_tensor_write for tiny per-block metadata (the DSpark
+ * verify's row token ids for the hash-routed layers). */
+struct cuda_i32_small_args { int32_t v[16]; uint32_t n; };
+__global__ static void tensor_write_i32_small_kernel(int32_t *dst,
+                                                     cuda_i32_small_args a) {
+    const uint32_t i = threadIdx.x;
+    if (i < a.n) dst[i] = a.v[i];
+}
+extern "C" int ns4_gpu_tensor_write_i32_small_tensor(ns4_gpu_tensor *dst,
+                                                     const int32_t *vals,
+                                                     uint32_t n) {
+    if (!dst || !dst->ptr || !vals || n == 0u || n > 16u ||
+        dst->bytes < (uint64_t)n * sizeof(int32_t)) {
+        return 0;
+    }
+    cuda_i32_small_args a;
+    memset(&a, 0, sizeof(a));
+    for (uint32_t i = 0; i < n; i++) a.v[i] = vals[i];
+    a.n = n;
+    int ok = 0;
+    WITH_DEVICE(g_gpu[ns4_tensor_device_idx(dst)].device_id) {
+        tensor_write_i32_small_kernel<<<1, 16, 0, cuda_decode_stream()>>>(
+                (int32_t *)dst->ptr, a);
+        ok = cuda_ok(cudaGetLastError(), "tensor_write_i32_small launch");
+    }
+    return ok;
 }
 
 extern "C" int ns4_gpu_tensor_copy4_async_tensor(
@@ -6186,6 +6240,83 @@ __global__ static void matmul_q8_0_pair_preq_wide_kernel(
     }
 }
 
+/* Weight-shared rows twin of the wide pair kernel: NR token rows per launch,
+ * each weight block loaded once and dotted against every row's activation.
+ * Per row the per-thread K stride, the warp tree and the cross-warp chain
+ * are the wide kernel's exactly (own accumulators, same order), so each
+ * row's result is bit-identical to a one-row wide launch; only the weight
+ * traffic is shared (the grid.y form re-read the pair per row). */
+template <uint32_t NT, uint32_t NR>
+__global__ static void matmul_q8_0_pair_preq_wide_rows_shared_kernel(
+        float *out0,
+        float *out1,
+        const unsigned char *w0,
+        const unsigned char *w1,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out0_dim,
+        uint64_t out1_dim,
+        uint64_t blocks,
+        int use_dp4a) {
+    const uint64_t row = (uint64_t)blockIdx.x;
+    if (row >= out0_dim && row >= out1_dim) return;
+    float acc0[NR];
+    float acc1[NR];
+    #pragma unroll
+    for (uint32_t r = 0; r < NR; r++) { acc0[r] = 0.0f; acc1[r] = 0.0f; }
+    const unsigned char *wr0 = row < out0_dim ? w0 + row * blocks * 34 : NULL;
+    const unsigned char *wr1 = row < out1_dim ? w1 + row * blocks * 34 : NULL;
+    for (uint64_t b = threadIdx.x; b < blocks; b += NT) {
+        uint64_t i0 = b * 32;
+        uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
+        if (wr0) {
+            const __half *scale_h = (const __half *)(wr0 + b * 34);
+            const int8_t *qs = (const int8_t *)(wr0 + b * 34 + 2);
+            const float ws = __half2float(*scale_h);
+            #pragma unroll
+            for (uint32_t r = 0; r < NR; r++) {
+                const int8_t *xqb = xq + ((uint64_t)r * blocks + b) * 32u;
+                const float xs = xscale[(uint64_t)r * blocks + b];
+                int dot = dot_i8_block_a2b16(qs, xqb, bn, use_dp4a);
+                acc0[r] += ws * xs * (float)dot;
+            }
+        }
+        if (wr1) {
+            const __half *scale_h = (const __half *)(wr1 + b * 34);
+            const int8_t *qs = (const int8_t *)(wr1 + b * 34 + 2);
+            const float ws = __half2float(*scale_h);
+            #pragma unroll
+            for (uint32_t r = 0; r < NR; r++) {
+                const int8_t *xqb = xq + ((uint64_t)r * blocks + b) * 32u;
+                const float xs = xscale[(uint64_t)r * blocks + b];
+                int dot = dot_i8_block_a2b16(qs, xqb, bn, use_dp4a);
+                acc1[r] += ws * xs * (float)dot;
+            }
+        }
+    }
+    __shared__ float ws0[NR][NT / 32];
+    __shared__ float ws1[NR][NT / 32];
+    const uint32_t warp = threadIdx.x >> 5;
+    #pragma unroll
+    for (uint32_t r = 0; r < NR; r++) {
+        const float a0 = warp_sum_f32(acc0[r]);
+        const float a1 = warp_sum_f32(acc1[r]);
+        if ((threadIdx.x & 31u) == 0u) { ws0[r][warp] = a0; ws1[r][warp] = a1; }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        #pragma unroll
+        for (uint32_t r = 0; r < NR; r++) {
+            float total0 = 0.0f;
+            float total1 = 0.0f;
+            for (uint32_t i = 0; i < NT / 32u; i++) { total0 += ws0[r][i]; total1 += ws1[r][i]; }
+            if (row < out0_dim) out0[r * out0_dim + row] = total0;
+            if (row < out1_dim) out1[r * out1_dim + row] = total1;
+        }
+    }
+}
+
 /* Rows-verify kernel block shape: 8 rows per block measured best (80.6 t/s
  * vs 79.6 at 4, DSpark 8k) -- unlike the pair kernel these grids are large
  * enough already, and smaller blocks just cost occupancy.
@@ -6227,6 +6358,27 @@ static int cuda_launch_q8_0_pair_preq_warp8(
     const char *wide_env = getenv("NS4_CUDA_Q8_PAIR_WIDE");
     if (wide_env && blocks >= 64u) {
         const int nt = atoi(wide_env);
+        /* 2..8 rows: the weight-shared twin (one grid row, NR accumulators)
+         * instead of re-reading the pair once per row. */
+        if (n_rows >= 2u && n_rows <= 8u && (nt == 128 || nt == 256 || nt == 512) &&
+            getenv("NS4_CUDA_NO_Q8_PAIR_ROWS_SHARED") == NULL) {
+            const dim3 sgrid((unsigned)max_out, 1u, 1u);
+#define NS4_Q8_PAIR_SHARED_NT(NTV) \
+            switch (n_rows) { \
+            case 2u: matmul_q8_0_pair_preq_wide_rows_shared_kernel<NTV, 2><<<sgrid, NTV, 0, s>>>(out0, out1, w0, w1, xq, xscale, in_dim, out0_dim, out1_dim, blocks, use_dp4a); break; \
+            case 3u: matmul_q8_0_pair_preq_wide_rows_shared_kernel<NTV, 3><<<sgrid, NTV, 0, s>>>(out0, out1, w0, w1, xq, xscale, in_dim, out0_dim, out1_dim, blocks, use_dp4a); break; \
+            case 4u: matmul_q8_0_pair_preq_wide_rows_shared_kernel<NTV, 4><<<sgrid, NTV, 0, s>>>(out0, out1, w0, w1, xq, xscale, in_dim, out0_dim, out1_dim, blocks, use_dp4a); break; \
+            case 5u: matmul_q8_0_pair_preq_wide_rows_shared_kernel<NTV, 5><<<sgrid, NTV, 0, s>>>(out0, out1, w0, w1, xq, xscale, in_dim, out0_dim, out1_dim, blocks, use_dp4a); break; \
+            case 6u: matmul_q8_0_pair_preq_wide_rows_shared_kernel<NTV, 6><<<sgrid, NTV, 0, s>>>(out0, out1, w0, w1, xq, xscale, in_dim, out0_dim, out1_dim, blocks, use_dp4a); break; \
+            case 7u: matmul_q8_0_pair_preq_wide_rows_shared_kernel<NTV, 7><<<sgrid, NTV, 0, s>>>(out0, out1, w0, w1, xq, xscale, in_dim, out0_dim, out1_dim, blocks, use_dp4a); break; \
+            default: matmul_q8_0_pair_preq_wide_rows_shared_kernel<NTV, 8><<<sgrid, NTV, 0, s>>>(out0, out1, w0, w1, xq, xscale, in_dim, out0_dim, out1_dim, blocks, use_dp4a); break; \
+            }
+            if (nt == 128) { NS4_Q8_PAIR_SHARED_NT(128) }
+            else if (nt == 256) { NS4_Q8_PAIR_SHARED_NT(256) }
+            else { NS4_Q8_PAIR_SHARED_NT(512) }
+#undef NS4_Q8_PAIR_SHARED_NT
+            return 1;
+        }
         const dim3 wgrid((unsigned)max_out, n_rows, 1u);
         if (nt == 128) {
             matmul_q8_0_pair_preq_wide_kernel<128><<<wgrid, 128, 0, s>>>(
@@ -18565,6 +18717,12 @@ static int cuda_matmul_q8_0_tensor_labeled(ns4_gpu_tensor *out, const void *mode
                     (unsigned long long)in_dim);
         }
     }
+    if (g_small_batch_rows_pref && n_tok >= 2u && n_tok <= 8u &&
+        ns4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+                out, model_map, model_size, weight_offset, in_dim, out_dim,
+                x, (uint32_t)n_tok)) {
+        return 1;
+    }
     const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes, logical_tier, "q8_0");
     if (!wptr) return 0;
     /* mmq fused-dequant-matmul prefill tier (ported from the Entrpi/ds4
@@ -19509,6 +19667,13 @@ extern "C" int ns4_gpu_matmul_f16_tensor(ns4_gpu_tensor *out, const void *model_
             }
         }
     }
+    if (g_small_batch_rows_pref && !serial_f16 && !g_quality_mode &&
+        n_tok >= 2u && n_tok <= 8u &&
+        ns4_gpu_matmul_f16_one_wide_rows_exact_tensor(
+                out, model_map, model_size, weight_offset, in_dim, out_dim,
+                x, (uint32_t)n_tok)) {
+        return 1;
+    }
     const int cublas_one_token =
         n_tok == 1u &&
         getenv("NS4_CUDA_NO_F16_CUBLAS_ONE") == NULL &&
@@ -20154,12 +20319,22 @@ __global__ static void attention_noncausal_raw_batch_heads_kernel(
     extern __shared__ float sh_scores[]; /* n_raw floats */
     const float *qh = q + ((uint64_t)tok * n_head + h) * head_dim;
     const float scale = rsqrtf((float)head_dim);
-    for (uint32_t r = threadIdx.x; r < n_raw; r += blockDim.x) {
-        const uint32_t row = (raw_start + r) % raw_cap;
-        const float *kv = raw_kv + (uint64_t)row * head_dim;
-        float dot = 0.0f;
-        for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kv[d];
-        sh_scores[r] = dot * scale;
+    /* Scores: one warp per visible row, lanes striding the head so the KV
+     * row streams in coalesced (the thread-per-row form read 134 rows
+     * strided across threads and took ~70 us of a proposal's 1.4 ms).  The
+     * drafter's numerics are its own -- the exact verify never sees them. */
+    {
+        const uint32_t warp = threadIdx.x >> 5u;
+        const uint32_t lane = threadIdx.x & 31u;
+        const uint32_t nwarps = blockDim.x >> 5u;
+        for (uint32_t r = warp; r < n_raw; r += nwarps) {
+            const uint32_t row = (raw_start + r) % raw_cap;
+            const float *kv = raw_kv + (uint64_t)row * head_dim;
+            float dot = 0.0f;
+            for (uint32_t d = lane; d < head_dim; d += 32u) dot += qh[d] * kv[d];
+            dot = warp_sum_f32(dot);
+            if (lane == 0u) sh_scores[r] = dot * scale;
+        }
     }
     __syncthreads();
     __shared__ float partial[256];
@@ -20372,6 +20547,15 @@ extern "C" int ns4_gpu_rms_norm_weight_rows_tensor(ns4_gpu_tensor *out, const ns
     const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, (uint64_t)n * sizeof(float), logical_tier, "rms_weight");
     if (!wptr) return 0;
     const float *w = (const float *)wptr;
+    /* Same dispatch as the one-row entry: the wide forms keep the 256-thread
+     * sum (bit-identical scale) and only widen the output pass. */
+    const uint32_t ww = cuda_rms_block_width();
+    if (ww > 256u && n >= 1024u) {
+        if (ww == 512u)
+            rms_norm_weight_wide_kernel<512><<<rows, 512, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
+        else
+            rms_norm_weight_wide_kernel<1024><<<rows, 1024, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
+    } else
     rms_norm_weight_kernel<<<rows, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
 }
@@ -22575,6 +22759,15 @@ extern "C" int ns4_gpu_attention_output_q8_batch_tensor(
     const unsigned char *out_b = reinterpret_cast<const unsigned char *>(
             cuda_resolve_weight_ptr(model_map, out_b_offset, out_b_bytes, logical_tier, "attn_out_b"));
     if (!out_a || !out_b) return 0;
+    if (g_small_batch_rows_pref && n_tokens >= 2u && n_tokens <= 8u &&
+        ns4_gpu_attention_output_low_q8_rows_exact_tensor(
+                low, model_map, model_size, out_a_offset, group_dim, rank,
+                n_groups, 0u, n_groups, heads, n_tokens) &&
+        ns4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+                out, model_map, model_size, out_b_offset, low_dim, out_dim,
+                low, n_tokens)) {
+        return 1;
+    }
 
     const uint32_t profile = getenv("NS4_CUDA_ATTN_OUTPUT_PROFILE") != NULL;
     cudaEvent_t prof_ev[3] = {NULL, NULL, NULL};
@@ -30451,6 +30644,11 @@ extern "C" int ns4_gpu_routed_moe_one_tensor(ns4_gpu_tensor *out, ns4_gpu_tensor
 extern "C" int ns4_gpu_routed_moe_batch_tensor(ns4_gpu_tensor *out, ns4_gpu_tensor *gate, ns4_gpu_tensor *up, ns4_gpu_tensor *mid, ns4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ns4_gpu_tensor *selected, const ns4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ns4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16, bool force_resident) {
     (void)force_resident;
     if (mid_is_f16) *mid_is_f16 = false;
+    /* Under the small-batch preference (DSpark proposer) a block of <= 8
+     * rows takes the decode-exact rows path: one w32 gate/up launch and one
+     * down launch on the decode stream instead of the MMQ fused MoE. */
+    const int exact_rows =
+        g_small_batch_rows_pref && n_tokens <= 8u ? 1 : 0;
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
                              gate_type, down_type,
@@ -30458,7 +30656,7 @@ extern "C" int ns4_gpu_routed_moe_batch_tensor(ns4_gpu_tensor *out, ns4_gpu_tens
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, n_total_expert, n_expert, clamp, x,
-                             layer_index, n_tokens, 1, 0, 0);
+                             layer_index, n_tokens, 1, 0, exact_rows);
 }
 
 /* DSpark verify: the block's rows batched through the decode-exact aligned
@@ -30686,7 +30884,11 @@ extern "C" int ns4_gpu_hc_split_weighted_sum_norm_tensor(
             return 0;
         }
         uint64_t n_rows = out->bytes / out_row_bytes;
-        if (n_rows == 1) {
+        /* Small row counts (decode, the DSpark verify block) take the fused
+         * kernel with one block per row -- each row runs the one-row program,
+         * so the rows-verify stays bit-identical to decode and drops the
+         * separate rms_norm_weight launch it paid per layer. */
+        if (n_rows >= 1 && n_rows <= 8u) {
             if (mix->bytes < n_rows * mix_bytes ||
                 split->bytes < n_rows * mix_bytes ||
                 residual_hc->bytes < n_rows * residual_row_bytes) {

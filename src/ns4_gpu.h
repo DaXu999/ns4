@@ -58,6 +58,11 @@ int ns4_gpu_tensor_copy(ns4_gpu_tensor *dst, uint64_t dst_offset,
 /* Up to four same-tier device copies in one launch on the decode stream,
  * asynchronous to the host (unlike ns4_gpu_tensor_copy's blocking
  * cudaMemcpy). Unused pairs pass NULL/NULL. */
+/* Up to 16 int32 values written from a by-value argument block, one async
+ * launch on the decode stream (no host-side blocking copy). */
+int ns4_gpu_tensor_write_i32_small_tensor(ns4_gpu_tensor *dst,
+                                          const int32_t *vals,
+                                          uint32_t n);
 int ns4_gpu_tensor_copy4_async_tensor(
         ns4_gpu_tensor *dst0, uint64_t doff0, const ns4_gpu_tensor *src0, uint64_t soff0, uint64_t b0,
         ns4_gpu_tensor *dst1, uint64_t doff1, const ns4_gpu_tensor *src1, uint64_t soff1, uint64_t b1,
@@ -405,6 +410,12 @@ int ns4_gpu_matmul_q8_0_pair_tensor(
         uint64_t                out1_dim,
         const ns4_gpu_tensor *x,
         uint64_t                n_tok);
+
+/* Small-batch preference: while set, 2..8-row dense GEMMs, the attention
+ * output projection and the routed MoE take the weight-shared decode rows
+ * kernels instead of the MMQ/cuBLAS batch paths.  The DSpark proposer sets
+ * it around its support-model work (its numerics only shape drafts). */
+void ns4_gpu_small_batch_rows_pref(int on);
 
 /* Multi-row decode projections that preserve the one-row reduction order. */
 int ns4_gpu_matmul_q8_0_decode_rows_exact_tensor(

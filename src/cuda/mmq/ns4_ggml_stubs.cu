@@ -124,7 +124,20 @@ namespace {
 struct ns4_naive_pool : public ggml_cuda_pool {
     int device;
 
-    explicit ns4_naive_pool(int device) : device(device) {}
+    explicit ns4_naive_pool(int device) : device(device) {
+        /* Keep freed blocks in the device's default pool instead of handing
+         * them back to the driver at every stream synchronisation.  The
+         * DSpark proposer allocates and frees its MMQ scratch a few times per
+         * proposal and synchronises between slots, so with the default zero
+         * threshold every cudaMallocAsync went to the driver again (~150 us
+         * of host stall in front of each quantize_mmq_q8_1 launch). */
+        cudaMemPool_t pool = nullptr;
+        if (cudaDeviceGetDefaultMemPool(&pool, device) == cudaSuccess && pool) {
+            cuuint64_t threshold = UINT64_MAX;
+            (void)cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &threshold);
+        }
+        (void)cudaGetLastError();
+    }
 
     void * alloc(size_t size, size_t * actual_size) override {
         ggml_cuda_set_device(device);

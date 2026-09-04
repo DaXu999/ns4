@@ -28406,7 +28406,8 @@ static bool dspark_apply_markov_confidence_lazy_runtime(
         uint32_t               *confidence_prefix_len,
         uint32_t                extra_slots,
         bool                    reuse_first_confidence,
-        float                  *confidence0) {
+        float                  *confidence0,
+        int32_t                 forced_slot0) {
     if (proposal_len) *proposal_len = 0;
     if (confidence_len) *confidence_len = 0;
     if (confidence_prefix_len) *confidence_prefix_len = 0;
@@ -28446,10 +28447,46 @@ static bool dspark_apply_markov_confidence_lazy_runtime(
     uint32_t confident = 0;
     uint32_t extra_used = 0;
     bool prefix_closed = false;
+    /* Every slot's hidden row is already on the device (the chain wrote the
+     * whole block), so fetch the rows this loop can reach in one read rather
+     * than one blocking 16 KB read per slot: the per-slot host round trips
+     * were ~100 us each, half of them this read. */
+    static __thread float *hidden_rows = NULL;
+    static __thread uint32_t hidden_rows_cap = 0;
+    const uint32_t first_read =
+        (reuse_first_confidence || forced_slot0 >= 0) ? 1u : 0u;
+    bool hidden_rows_ok = false;
+    if (dw->block_size > first_read) {
+        const uint32_t want = dw->block_size;
+        if (hidden_rows_cap < want) {
+            free(hidden_rows);
+            hidden_rows = xmalloc((size_t)want * NS4_N_EMBD * sizeof(float));
+            hidden_rows_cap = want;
+        }
+        hidden_rows_ok =
+            ns4_gpu_tensor_read(graph_batch_ffn_norm(g),
+                                (uint64_t)first_read * hidden_bytes,
+                                hidden_rows + (uint64_t)first_read * NS4_N_EMBD,
+                                (uint64_t)(dw->block_size - first_read) *
+                                    hidden_bytes) != 0;
+    }
     for (uint32_t draft = 0; ok && draft < dw->block_size; draft++) {
         if (prev_token < 0 || (uint32_t)prev_token >= NS4_N_VOCAB) {
             ok = false;
             break;
+        }
+        /* Slot 0 handed in by the caller: the target's own argmax for the
+         * position, which is what the block would have checked the drafter's
+         * slot 0 against.  It is certain by construction, so it opens the
+         * confident prefix and seeds the Markov chain; the drafter's slot-0
+         * logits and confidence are not consulted. */
+        if (draft == 0 && forced_slot0 >= 0) {
+            if (confidence_len) *confidence_len = 1u;
+            proposal[0] = forced_slot0;
+            produced = 1u;
+            confident = 1u;
+            prev_token = forced_slot0;
+            continue;
         }
         float confidence_logit = 0.0f;
         if (draft == 0 && reuse_first_confidence) {
@@ -28461,11 +28498,17 @@ static bool dspark_apply_markov_confidence_lazy_runtime(
                                          (uint32_t)prev_token);
             if (!ok) break;
 
-            ok = ns4_gpu_tensor_read(graph_batch_ffn_norm(g),
-                                     (uint64_t)draft * hidden_bytes,
-                                     features,
-                                     hidden_bytes) != 0;
-            if (!ok) break;
+            if (hidden_rows_ok && draft >= first_read) {
+                memcpy(features,
+                       hidden_rows + (uint64_t)draft * NS4_N_EMBD,
+                       (size_t)hidden_bytes);
+            } else {
+                ok = ns4_gpu_tensor_read(graph_batch_ffn_norm(g),
+                                         (uint64_t)draft * hidden_bytes,
+                                         features,
+                                         hidden_bytes) != 0;
+                if (!ok) break;
+            }
             matvec_any(&confidence_logit,
                        dspark_model,
                        final->confidence_proj,
@@ -33476,12 +33519,18 @@ static uint32_t ns4_dspark_env_u32(const char *name, uint32_t fallback) {
  * committed hidden state, one position further back, so every drafted slot
  * moves one step deeper into the draft block.
  *
- * Measured, it does not pay: the decode it removes was producing a token, and
- * the confirmed token now occupies draft slot 0, so every block speculates one
- * position less far than it did.  Off by default; NS4_DSPARK_FOLD=1 turns it
- * on and NS4_DSPARK_FOLD=0 is the decode-then-verify cycle. */
+ * When a verify row cost ~11 ms this did not pay: the decode it removes was
+ * producing a token, and the confirmed token now occupies draft slot 0, so
+ * every block speculates one position less far than it did.  With the rows
+ * verifier sharing the dense weights across the block (a 5-row block ~18 ms,
+ * ~1.6 ms per extra row) the arithmetic flipped: the fold trades one 12.8 ms
+ * decode per cycle for one row, and with slot 0 seeded from the target's own
+ * argmax (see ns4_session_prepare_dspark_draft_impl) every greedy cycle
+ * folds.  Measured 2026-09-04 @8k/131k: 96.1/84.9 -> 123.2/101.9 t/s,
+ * byte-identical.  On by default; NS4_DSPARK_FOLD=0 restores the
+ * decode-then-verify cycle. */
 static bool dspark_fold_enabled(void) {
-    return ns4_dspark_env_u32("NS4_DSPARK_FOLD", 0u) != 0u;
+    return ns4_dspark_env_u32("NS4_DSPARK_FOLD", 1u) != 0u;
 }
 
 /* Draft slots to keep past the confident prefix when the fold is on.
@@ -40166,6 +40215,17 @@ static bool ns4_session_prepare_dspark_draft_impl(ns4_session *s,
     } while (0)
     const uint32_t fold_extra =
         dspark_fold_enabled() ? dspark_fold_extra_slots() : 0u;
+    /* The target's argmax for the next position is already in s->logits
+     * (the last committed row's, or the decode's); under greedy decode it
+     * is exactly the token the next cycle will require slot 0 to equal.
+     * Seeding slot 0 with it turns every slot-0 miss (a third of cycles
+     * under the fold, each costing a full decode) into a block.
+     * NS4_DSPARK_NO_TARGET_SLOT0=1 keeps the drafter's own slot 0. */
+    const int32_t forced_slot0 =
+        enabled && !probe_log && !fake_argmax_enabled &&
+        s->checkpoint_valid && s->logits &&
+        getenv("NS4_DSPARK_NO_TARGET_SLOT0") == NULL
+            ? (int32_t)sample_argmax(s->logits, NS4_N_VOCAB) : -1;
     s->dspark_draft_valid = false;
     s->dspark_draft_len = 0;
     s->dspark_draft_pos = 0;
@@ -40363,7 +40423,21 @@ static bool ns4_session_prepare_dspark_draft_impl(ns4_session *s,
                                                      false);
             NS4_DSPARK_PROP_ADD(propose_hidden_ms, hidden_t0);
             bool conf0_ok = false;
-            if (hidden_ok) {
+            if (hidden_ok && forced_slot0 >= 0) {
+                /* Slot 0 is the target's token: no confidence gate for it,
+                 * straight to the logits the remaining slots need. */
+                const double logits_t0 = NS4_DSPARK_PROP_T0();
+                base_logits_ok =
+                    graph_eval_dspark_base_logits_from_hidden(
+                            &s->graph,
+                            &s->engine->model,
+                            &s->engine->weights,
+                            dw);
+                NS4_DSPARK_PROP_ADD(propose_logits_ms, logits_t0);
+                confidence_ok = base_logits_ok;
+                confidence_len = 1;
+                confidence_prefix_len = base_logits_ok ? 1 : 0;
+            } else if (hidden_ok) {
                 const double conf0_t0 = NS4_DSPARK_PROP_T0();
                 conf0_ok =
                     dspark_eval_confidence0_runtime(&s->graph,
@@ -40426,7 +40500,8 @@ static bool ns4_session_prepare_dspark_draft_impl(ns4_session *s,
                         &confidence_prefix_len,
                         fold_extra,
                         reuse_confidence0_markov,
-                        &confidence0);
+                        &confidence0,
+                        forced_slot0);
             NS4_DSPARK_PROP_ADD(propose_markov_ms, markov_t0);
             confidence_ok = markov_ok;
         } else if (markov_ready) {
@@ -40694,7 +40769,11 @@ static bool ns4_session_prepare_dspark_draft(ns4_session *s,
         if (ns4_gpu_set_current_device(exec_tier) != 0) return false;
         g->active_tier = exec_tier;
     }
+    /* The proposer's support-model batches are 5-6 rows: prefer the
+     * weight-shared decode rows kernels over the MMQ/cuBLAS batch paths. */
+    ns4_gpu_small_batch_rows_pref(1);
     const bool ok = ns4_session_prepare_dspark_draft_impl(s, token, pos);
+    ns4_gpu_small_batch_rows_pref(0);
     if (exec_tier != saved_tier) {
         g->active_tier = saved_tier;
         if (ns4_gpu_set_current_device(saved_tier) != 0) return false;
@@ -41092,13 +41171,18 @@ static bool dspark_commit_verified_block(ns4_session *s,
          * that position is the next cycle's separate decode, so every committed
          * row goes in; folded, it is this block's own last committed row. */
         const uint32_t ring_rows = (uint32_t)commit + lead - 1u;
-        if (ring_rows != 0 &&
-            !graph_dspark_ring_extend_from_batch(g,
-                                                       &e->mtp_model,
-                                                       &e->dspark_weights,
-                                                       fold ? 0u : 1u,
-                                                       start,
-                                                       ring_rows)) {
+        bool ring_ok = true;
+        if (ring_rows != 0) {
+            ns4_gpu_small_batch_rows_pref(1);
+            ring_ok = graph_dspark_ring_extend_from_batch(g,
+                                                          &e->mtp_model,
+                                                          &e->dspark_weights,
+                                                          fold ? 0u : 1u,
+                                                          start,
+                                                          ring_rows);
+            ns4_gpu_small_batch_rows_pref(0);
+        }
+        if (!ring_ok) {
             /* The ring holds draft-derived rows for these positions; drop the
              * window rather than let the next block attend to them. */
             graph_dspark_cache_reset(g);
@@ -42466,6 +42550,20 @@ static bool graph_verify_decode_rows_exact(
                                            NS4_N_EMBD,
                                            NS4_N_HC) != 0;
     }
+    /* The block's token ids on the device, for the hash-routed layers'
+     * batched router (one async launch per block; the proposer's draft copy
+     * into the same buffer happens after the block, never during it). */
+    ns4_gpu_tensor row_tokens_view;
+    bool row_tokens_ok = false;
+    if (ok && n_tokens > 1u && graph_prefill_tokens(g)) {
+        int32_t ids[rows_cap];
+        for (uint32_t r = 0; r < n_tokens; r++) ids[r] = prompt->v[start + r];
+        row_tokens_ok =
+            graph_borrow_tensor_view(&row_tokens_view, graph_prefill_tokens(g),
+                                     0, (uint64_t)n_tokens * sizeof(int32_t)) &&
+            ns4_gpu_tensor_write_i32_small_tensor(&row_tokens_view, ids,
+                                                  n_tokens) != 0;
+    }
 
     for (uint32_t il = 0; ok && il < NS4_N_LAYER; il++) {
         const ns4_layer_weights *layer = &weights->layer[il];
@@ -43258,7 +43356,7 @@ static bool graph_verify_decode_rows_exact(
                 if (ok && n_tokens > 1u &&
                     getenv("NS4_DSPARK_NO_MOE_BATCH") == NULL &&
                     !g->ssd_streaming &&
-                    layer->ffn_gate_tid2eid == NULL &&
+                    (layer->ffn_gate_tid2eid == NULL || row_tokens_ok) &&
                     !graph_decode_cpu_router_applicable(g, layer) &&
                     graph_batch_router_selected(g) &&
                     graph_batch_router_weights(g) &&
@@ -43325,9 +43423,15 @@ static bool graph_verify_decode_rows_exact(
                                     model->map, model->size,
                                     layer->ffn_exp_probs_b ?
                                         layer->ffn_exp_probs_b->abs_offset : 0,
-                                    0, 0, 0, 0,
-                                    layer->ffn_exp_probs_b != NULL, false,
-                                    &logits_all, NULL,
+                                    layer->ffn_gate_tid2eid ?
+                                        layer->ffn_gate_tid2eid->abs_offset : 0,
+                                    layer->ffn_gate_tid2eid ?
+                                        (uint32_t)layer->ffn_gate_tid2eid->dim[1] : 0,
+                                    0, 0,
+                                    layer->ffn_exp_probs_b != NULL,
+                                    layer->ffn_gate_tid2eid != NULL,
+                                    &logits_all,
+                                    layer->ffn_gate_tid2eid ? &row_tokens_view : NULL,
                                     NS4_N_EXPERT, NS4_N_EXPERT_USED,
                                     NS4_EXPERT_WEIGHT_SCALE, n_tokens);
                     }
@@ -43364,8 +43468,10 @@ static bool graph_verify_decode_rows_exact(
                                       model->map, model->size,
                                       layer->ffn_exp_probs_b ?
                                           layer->ffn_exp_probs_b->abs_offset : 0,
-                                      0,
-                                      0,
+                                      layer->ffn_gate_tid2eid ?
+                                          layer->ffn_gate_tid2eid->abs_offset : 0,
+                                      layer->ffn_gate_tid2eid ?
+                                          (uint32_t)layer->ffn_gate_tid2eid->dim[1] : 0,
                                       (uint32_t)prompt->v[start + r],
                                       NS4_N_EXPERT,
                                       NS4_N_EXPERT_USED,
@@ -43373,7 +43479,7 @@ static bool graph_verify_decode_rows_exact(
                                       0,
                                       0,
                                       layer->ffn_exp_probs_b != NULL,
-                                      false,
+                                      layer->ffn_gate_tid2eid != NULL,
                                       &logits_row) != 0;
                     }
                     ok = ok && bok;
