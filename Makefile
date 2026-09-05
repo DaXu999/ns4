@@ -164,7 +164,7 @@ src/ns4_bench_cpu.o: src/ns4_bench.c src/ns4.h src/ns4_ssd.h src/ns4_distributed
 src/ns4_eval_cpu.o: src/ns4_eval.c src/ns4.h src/ns4_ssd.h src/ns4_distributed.h src/ns4_help.h
 	$(CC) $(CFLAGS) -DNS4_NO_GPU -c -o $@ src/ns4_eval.c
 
-src/ns4_cuda.o: src/ns4_cuda.cu src/ns4_gpu.h src/ns4_gpu_mgpu.h src/ns4_iq2_tables_cuda.inc src/cuda/mmq/ns4_mmq.h
+src/ns4_cuda.o: src/ns4_cuda.cu src/ns4_gpu.h src/ns4_gpu_mgpu.h src/ns4_iq2_tables_cuda.inc src/cuda/mmq/ns4_mmq.h src/cuda/flash2_decode.cuh
 	$(NVCC) $(NVCCFLAGS) -c -o $@ src/ns4_cuda.cu
 
 # Vendored mmq pieces (see src/cuda/mmq/VENDOR.md).  ns4_mmq.cu transitively

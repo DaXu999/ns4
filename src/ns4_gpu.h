@@ -107,7 +107,19 @@ int ns4_gpu_signal_selected_readback_ready(uint64_t *event_value);
 int ns4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label);
 int ns4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label);
 int ns4_gpu_end_commands(void);
+/* Same boundary without the host wait: for phases whose consumer is more
+ * device work (launches or the stream-ordered blocking tensor reads/writes/
+ * copies); execution errors surface at the next read. */
+int ns4_gpu_end_commands_async(void);
 int ns4_gpu_synchronize(void);
+/* Side stream inside an eager decode island: begin forks (later launches go
+ * to the side stream; 0 = refused, launches stay on the decode stream),
+ * leave returns launches to the decode stream with the side work in flight,
+ * join makes the decode stream wait for it.  Callers keep the two streams'
+ * buffers disjoint between fork and join. */
+int ns4_gpu_side_begin(void);
+void ns4_gpu_side_leave(void);
+int ns4_gpu_side_join(void);
 
 int ns4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ns4_gpu_set_model_fd(int fd);
@@ -299,6 +311,23 @@ int ns4_gpu_dspark_markov_argmax_tensor(ns4_gpu_tensor *out_idx,
                                         uint32_t prev_token,
                                         uint32_t vocab,
                                         uint32_t rank);
+/* Whole-proposal chain of the above: keys of slots 1..n_slots-1 (u64 at
+ * scratch+0, 0 = failed) and their confidence logits (f32 at scratch+128),
+ * enqueued back to back on the device; the host reads once.  Slot 0's
+ * token is `first_prev_token`. */
+int ns4_gpu_dspark_markov_chain_tensor(ns4_gpu_tensor *scratch,
+                                       const ns4_gpu_tensor *logits_rows,
+                                       const ns4_gpu_tensor *hidden_rows,
+                                       const void *model_map,
+                                       uint64_t model_size,
+                                       uint64_t w1_offset,
+                                       uint64_t w2_offset,
+                                       uint64_t conf_offset,
+                                       uint32_t first_prev_token,
+                                       uint32_t n_slots,
+                                       uint32_t vocab,
+                                       uint32_t rank,
+                                       uint32_t n_embd);
 int ns4_gpu_indexer_topk_tensor(
         ns4_gpu_tensor       *selected,
         const ns4_gpu_tensor *scores,
@@ -929,7 +958,48 @@ int ns4_gpu_attention_flash2_decode_rows_tensor(
  * in a single block-sequential launch.  Bit-identical to the per-row
  * chain; returns 0 (caller keeps its per-row loop) when any per-row
  * dispatch under the current env would differ.  kv/sc rows are read at
- * row_stride; ratio!=4 blocks must contain no emit. */
+ * row_stride; ratio!=4 blocks must contain no emit.
+ *
+ * ns4_gpu_compressor_block_desc carries the same arguments as a struct;
+ * the pair entry runs two independent programs (the attention and the
+ * indexer frontier) in one launch and returns a bitmask: 1 = the first
+ * ran, 2 = the second ran (only ever together with the first). */
+typedef struct ns4_gpu_compressor_block_desc {
+    const ns4_gpu_tensor *kv_rows;
+    const ns4_gpu_tensor *sc_rows;
+    uint32_t row_stride;
+    ns4_gpu_tensor *state_kv;
+    ns4_gpu_tensor *state_score;
+    ns4_gpu_tensor *emit_out;
+    ns4_gpu_tensor *mirror;
+    ns4_gpu_tensor *cap_kv;
+    ns4_gpu_tensor *cap_score;
+    uint32_t cap_slots;
+    const void *model_map;
+    uint64_t model_size;
+    uint64_t ape_offset;
+    uint32_t ape_type;
+    uint64_t norm_offset;
+    uint32_t norm_type;
+    uint32_t head_dim;
+    uint32_t ratio;
+    uint32_t pos0;
+    uint32_t n_rows;
+    uint32_t emit_row0;
+    uint32_t n_rot;
+    uint32_t n_ctx_orig;
+    float freq_base;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float beta_fast;
+    float beta_slow;
+    float rms_eps;
+    int fp8_emit;
+} ns4_gpu_compressor_block_desc;
+int ns4_gpu_compressor_block_rows_pair_tensor(
+        const ns4_gpu_compressor_block_desc *a,
+        const ns4_gpu_compressor_block_desc *b);
 int ns4_gpu_compressor_block_rows_tensor(
         const ns4_gpu_tensor *kv_rows,
         const ns4_gpu_tensor *sc_rows,

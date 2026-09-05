@@ -85,14 +85,24 @@ __device__ __forceinline__ uint32_t fd2_c_j(uint32_t lane, uint32_t l) {
     return ((lane & 3u) << 1) + (l & 1u);
 }
 
+/* Convert 8 floats (two float4) to halves and store one swizzled 16B chunk. */
+__device__ __forceinline__ void fd2_store_chunk_f4(half *base, uint32_t row,
+                                                   uint32_t c, float4 v0, float4 v1) {
+    const float sv[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+    half tmp[8];
+#pragma unroll
+    for (uint32_t i = 0; i < 8u; i++) tmp[i] = __float2half(sv[i]);
+    *reinterpret_cast<int4 *>(reinterpret_cast<char *>(base) + fd2_off_bytes(row, c)) =
+        *reinterpret_cast<const int4 *>(tmp);
+}
+
 /* Convert 8 consecutive floats to halves and store one swizzled 16B chunk. */
 __device__ __forceinline__ void fd2_store_chunk(half *base, uint32_t row,
                                                 uint32_t c, const float *src) {
-    half tmp[8];
-#pragma unroll
-    for (uint32_t i = 0; i < 8u; i++) tmp[i] = __float2half(src[i]);
-    *reinterpret_cast<int4 *>(reinterpret_cast<char *>(base) + fd2_off_bytes(row, c)) =
-        *reinterpret_cast<const int4 *>(tmp);
+    /* Two float4 loads (rows are whole 512-float lines and chunks 32-byte
+     * aligned) instead of eight scalars; same values, same conversions. */
+    const float4 *s4 = reinterpret_cast<const float4 *>(src);
+    fd2_store_chunk_f4(base, row, c, s4[0], s4[1]);
 }
 
 __device__ __forceinline__ void fd2_store_chunk_zero(half *base, uint32_t row,

@@ -130,10 +130,13 @@ struct ns4_naive_pool : public ggml_cuda_pool {
          * DSpark proposer allocates and frees its MMQ scratch a few times per
          * proposal and synchronises between slots, so with the default zero
          * threshold every cudaMallocAsync went to the driver again (~150 us
-         * of host stall in front of each quantize_mmq_q8_1 launch). */
+         * of host stall in front of each quantize_mmq_q8_1 launch).  The
+         * cache is capped at 256 MiB: an unbounded one would keep the
+         * prefill GEMMs' scratch after the prompt and that is the slack a
+         * 436k-context DSpark session needs for its own late buffers. */
         cudaMemPool_t pool = nullptr;
         if (cudaDeviceGetDefaultMemPool(&pool, device) == cudaSuccess && pool) {
-            cuuint64_t threshold = UINT64_MAX;
+            cuuint64_t threshold = 256ull << 20;
             (void)cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &threshold);
         }
         (void)cudaGetLastError();
