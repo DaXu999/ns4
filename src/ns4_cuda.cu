@@ -519,6 +519,7 @@ static int g_indexer_deq_scratch_device = -1;
 static void *g_fd_scratch;
 static uint64_t g_fd_scratch_bytes;
 static int g_fd_scratch_device = -1;
+static uint64_t g_fd_l2win_bytes;   /* persisting-L2 window over the partials, 0 = off */
 #ifdef NS4_CUDA_HAVE_MXF4
 static void *g_indexer_mxf4_scratch;
 static uint64_t g_indexer_mxf4_scratch_bytes;
@@ -1035,6 +1036,41 @@ static inline cudaError_t cuda_launch_pdl(void (*kernel)(KArgs...), dim3 grid, d
         cuda_pdl_enabled() && !g_decode_graph_capturing;
     cfg.attrs = attr;
     cfg.numAttrs = 1;
+    return cudaLaunchKernelEx(&cfg, kernel, std::forward<Args>(args)...);
+}
+/* cuda_launch_pdl plus an L2 access-policy window: [win, win + win_bytes)
+ * is accessed as persisting, so those lines live in the set-aside region
+ * and are not evicted by the weight streams that follow.  Used for the
+ * rows flash decode kernel, whose split-K partials are produced and
+ * consumed within one layer: without the window every layer's partials
+ * (4 MB per row) get written back to DRAM while the next MoE weights
+ * stream through L2, and that write drain costs the DRAM-bound MoE
+ * kernels ~10% of their bandwidth. */
+template <typename... KArgs, typename... Args>
+static inline cudaError_t cuda_launch_pdl_l2win(void (*kernel)(KArgs...), dim3 grid, dim3 block,
+                                                size_t smem, cudaStream_t stream,
+                                                void *win, uint64_t win_bytes, Args&&... args) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = grid;
+    cfg.blockDim = block;
+    cfg.dynamicSmemBytes = smem;
+    cfg.stream = stream;
+    cudaLaunchAttribute attr[2];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed =
+        cuda_pdl_enabled() && !g_decode_graph_capturing;
+    unsigned int n_attr = 1;
+    if (win && win_bytes) {
+        attr[1].id = cudaLaunchAttributeAccessPolicyWindow;
+        attr[1].val.accessPolicyWindow.base_ptr = win;
+        attr[1].val.accessPolicyWindow.num_bytes = (size_t)win_bytes;
+        attr[1].val.accessPolicyWindow.hitRatio = 1.0f;
+        attr[1].val.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+        attr[1].val.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+        n_attr = 2;
+    }
+    cfg.attrs = attr;
+    cfg.numAttrs = n_attr;
     return cudaLaunchKernelEx(&cfg, kernel, std::forward<Args>(args)...);
 }
 static cudaStream_t g_launch_stream_override = NULL;
@@ -3030,6 +3066,7 @@ extern "C" void ns4_gpu_cleanup(void) {
             g_fd_scratch = NULL;
             g_fd_scratch_bytes = 0;
             g_fd_scratch_device = -1;
+            g_fd_l2win_bytes = 0;
         }
         if (g_indexer_qm_scratch &&
             g_indexer_qm_scratch_device == c->device_id) {
@@ -11740,6 +11777,26 @@ static void *fd_scratch_ensure(uint64_t bytes, int device) {
     }
     g_fd_scratch_bytes = bytes;
     g_fd_scratch_device = device;
+    /* Persisting-L2 set-aside for the partials (see cuda_launch_pdl_l2win);
+     * NS4_CUDA_NO_FD_L2WIN=1 for A/B. */
+    g_fd_l2win_bytes = 0;
+    static int l2win_env = -1;
+    if (l2win_env < 0) l2win_env = getenv("NS4_CUDA_NO_FD_L2WIN") == NULL;
+    if (l2win_env) {
+        int max_persist = 0, max_window = 0;
+        (void)cudaDeviceGetAttribute(&max_persist, cudaDevAttrMaxPersistingL2CacheSize, device);
+        (void)cudaDeviceGetAttribute(&max_window, cudaDevAttrMaxAccessPolicyWindowSize, device);
+        uint64_t want = bytes;
+        if (max_persist > 0 && want > (uint64_t)max_persist) want = (uint64_t)max_persist;
+        if (max_window > 0 && want > (uint64_t)max_window) want = (uint64_t)max_window;
+        size_t got = 0;
+        if (want > 0 && max_persist > 0 &&
+            cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, (size_t)want) == cudaSuccess &&
+            cudaDeviceGetLimit(&got, cudaLimitPersistingL2CacheSize) == cudaSuccess && got > 0) {
+            g_fd_l2win_bytes = (uint64_t)got < want ? (uint64_t)got : want;
+        }
+        (void)cudaGetLastError();
+    }
     return g_fd_scratch;
 }
 
@@ -12680,7 +12737,7 @@ static int attention_flash2_decode_rows_launch(
 
     cudaStream_t stream = cuda_decode_stream();
     const dim3 grid((n_head + kFD2Heads - 1u) / kFD2Heads, max_split, n_rows);
-    cuda_launch_pdl(attention_flash2_decode_rows_kernel, grid, kFD2Threads, 0, stream, 
+    cuda_launch_pdl_l2win(attention_flash2_decode_rows_kernel, grid, kFD2Threads, 0, stream, g_fd_scratch, g_fd_l2win_bytes, 
             args, raw_kv, comp_kv, n_head, raw_cap, n_rows);
     if (!cuda_ok(cudaGetLastError(), "flash2 rows attention launch")) return 0;
 
@@ -18212,8 +18269,13 @@ __global__ static void indexer_score_one_int_rows_kernel(
  *
  * A block scores 256 keys for EVERY row of the verify block, so the key
  * mirror is read once per layer instead of once per row.  The keys decode
- * to int8 in shared memory once; the rows' q decode into a double buffer,
- * the next row staged while the current one computes.  Each 128-byte row
+ * to int8 in shared memory once; the rows' q decode into one buffer, the
+ * next row's mirror words prefetched into registers while the current
+ * one computes.  (A second q buffer put the block at 55.8 KB of shared
+ * memory, past half of this GPU's 100 KB per SM, which capped the kernel
+ * at one block -- 8 warps -- per SM; at 45.3 KB two fit, +2.3% at 436k.
+ * Splitting the rows over grid.y to fill the wave tail measured as
+ * noise, so the block keeps all rows.)  Each 128-byte row
  * keeps its 16-byte chunks XOR-swizzled by (row & 7), which makes ldmatrix
  * conflict-free.  Warp w owns keys 32w..32w+31 as two m16 tiles whose A
  * fragments stay in registers for the whole block; q streams through as n8
@@ -18225,10 +18287,10 @@ __global__ static void indexer_score_one_int_rows_kernel(
 static constexpr uint32_t kIdxMmaKeys = 256u;
 static constexpr uint32_t kIdxMmaSmem =
     kIdxMmaKeys * 128u +                      /* kdec (int8, swizzled) */
-    2u * 64u * 128u +                         /* qdec x2 (int8, swizzled) */
+    64u * 128u +                              /* qdec (int8, swizzled) */
     kIdxMmaKeys * 4u * sizeof(float) +        /* ksc */
-    2u * 64u * 4u * sizeof(float) +           /* qsc x2 */
-    2u * 64u * sizeof(float);                 /* head weights x2 */
+    64u * 4u * sizeof(float) +                /* qsc */
+    64u * sizeof(float);                      /* head weights */
 
 __device__ __forceinline__ static uint32_t idx_mma_swz(uint32_t row, uint32_t byte) {
     return row * 128u + ((((byte >> 4u) ^ row) & 7u) << 4u) + (byte & 15u);
@@ -18270,9 +18332,9 @@ static void indexer_score_mma_rows_kernel(
     extern __shared__ __align__(128) unsigned char idx_dyn[];
     unsigned char *kdec = idx_dyn;
     unsigned char *qdec = kdec + kIdxMmaKeys * 128u;
-    float *ksc = (float *)(qdec + 2u * 64u * 128u);
+    float *ksc = (float *)(qdec + 64u * 128u);
     float *qsc = ksc + kIdxMmaKeys * 4u;
-    float *wsm = qsc + 2u * 64u * 4u;
+    float *wsm = qsc + 64u * 4u;
     __shared__ uint32_t s_ncomp[kFD2RowsMax];
     __shared__ float *s_scores[kFD2RowsMax];
     const uint32_t tid = threadIdx.x;
@@ -18309,15 +18371,14 @@ static void indexer_score_mma_rows_kernel(
         qs = ((const float *)(qm + (uint64_t)(tid >> 2u) * NS4_CUDA_INDEXER_MIRROR_ROW_BYTES + 64u))[tid & 3u] * 0.5f;
         qwt = tid < 64u ? w0[r * 64u + tid] : 0.0f;
     };
-    auto q_store = [&](uint32_t buf) {
-        unsigned char *qd = qdec + buf * (64u * 128u);
+    auto q_store = [&]() {
 #pragma unroll
         for (uint32_t u = 0; u < 4u; u++) {
             const uint32_t i = tid + u * 256u;
-            *(uint2 *)(qd + idx_mma_swz(i >> 4u, (i & 15u) * 8u)) = idx_mma_decode8(qw[u]);
+            *(uint2 *)(qdec + idx_mma_swz(i >> 4u, (i & 15u) * 8u)) = idx_mma_decode8(qw[u]);
         }
-        qsc[buf * 256u + tid] = qs;
-        if (tid < 64u) wsm[buf * 64u + tid] = qwt;
+        qsc[tid] = qs;
+        if (tid < 64u) wsm[tid] = qwt;
     };
 
     q_load(0u);
@@ -18336,7 +18397,7 @@ static void indexer_score_mma_rows_kernel(
             ? ((const float *)(k_mirror + (uint64_t)(c0 + r) * NS4_CUDA_INDEXER_MIRROR_ROW_BYTES + 64u))[i & 3u] * 0.5f
             : 0.0f;
     }
-    q_store(0u);
+    q_store();
     __syncthreads();
 
     const uint32_t key0 = warp * 32u;
@@ -18366,12 +18427,11 @@ static void indexer_score_mma_rows_kernel(
     }
     const uint32_t brow = lane & 7u;
     for (uint32_t r = 0; r < n_rows; r++) {
-        const uint32_t cur = r & 1u;
         const bool more = r + 1u < n_rows;
         if (more) q_load(r + 1u);
-        const unsigned char *qd = qdec + cur * (64u * 128u);
-        const float *qsr = qsc + cur * 256u;
-        const float *wr = wsm + cur * 64u;
+        const unsigned char *qd = qdec;
+        const float *qsr = qsc;
+        const float *wr = wsm;
         float run[2][2] = {{0.0f, 0.0f}, {0.0f, 0.0f}};
         for (uint32_t j = 0; j < 8u; j++) {
             const uint32_t h0 = j * 8u;
@@ -18430,8 +18490,12 @@ static void indexer_score_mma_rows_kernel(
                 }
             }
         }
-        if (more) q_store(cur ^ 1u);
-        __syncthreads();
+        /* Every warp is done reading this row's q before it is replaced. */
+        if (more) {
+            __syncthreads();
+            q_store();
+            __syncthreads();
+        }
     }
 }
 
@@ -26496,6 +26560,209 @@ moe_gate_up_mid_decode_aligned_w32_uniq_kernel(
     }
 }
 
+/* Tensor-core twin of the uniq kernel above for the 16-block (4096-wide)
+ * expert input: mma.m16n8k32.s8 with rows 0-7 gate / 8-15 up of one
+ * 8-row group and the 8 plan chooser rows as columns; one k-step is one
+ * iq2 group (one scale), lane q of a quad holding grid entry q of the
+ * group.  The int8 A bytes come from two 32-bit lookup tables (s_code:
+ * grid value >> 4 per nibble, s_sgn: sign bits incl. the parity bit at
+ * nibble bit 2) and __byte_perm from {8,25,43,62,-8,...}; every mma runs
+ * from a zero accumulator and is scaled in int32 by the group scale.
+ * The float path is fma(0.125 dq xd, sum, acc) from 0.0f per block with
+ * the 16 blocks visited in bit-reversed order, so the running sums pair
+ * (g, g+8), then g+4, g+2, g+1 exactly like the reference's lane tree:
+ * bit-identical to moe_gate_up_mid_decode_aligned_w32_uniq_kernel.
+ * Dynamic shared = n_rows x 4128 bytes: the chooser rows' quants at a
+ * 1032-word stride (32-byte pad keeps the B loads conflict-free). */
+#define NS4_MOE_UNIQ_MMA_ROWW 1032u
+#define NS4_MOE_UNIQ_MMA_ROW_BYTES (NS4_MOE_UNIQ_MMA_ROWW * 4u)
+#define NS4_MOE_UNIQ_MMA_VPOS 0x3e2b1908u
+#define NS4_MOE_UNIQ_MMA_VNEG 0xc2d5e7f8u
+#define NS4_MOE_UNIQ_MMA_WARPS 4u
+#define NS4_MOE_UNIQ_MMA_ROWS (8u * NS4_MOE_UNIQ_MMA_WARPS)
+#define NS4_MOE_UNIQ_MMA_THREADS (32u * NS4_MOE_UNIQ_MMA_WARPS)
+
+/* bit reversal of a 3-bit index: the block-pair visiting order */
+__device__ __forceinline__ static uint32_t moe_uniq_mma_brev3(uint32_t i) {
+    return ((i & 1u) << 2) | (i & 2u) | (i >> 2);
+}
+
+__global__ static void __launch_bounds__(NS4_MOE_UNIQ_MMA_THREADS, 4)
+moe_gate_up_mid_decode_aligned_w32_uniq_mma_kernel(
+        float *mid_out,
+        const uint2 *qs_gate,
+        const __half *dq_gate,
+        const uint2 *qs_up,
+        const __half *dq_up,
+        const cuda_block_q8_K *xq,
+        const ns4_moe_rows_plan *plan,
+        const float *weights,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        float clamp) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;      /* 8-row group within the block */
+    const uint32_t g = lane >> 2u;
+    const uint32_t q = lane & 3u;
+    extern __shared__ __align__(16) unsigned char moe_uniq_mma_smem[];
+    uint32_t *sxq = (uint32_t *)moe_uniq_mma_smem;
+    __shared__ uint32_t s_code[256];
+    __shared__ uint32_t s_sgn[128];
+    __shared__ __align__(16) float s_xd[16][NS4_MOE_PLAN_MAX_ROWS];
+    __shared__ uint32_t s_pair[NS4_MOE_PLAN_MAX_ROWS];
+    /* the LUTs depend on nothing upstream: build them before the wait */
+    for (uint32_t i = threadIdx.x; i < 256u; i += NS4_MOE_UNIQ_MMA_THREADS) {
+        const uint64_t e = cuda_iq2xxs_grid[i];
+        uint32_t c = 0;
+        #pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) c |= (uint32_t)((e >> (8u * j)) & 0xffu) >> 4u << (4u * j);
+        s_code[i] = c;
+    }
+    for (uint32_t i = threadIdx.x; i < 128u; i += NS4_MOE_UNIQ_MMA_THREADS) {
+        const uint32_t sb = cuda_ksigns_iq2xs[i];
+        uint32_t c = 0;
+        #pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) c |= ((sb >> j) & 1u) << (4u * j + 2u);
+        s_sgn[i] = c;
+    }
+    NS4_PDL_WAIT();
+    const uint32_t u = blockIdx.y;
+    if (u >= plan->n_uniq) return;
+    const uint32_t expert = plan->expert[u];
+    const uint32_t count = plan->count[u];
+    const uint32_t row = blockIdx.x * NS4_MOE_UNIQ_MMA_ROWS + warp * 8u + g;
+    const bool row_ok = row < expert_mid_dim;
+    const uint32_t rrow = row_ok ? row : expert_mid_dim - 1u;
+    const uint64_t rbase = (uint64_t)expert * expert_mid_dim + rrow;
+    const uint4 *pg = (const uint4 *)(qs_gate + rbase * 128u);
+    const uint4 *pu = (const uint4 *)(qs_up + rbase * 128u);
+    /* lane q's 8 scales: q=0 gate[0..7], 1 gate[8..15], 2 up[0..7], 3 up[8..15] */
+    const uint4 dqw = *(const uint4 *)((q < 2u ? dq_gate : dq_up) + rbase * 16u + (q & 1u) * 8u);
+    uint4 cur[4] = { pg[q], pg[8u * 4u + q], pu[q], pu[8u * 4u + q] };
+    if (threadIdx.x < NS4_MOE_PLAN_MAX_ROWS) s_pair[threadIdx.x] = plan->pair[u][threadIdx.x];
+    for (uint32_t k = 0; k < count; k++) {
+        const uint32_t tok = plan->pair[u][k] / n_expert;
+        const uint32_t *src = (const uint32_t *)(xq + (uint64_t)tok * 16u);
+        uint32_t *dst = sxq + k * NS4_MOE_UNIQ_MMA_ROWW;
+        for (uint32_t i = threadIdx.x; i < 1024u; i += NS4_MOE_UNIQ_MMA_THREADS) {
+            dst[i] = src[(i >> 6u) * 73u + 1u + (i & 63u)];
+        }
+        if (threadIdx.x < 16u) s_xd[threadIdx.x][k] = __uint_as_float(src[threadIdx.x * 73u]);
+    }
+    __syncthreads();
+    const uint32_t ktok = g < count ? g : count - 1u;
+    const uint32_t *xrow = sxq + ktok * NS4_MOE_UNIQ_MMA_ROWW + q * 2u;
+    const uint32_t base = lane & ~3u;
+    float ps[4], pp[4], pq[4], pl[4], qv[4], res[4], t[4];
+    #pragma unroll
+    for (uint32_t j = 0; j < 4u; j++) {
+        ps[j] = 0.0f; pp[j] = 0.0f; pq[j] = 0.0f; pl[j] = 0.0f; qv[j] = 0.0f; res[j] = 0.0f; t[j] = 0.0f;
+    }
+    #pragma unroll 1
+    for (uint32_t it = 0; it < 8u; it++) {
+        const uint32_t s = moe_uniq_mma_brev3(it);
+        uint4 nxt[4];
+        if (it + 1u < 8u) {
+            const uint32_t s2 = moe_uniq_mma_brev3(it + 1u);
+            nxt[0] = pg[s2 * 4u + q]; nxt[1] = pg[(s2 + 8u) * 4u + q];
+            nxt[2] = pu[s2 * 4u + q]; nxt[3] = pu[(s2 + 8u) * 4u + q];
+        } else {
+            nxt[0] = nxt[1] = nxt[2] = nxt[3] = make_uint4(0u, 0u, 0u, 0u);
+        }
+        const uint32_t wsel = s >> 1u;
+        const uint32_t myw = wsel == 0u ? dqw.x : wsel == 1u ? dqw.y : wsel == 2u ? dqw.z : dqw.w;
+        uint32_t dw[4];
+        #pragma unroll
+        for (uint32_t j = 0; j < 4u; j++) dw[j] = __shfl_sync(0xffffffffu, myw, base + j);
+        const uint32_t sh = (s & 1u) * 16u;
+        #pragma unroll
+        for (uint32_t h = 0; h < 2u; h++) {
+            const uint32_t b = s + 8u * h;
+            const uint4 wg = cur[h];
+            const uint4 wu = cur[2u + h];
+            int32_t acc0 = 0, acc1 = 0, acc2 = 0, acc3 = 0;
+            const uint32_t *xb = xrow + b * 64u;
+            #pragma unroll
+            for (uint32_t i = 0; i < 8u; i++) {
+                const uint32_t src = base + (i >> 1u);
+                const uint32_t g0 = __shfl_sync(0xffffffffu, (i & 1u) ? wg.z : wg.x, src);
+                const uint32_t g1 = __shfl_sync(0xffffffffu, (i & 1u) ? wg.w : wg.y, src);
+                const uint32_t u0 = __shfl_sync(0xffffffffu, (i & 1u) ? wu.z : wu.x, src);
+                const uint32_t u1 = __shfl_sync(0xffffffffu, (i & 1u) ? wu.w : wu.y, src);
+                const uint32_t selg = s_code[(g0 >> (8u * q)) & 0xffu] | s_sgn[(g1 >> (7u * q)) & 127u];
+                const uint32_t selu = s_code[(u0 >> (8u * q)) & 0xffu] | s_sgn[(u1 >> (7u * q)) & 127u];
+                const uint32_t a0 = __byte_perm(NS4_MOE_UNIQ_MMA_VPOS, NS4_MOE_UNIQ_MMA_VNEG, selg);
+                const uint32_t a2 = __byte_perm(NS4_MOE_UNIQ_MMA_VPOS, NS4_MOE_UNIQ_MMA_VNEG, selg >> 16u);
+                const uint32_t a1 = __byte_perm(NS4_MOE_UNIQ_MMA_VPOS, NS4_MOE_UNIQ_MMA_VNEG, selu);
+                const uint32_t a3 = __byte_perm(NS4_MOE_UNIQ_MMA_VPOS, NS4_MOE_UNIQ_MMA_VNEG, selu >> 16u);
+                const int32_t lsg = (int32_t)(2u * (g1 >> 28) + 1u);
+                const int32_t lsu = (int32_t)(2u * (u1 >> 28) + 1u);
+                const uint2 bb = *(const uint2 *)(xb + i * 8u);
+                int32_t d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+                mma_m16n8k32_s8(d0, d1, d2, d3, a0, a1, a2, a3, bb.x, bb.y);
+                acc0 += d0 * lsg; acc1 += d1 * lsg; acc2 += d2 * lsu; acc3 += d3 * lsu;
+            }
+            const float2 xd = *(const float2 *)&s_xd[b][2u * q];
+            const float dg = __half2float(__ushort_as_half((uint16_t)(dw[h] >> sh)));
+            const float du = __half2float(__ushort_as_half((uint16_t)(dw[2u + h] >> sh)));
+            const float xg = 0.125f * dg;
+            const float xu = 0.125f * du;
+            if (h == 0u) {
+                t[0] = __fmaf_rn(xg * xd.x, (float)acc0, 0.0f);
+                t[1] = __fmaf_rn(xg * xd.y, (float)acc1, 0.0f);
+                t[2] = __fmaf_rn(xu * xd.x, (float)acc2, 0.0f);
+                t[3] = __fmaf_rn(xu * xd.y, (float)acc3, 0.0f);
+            } else {
+                t[0] = __fmaf_rn(xg * xd.x, (float)acc0, t[0]);
+                t[1] = __fmaf_rn(xg * xd.y, (float)acc1, t[1]);
+                t[2] = __fmaf_rn(xu * xd.x, (float)acc2, t[2]);
+                t[3] = __fmaf_rn(xu * xd.y, (float)acc3, t[3]);
+            }
+        }
+        /* tree: s_g = t_g + t_{g+8} (done), p_g = s_g + s_{g+4}, q_g = p_g + p_{g+2}, r = q_0 + q_1 */
+        if ((it & 1u) == 0u) {
+            #pragma unroll
+            for (uint32_t j = 0; j < 4u; j++) ps[j] = t[j];
+        } else {
+            #pragma unroll
+            for (uint32_t j = 0; j < 4u; j++) pl[j] = ps[j] + t[j];
+            if ((it & 2u) == 0u) {
+                #pragma unroll
+                for (uint32_t j = 0; j < 4u; j++) pp[j] = pl[j];
+            } else {
+                #pragma unroll
+                for (uint32_t j = 0; j < 4u; j++) qv[j] = pp[j] + pl[j];
+                if ((it & 4u) == 0u) {
+                    #pragma unroll
+                    for (uint32_t j = 0; j < 4u; j++) pq[j] = qv[j];
+                } else {
+                    #pragma unroll
+                    for (uint32_t j = 0; j < 4u; j++) res[j] = pq[j] + qv[j];
+                }
+            }
+        }
+        #pragma unroll
+        for (uint32_t j = 0; j < 4u; j++) cur[j] = nxt[j];
+    }
+    if (!row_ok) return;
+    #pragma unroll
+    for (uint32_t j = 0; j < 2u; j++) {
+        const uint32_t k = 2u * q + j;
+        if (k < count) {
+            float gk = res[j];
+            float uk = res[2u + j];
+            if (clamp > 1.0e-6f) {
+                if (gk > clamp) gk = clamp;
+                if (uk > clamp) uk = clamp;
+                if (uk < -clamp) uk = -clamp;
+            }
+            const uint32_t pair = s_pair[k];
+            const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+            mid_out[off] = (gk / (1.0f + expf(-gk))) * uk * weights[pair];
+        }
+    }
+}
+
 __global__ static void moe_gate_up_mid_decode_lut_owned_qwarp32_kernel(
         float *gate_out,
         float *up_out,
@@ -30521,7 +30788,31 @@ static int routed_moe_launch(
                             xq, (const float *)x->ptr, expert_in_dim, n_tokens);
                     }
                     rc = cuda_ok(cudaGetLastError(), "aligned q8_K x quantize") ? 0 : -1;
-                    if (rc == 0 && rows_uniq) {
+                    /* The tensor-core uniq kernel wants the 16-block input
+                     * (its B fragments and scale words index 16 blocks per
+                     * row); NS4_CUDA_NO_MOE_UNIQ_MMA=1 for A/B. */
+                    static int uniq_mma_env = -1;
+                    if (uniq_mma_env < 0) {
+                        uniq_mma_env = getenv("NS4_CUDA_NO_MOE_UNIQ_MMA") == NULL;
+                    }
+                    if (rc == 0 && rows_uniq && uniq_mma_env && xq_blocks == 16u) {
+                        dim3 ugrid((expert_mid_dim + NS4_MOE_UNIQ_MMA_ROWS - 1u) / NS4_MOE_UNIQ_MMA_ROWS,
+                                   n_tokens * n_expert, 1);
+                        cuda_launch_pdl(moe_gate_up_mid_decode_aligned_w32_uniq_mma_kernel, ugrid,
+                            NS4_MOE_UNIQ_MMA_THREADS,
+                            (size_t)n_tokens * NS4_MOE_UNIQ_MMA_ROW_BYTES, aligned_stream,
+                            (float *)mid->ptr,
+                            (const uint2 *)(gate_aligned + dq_bytes),
+                            (const __half *)gate_aligned,
+                            (const uint2 *)(up_aligned + dq_bytes),
+                            (const __half *)up_aligned,
+                            xq,
+                            (const ns4_moe_rows_plan *)plan,
+                            (const float *)weights->ptr,
+                            expert_mid_dim, n_expert, clamp);
+                        rc = cuda_ok(cudaGetLastError(),
+                                     "aligned q8_K gate/up uniq mma launch") ? 0 : -1;
+                    } else if (rc == 0 && rows_uniq) {
                         dim3 ugrid((expert_mid_dim + 7u) / 8u,
                                    n_tokens * n_expert, 1);
                         cuda_launch_pdl(moe_gate_up_mid_decode_aligned_w32_uniq_kernel, ugrid, 256,
