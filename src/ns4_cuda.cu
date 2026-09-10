@@ -7659,6 +7659,19 @@ __device__ __forceinline__ static void mma_m16n8k32_s8(
 #endif
 }
 
+__device__ __forceinline__ static void mma_m16n8k32_u8s8(
+        int32_t &c0, int32_t &c1, int32_t &c2, int32_t &c3,
+        uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+        uint32_t b0, uint32_t b1) {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+r"(c0),"+r"(c1),"+r"(c2),"+r"(c3)
+                 : "r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1));
+#else
+    (void)a0;(void)a1;(void)a2;(void)a3;(void)b0;(void)b1;(void)c0;(void)c1;(void)c2;(void)c3;
+#endif
+}
+
 __device__ __forceinline__ static uint32_t bitrev5(uint32_t i) {
     return ((i & 1u) << 4) | ((i & 2u) << 2) | (i & 4u) | ((i & 8u) >> 2) | ((i & 16u) >> 4);
 }
@@ -28563,6 +28576,173 @@ moe_down_aligned_w32_uniq_kernel(
     }
 }
 
+/* Tensor-core twin of moe_down_aligned_w32_uniq_kernel for the 8-block
+ * (2048-wide) expert input.  mma.m16n8k32 u8 x s8: the 16 A rows are the
+ * two parities of 8 Q2_K row pairs (row g = pair g parity 0, row g+8 =
+ * parity 1, so one pair-block uint4 feeds both), the 8 B columns are the
+ * plan's chooser pairs.  A k-step is 32 values = 2 sub-blocks; lane q of a
+ * quad holds values 8q..8q+7 of the step (a free k-permutation applied to
+ * A and B alike), which lie inside sub-block 2i + (q>>1), so the lane
+ * pre-multiplies its 2-bit codes by that sub-block's 4-bit scale (<= 45,
+ * no byte carries) and the mma accumulates isum = sum scale * q2 * q8
+ * exactly in int32; a second mma with A = the sub-block min replicated
+ * over its 16 values gives summs = sum bsums * min (bsums are exact int8
+ * sums).  The per-block float term is the reference's
+ * acc = 0 + (dall * isum - dmin * summs) with the same contraction, and
+ * the 8 blocks are visited in bit-reversed order so the running sums pair
+ * (g, g+4), (g+2), (g+1) exactly like the reference's xor-16/8/4 lane
+ * tree: bit-identical partials, moe_mmq_sum_kernel unchanged.  Dynamic
+ * shared = n_rows x 2080 bytes (the chooser pairs' 8 q8_K blocks of quants
+ * at a 520-word stride; the 32-byte pad keeps the B loads conflict-free). */
+#define NS4_MOE_DOWN_MMA_ROWW 520u
+#define NS4_MOE_DOWN_MMA_ROW_BYTES (NS4_MOE_DOWN_MMA_ROWW * 4u)
+#define NS4_MOE_DOWN_MMA_WARPS 4u
+#define NS4_MOE_DOWN_MMA_THREADS (32u * NS4_MOE_DOWN_MMA_WARPS)
+#define NS4_MOE_DOWN_MMA_PAIRS (8u * NS4_MOE_DOWN_MMA_WARPS)
+
+/* the reference's per-block term: FMUL dmin*summs, FFMA dall*isum - that,
+ * FADD from the zero accumulator */
+__device__ __forceinline__ static float moe_down_mma_term(float dall, float dmin, int32_t isum, int32_t summs) {
+    return __fadd_rn(0.0f, __fmaf_rn(dall, (float)isum, -__fmul_rn(dmin, (float)summs)));
+}
+
+__global__ static void __launch_bounds__(NS4_MOE_DOWN_MMA_THREADS, 4)
+moe_down_aligned_w32_uniq_mma_kernel(
+        float *partial,
+        const uint32_t *dm2,
+        const uint32_t *sc4,
+        const uint32_t *qs2,
+        const cuda_block_q8_K *midq,
+        const ns4_moe_rows_plan *plan,
+        uint32_t out_dim) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t g = lane >> 2u;
+    const uint32_t q = lane & 3u;
+    extern __shared__ __align__(16) unsigned char moe_down_mma_smem[];
+    uint32_t *sxq = (uint32_t *)moe_down_mma_smem;
+    __shared__ __align__(16) float s_xd[8][NS4_MOE_PLAN_MAX_ROWS];
+    __shared__ uint32_t s_pair[NS4_MOE_PLAN_MAX_ROWS];
+    NS4_PDL_WAIT();
+    const uint32_t u = blockIdx.y;
+    if (u >= plan->n_uniq) return;
+    const uint32_t expert = plan->expert[u];
+    const uint32_t count = plan->count[u];
+    const uint32_t n_pairs = out_dim >> 1u;
+    const uint32_t rp = blockIdx.x * NS4_MOE_DOWN_MMA_PAIRS + warp * 8u + g;
+    const bool ok = rp < n_pairs;
+    const uint32_t rrp = ok ? rp : n_pairs - 1u;
+    /* pair-block index of this row pair's block 0 (its 8 blocks are consecutive) */
+    const uint64_t pbase = ((uint64_t)expert * n_pairs + rrp) * 8ull;
+    const uint4 *pq = (const uint4 *)(qs2 + pbase * 32ull);
+    const uint4 *psc = (const uint4 *)(sc4 + pbase * 8ull);
+    const uint2 *pdm = (const uint2 *)(dm2 + pbase * 2ull);
+    uint4 cq0 = pq[q], cq1 = pq[4u + q];
+    uint4 cs0 = psc[0], cs1 = psc[1];
+    uint2 cdm = pdm[0];
+    if (threadIdx.x < NS4_MOE_PLAN_MAX_ROWS) s_pair[threadIdx.x] = plan->pair[u][threadIdx.x];
+    for (uint32_t k = 0; k < count; k++) {
+        const uint32_t *src = (const uint32_t *)(midq + (uint64_t)plan->pair[u][k] * 8u);
+        uint32_t *dst = sxq + k * NS4_MOE_DOWN_MMA_ROWW;
+        for (uint32_t i = threadIdx.x; i < 512u; i += NS4_MOE_DOWN_MMA_THREADS) {
+            dst[i] = src[(i >> 6u) * 73u + 1u + (i & 63u)];
+        }
+        if (threadIdx.x < 8u) s_xd[threadIdx.x][k] = __uint_as_float(src[threadIdx.x * 73u]);
+    }
+    __syncthreads();
+    const uint32_t ktok = g < count ? g : count - 1u;
+    const uint32_t *xrow = sxq + ktok * NS4_MOE_DOWN_MMA_ROWW + q * 2u;
+    const uint32_t qsh = 8u * (q >> 1u);
+    float ps[4], pp[4], pq_[4], pl[4], qv[4], res[4], t[4];
+    #pragma unroll
+    for (uint32_t j = 0; j < 4u; j++) {
+        ps[j] = 0.0f; pp[j] = 0.0f; pq_[j] = 0.0f; pl[j] = 0.0f; qv[j] = 0.0f; res[j] = 0.0f; t[j] = 0.0f;
+    }
+    #pragma unroll 1
+    for (uint32_t it = 0; it < 8u; it++) {
+        const uint32_t b = moe_uniq_mma_brev3(it);
+        uint4 nq0, nq1, ns0, ns1;
+        uint2 ndm;
+        if (it + 1u < 8u) {
+            const uint32_t b2 = moe_uniq_mma_brev3(it + 1u);
+            nq0 = pq[b2 * 8u + q]; nq1 = pq[b2 * 8u + 4u + q];
+            ns0 = psc[b2 * 2u]; ns1 = psc[b2 * 2u + 1u];
+            ndm = pdm[b2];
+        } else {
+            nq0 = nq1 = ns0 = ns1 = make_uint4(0u, 0u, 0u, 0u);
+            ndm = make_uint2(0u, 0u);
+        }
+        int32_t d0 = 0, d1 = 0, d2 = 0, d3 = 0;   /* isum: (g,2q) (g,2q+1) (g+8,2q) (g+8,2q+1) */
+        int32_t e0 = 0, e1 = 0, e2 = 0, e3 = 0;   /* summs */
+        const uint32_t *xb = xrow + b * 64u;
+        #pragma unroll
+        for (uint32_t i = 0; i < 8u; i++) {
+            /* code words for values 8q..8q+7 of k-step i: words 8*(i>>2) + 2q, +1;
+             * .x/.z parity 0, .y/.w parity 1 */
+            const uint4 wv = (i < 4u) ? cq0 : cq1;
+            const uint32_t sh = 2u * (i & 3u);
+            /* scale bytes: sub-block s = 2i + (q>>1) = word (i>>1)&1 of the
+             * i<4 ? cs0 : cs1 quad (parity 0 in .x/.y, parity 1 in .z/.w),
+             * byte 2(i&1) + (q>>1) */
+            const uint4 sv = (i < 4u) ? cs0 : cs1;
+            const uint32_t sw0 = ((i >> 1u) & 1u) ? sv.y : sv.x;
+            const uint32_t sw1 = ((i >> 1u) & 1u) ? sv.w : sv.z;
+            const uint32_t sb0 = (sw0 >> (qsh + 16u * (i & 1u))) & 0xffu;
+            const uint32_t sb1 = (sw1 >> (qsh + 16u * (i & 1u))) & 0xffu;
+            const uint32_t a0 = ((wv.x >> sh) & 0x03030303u) * (sb0 & 0xfu);
+            const uint32_t a2 = ((wv.z >> sh) & 0x03030303u) * (sb0 & 0xfu);
+            const uint32_t a1 = ((wv.y >> sh) & 0x03030303u) * (sb1 & 0xfu);
+            const uint32_t a3 = ((wv.w >> sh) & 0x03030303u) * (sb1 & 0xfu);
+            const uint32_t m0 = (sb0 >> 4u) * 0x01010101u;
+            const uint32_t m1 = (sb1 >> 4u) * 0x01010101u;
+            const uint2 bb = *(const uint2 *)(xb + i * 8u);
+            mma_m16n8k32_u8s8(d0, d1, d2, d3, a0, a1, a2, a3, bb.x, bb.y);
+            mma_m16n8k32_u8s8(e0, e1, e2, e3, m0, m1, m0, m1, bb.x, bb.y);
+        }
+        const float2 xd = *(const float2 *)&s_xd[b][2u * q];
+        const float wd0 = __half2float(__ushort_as_half((uint16_t)(cdm.x & 0xffffu)));
+        const float wm0 = __half2float(__ushort_as_half((uint16_t)(cdm.x >> 16u)));
+        const float wd1 = __half2float(__ushort_as_half((uint16_t)(cdm.y & 0xffffu)));
+        const float wm1 = __half2float(__ushort_as_half((uint16_t)(cdm.y >> 16u)));
+        t[0] = moe_down_mma_term(xd.x * wd0, xd.x * wm0, d0, e0);
+        t[1] = moe_down_mma_term(xd.y * wd0, xd.y * wm0, d1, e1);
+        t[2] = moe_down_mma_term(xd.x * wd1, xd.x * wm1, d2, e2);
+        t[3] = moe_down_mma_term(xd.y * wd1, xd.y * wm1, d3, e3);
+        /* tree: s_g = t_g + t_{g+4}, p_g = s_g + s_{g+2}, r = p_0 + p_1 */
+        if ((it & 1u) == 0u) {
+            #pragma unroll
+            for (uint32_t j = 0; j < 4u; j++) ps[j] = t[j];
+        } else {
+            #pragma unroll
+            for (uint32_t j = 0; j < 4u; j++) pl[j] = ps[j] + t[j];
+            if ((it & 2u) == 0u) {
+                #pragma unroll
+                for (uint32_t j = 0; j < 4u; j++) pp[j] = pl[j];
+            } else {
+                #pragma unroll
+                for (uint32_t j = 0; j < 4u; j++) qv[j] = pp[j] + pl[j];
+                if ((it & 4u) == 0u) {
+                    #pragma unroll
+                    for (uint32_t j = 0; j < 4u; j++) pq_[j] = qv[j];
+                } else {
+                    #pragma unroll
+                    for (uint32_t j = 0; j < 4u; j++) res[j] = pq_[j] + qv[j];
+                }
+            }
+        }
+        cq0 = nq0; cq1 = nq1; cs0 = ns0; cs1 = ns1; cdm = ndm;
+    }
+    if (!ok) return;
+    #pragma unroll
+    for (uint32_t j = 0; j < 4u; j++) {
+        const uint32_t n = 2u * q + (j & 1u);
+        if (n < count) {
+            const uint32_t row = 2u * rp + (j >> 1u);
+            partial[(uint64_t)s_pair[n] * out_dim + row] = res[j];
+        }
+    }
+}
+
 __global__ static void moe_down_owned_slots_qwarp32_kernel(
         float *down_out,
         const char *down_base,
@@ -30910,18 +31090,44 @@ static int routed_moe_launch(
                             (midq_blocks % 8u) == 0u &&
                             getenv("NS4_CUDA_MOE_NO_ALIGNED_DOWN_W32") == NULL;
                         if (rc == 0 && use_down_w32 && rows_uniq) {
-                            dim3 ugrid((out_dim + 7u) / 8u, n_tokens * n_expert, 1);
-                            cuda_launch_pdl(moe_down_aligned_w32_uniq_kernel, ugrid, 256, 0, aligned_stream,
-                                (float *)down->ptr,
-                                (const uint32_t *)down_aligned,
-                                (const uint32_t *)(down_aligned + dm_bytes),
-                                (const uint32_t *)(down_aligned + dm_bytes + sc_bytes),
-                                midq,
-                                (const ns4_moe_rows_plan *)plan,
-                                midq_blocks,
-                                out_dim);
-                            rc = cuda_ok(cudaGetLastError(),
-                                         "aligned q8_K down uniq launch") ? 0 : -1;
+                            /* The tensor-core down twin wants the 8-block
+                             * input (one block per quad group, like the w32
+                             * tree); NS4_CUDA_NO_MOE_DOWN_MMA=1 for A/B. */
+                            static int down_mma_env = -1;
+                            if (down_mma_env < 0) {
+                                down_mma_env = getenv("NS4_CUDA_NO_MOE_DOWN_MMA") == NULL;
+                            }
+                            if (down_mma_env && midq_blocks == 8u) {
+                                const uint32_t n_stage = n_tokens < NS4_MOE_PLAN_MAX_ROWS ?
+                                    n_tokens : NS4_MOE_PLAN_MAX_ROWS;
+                                dim3 ugrid((out_dim / 2u + NS4_MOE_DOWN_MMA_PAIRS - 1u) / NS4_MOE_DOWN_MMA_PAIRS,
+                                           n_tokens * n_expert, 1);
+                                cuda_launch_pdl(moe_down_aligned_w32_uniq_mma_kernel, ugrid,
+                                    NS4_MOE_DOWN_MMA_THREADS,
+                                    (size_t)n_stage * NS4_MOE_DOWN_MMA_ROW_BYTES, aligned_stream,
+                                    (float *)down->ptr,
+                                    (const uint32_t *)down_aligned,
+                                    (const uint32_t *)(down_aligned + dm_bytes),
+                                    (const uint32_t *)(down_aligned + dm_bytes + sc_bytes),
+                                    midq,
+                                    (const ns4_moe_rows_plan *)plan,
+                                    out_dim);
+                                rc = cuda_ok(cudaGetLastError(),
+                                             "aligned q8_K down uniq mma launch") ? 0 : -1;
+                            } else {
+                                dim3 ugrid((out_dim + 7u) / 8u, n_tokens * n_expert, 1);
+                                cuda_launch_pdl(moe_down_aligned_w32_uniq_kernel, ugrid, 256, 0, aligned_stream,
+                                    (float *)down->ptr,
+                                    (const uint32_t *)down_aligned,
+                                    (const uint32_t *)(down_aligned + dm_bytes),
+                                    (const uint32_t *)(down_aligned + dm_bytes + sc_bytes),
+                                    midq,
+                                    (const ns4_moe_rows_plan *)plan,
+                                    midq_blocks,
+                                    out_dim);
+                                rc = cuda_ok(cudaGetLastError(),
+                                             "aligned q8_K down uniq launch") ? 0 : -1;
+                            }
                             if (rc == 0) {
                                 const uint64_t n = (uint64_t)n_tokens * out_dim;
                                 cuda_launch_pdl(moe_mmq_sum_kernel, (uint32_t)((n + 255u) / 256u), 256, 0, aligned_stream,
