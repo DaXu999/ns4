@@ -118,7 +118,18 @@ int ns4_gpu_synchronize(void);
  * join makes the decode stream wait for it.  Callers keep the two streams'
  * buffers disjoint between fork and join. */
 int ns4_gpu_side_begin(void);
+/* Same fork on a greatest-priority stream: its blocks dispatch ahead of the
+ * decode stream's pending blocks (for side work the decode stream soon
+ * waits on). */
+int ns4_gpu_side_begin_prio(int high);
 void ns4_gpu_side_leave(void);
+/* Route the decode-stream launches between begin and end to a blocking
+ * stream of the second-greatest priority (legacy default-stream ordering is
+ * preserved; side sections nest under it: the compressor's greatest-
+ * priority side wins, the shared expert's default-priority side loses).
+ * Returns 0 when refused (graph capture, multi-GPU, NS4_CUDA_NO_MAIN_PRIORITY). */
+int ns4_gpu_main_prio_begin(void);
+void ns4_gpu_main_prio_end(int began);
 int ns4_gpu_side_join(void);
 
 int ns4_gpu_set_model_map(const void *model_map, uint64_t model_size);
@@ -578,6 +589,20 @@ int ns4_gpu_matmul_f16_one_wide_rows_exact_tensor(
         const ns4_gpu_tensor *x,
         uint32_t                n_rows);
 
+/* The rows GEMV above with the plain RMS norm of its 16384-wide input
+ * folded in (x is the raw HC row; the normalised row is not written).
+ * Returns 0 (nothing launched) when the shape is not covered. */
+int ns4_gpu_matmul_f16_one_wide_rows_rmsnorm_exact_tensor(
+        ns4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ns4_gpu_tensor *x,
+        uint32_t                n_rows,
+        float                   eps);
+
 /* Optional decode fusion. Returns 1 when the paired projection and
  * recurrent compressor-state store were encoded, 0 when the optimized path
  * is unavailable, and -1 on an attempted-path error. */
@@ -692,6 +717,56 @@ int ns4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor(
         float                   beta_fast,
         float                   beta_slow,
         float                   eps);
+
+/* DSpark verify rows: the qkv norms, the kv rope, the q8_0 image of the
+ * normed q (handed to the following q_b GEMV) and the fp8 KV store in one
+ * launch.  raw_caches NULL skips the store.  Returns 0 (nothing launched)
+ * when the shape is not covered; the caller then issues the four launches. */
+int ns4_gpu_dsv4_qkv_norm_rope_q8_store_rows_tensor(
+        ns4_gpu_tensor                     *q_out,
+        const ns4_gpu_tensor               *q,
+        const void                         *model_map,
+        uint64_t                            model_size,
+        uint64_t                            q_weight_offset,
+        uint32_t                            q_n,
+        ns4_gpu_tensor                     *kv_out,
+        const ns4_gpu_tensor               *kv,
+        uint64_t                            kv_weight_offset,
+        uint32_t                            kv_n,
+        const ns4_gpu_attention_decode_row *rows,
+        uint32_t                            n_rows,
+        uint32_t                            kv_n_head,
+        uint32_t                            kv_head_dim,
+        uint32_t                            n_rot,
+        uint32_t                            n_ctx_orig,
+        float                               freq_base,
+        float                               freq_scale,
+        float                               ext_factor,
+        float                               attn_factor,
+        float                               beta_fast,
+        float                               beta_slow,
+        ns4_gpu_tensor *const              *raw_caches,
+        const uint32_t                     *raw_caps,
+        const uint32_t                     *raw_rows,
+        float                               eps);
+
+/* Per-head RMS norm followed by the tail rope with each row's position, one
+ * launch.  Returns 0 (nothing launched) when the shape is not covered. */
+int ns4_gpu_head_rms_norm_rope_rows_tensor(
+        ns4_gpu_tensor                     *x,
+        const ns4_gpu_attention_decode_row *rows,
+        uint32_t                            n_rows,
+        uint32_t                            n_head,
+        uint32_t                            head_dim,
+        uint32_t                            n_rot,
+        uint32_t                            n_ctx_orig,
+        float                               freq_base,
+        float                               freq_scale,
+        float                               ext_factor,
+        float                               attn_factor,
+        float                               beta_fast,
+        float                               beta_slow,
+        float                               eps);
 
 int ns4_gpu_head_rms_norm_tensor(
         ns4_gpu_tensor *x,
@@ -1350,6 +1425,18 @@ int ns4_gpu_swiglu_tensor(
         float                   clamp,
         float                   weight);
 
+/* n_rows x in_dim swiglu rows whose q8_0 image is handed to the shared-down
+ * GEMV that reads them next.  Returns 0 (nothing launched) when the shape
+ * is not covered; the caller then uses ns4_gpu_swiglu_tensor. */
+int ns4_gpu_swiglu_rows_q8_tensor(
+        ns4_gpu_tensor       *out,
+        const ns4_gpu_tensor *gate,
+        const ns4_gpu_tensor *up,
+        uint32_t                in_dim,
+        uint32_t                n_rows,
+        float                   clamp,
+        float                   weight);
+
 int ns4_gpu_add_tensor(
         ns4_gpu_tensor       *out,
         const ns4_gpu_tensor *a,
@@ -1755,6 +1842,11 @@ int ns4_gpu_shared_down_hc_expand_q8_0_tensor(
         const ns4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc);
+
+/* Launches the deferred routed-MoE partial sum, if one is pending, so
+ * routed_out holds the summed rows; a no-op otherwise.  The verify calls it
+ * before any per-row reader of routed_out. */
+int ns4_gpu_moe_rows_sum_flush(void);
 
 int ns4_gpu_shared_down_hc_expand_rows_exact_tensor(
         ns4_gpu_tensor       *out_hc,
