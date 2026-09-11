@@ -19777,6 +19777,17 @@ __device__ __forceinline__ static void idx_mma_s8(
                  : "r"(a0), "r"(a1), "r"(b0));
 }
 
+/* One m16n8k32 step = the two m16n8k16 steps over a 32-dim group: the A
+ * fragment is the two k16 fragments back to back, likewise B; the integer
+ * accumulation is exact either way. */
+__device__ __forceinline__ static void idx_mma_s8_k32(
+        int (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
 __global__ __launch_bounds__(256, 2)
 static void indexer_score_mma_rows_kernel(
         idx_rows_args args,
@@ -19951,6 +19962,265 @@ static void indexer_score_mma_rows_kernel(
             __syncthreads();
             q_store();
             __syncthreads();
+        }
+    }
+}
+
+/* Batched-load, barrier-free twin of indexer_score_mma_rows_kernel for
+ * verify blocks of up to kIdxMmaV2RowsMax rows (NS4_CUDA_NO_INDEXER_MMA_V2=1
+ * restores the original).  Three changes, all invisible to the arithmetic:
+ *   - every global read of the block (the 256 key mirrors, all rows' q
+ *     mirrors, the head weights) is issued as 16-byte loads before the
+ *     first decode.  The original's decode loop issued one 4-byte load per
+ *     iteration behind a shared store, 20 serial DRAM round trips per
+ *     block: ~10 us of the 13 us a 2-row launch costs at 131k.
+ *   - once the warps hold their A fragments and key scales in registers the
+ *     kdec/ksc region is dead, so every row's q tiles, scales and weights
+ *     are decoded into it at once and the row loop runs with no barrier
+ *     (the original swapped one q buffer per row between two barriers,
+ *     which held all eight warps in the same pipe at the same time).
+ *   - each 32-dim group is one m16n8k32 MMA instead of two m16n8k16
+ *     (idx_mma_s8_k32): the same int32 accumulation, half the issue slots.
+ * The nibbles decode through a byte-permute table (idx_mma_decode8_lut),
+ * the same sixteen int8 values.  They land in the same swizzled positions, the fragments,
+ * MMAs and the float epilogue are the original's expression by expression,
+ * so every score is bit-identical. */
+/* idx_mma_decode8 through byte permutes: each e2m1 nibble is a selector
+ * into an eight-entry magnitude table, the sign bit picks the negated
+ * table through PRMT's sign-replicate mode (selector 8 replicates the MSB
+ * of a 0x80 byte into 0xFF, selector 1 reads a zero byte), and one LOP3
+ * merges the two.  Same sixteen int8 values as e2m1_nibble_to_i8
+ * ({0,1,2,3,4,6,8,12}, negated for nibbles 8..15, -0 = 0), ~2 instructions
+ * a nibble instead of ~9.  The permute is inline PTX on purpose: the
+ * __byte_perm intrinsic promises only the low three bits of each selector
+ * nibble, so the compiler deletes the sign bit of the selector and the
+ * replicate mode never reaches the hardware. */
+__device__ __forceinline__ static uint32_t idx_prmt(uint32_t x, uint32_t y, uint32_t s) {
+    uint32_t r;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(r) : "r"(x), "r"(y), "r"(s));
+    return r;
+}
+__device__ __forceinline__ static uint32_t idx_mma_decode4_lut(uint32_t nib4 /* four nibbles, bits 0..15 */) {
+    const uint32_t sel = nib4 & 0x7777u;
+    const uint32_t pos = idx_prmt(0x03020100u, 0x0C080604u, sel);
+    const uint32_t neg = idx_prmt(0xFDFEFF00u, 0xF4F8FAFCu, sel);
+    const uint32_t msel = (nib4 & 0x8888u) | ((~nib4 & 0x8888u) >> 3u);
+    const uint32_t mask = idx_prmt(0x80u, 0u, msel);
+    return (pos & ~mask) | (neg & mask);
+}
+__device__ __forceinline__ static uint2 idx_mma_decode8_lut(uint32_t w) {
+    return make_uint2(idx_mma_decode4_lut(w), idx_mma_decode4_lut(w >> 16u));
+}
+
+static constexpr uint32_t kIdxMmaV2RowsMax = 5u;
+static constexpr uint32_t kIdxMmaV2QRow = 64u * 128u;             /* one row's decoded q tiles */
+static constexpr uint32_t kIdxMmaV2Smem =
+    kIdxMmaV2RowsMax * kIdxMmaV2QRow +                             /* q rows (over the dead kdec+ksc) */
+    kIdxMmaV2RowsMax * 64u * 4u * sizeof(float) +                  /* qsc */
+    kIdxMmaV2RowsMax * 64u * sizeof(float);                        /* head weights */
+static_assert(kIdxMmaV2RowsMax * kIdxMmaV2QRow >= kIdxMmaKeys * 128u + kIdxMmaKeys * 4u * sizeof(float),
+              "q rows region must cover kdec + ksc");
+static_assert(NS4_CUDA_INDEXER_MIRROR_ROW_BYTES == 80u, "v2 scorer assumes 80-byte mirror rows");
+
+__global__ __launch_bounds__(256, 2)
+static void indexer_score_mma_rows_v2_kernel(
+        idx_rows_args args,
+        const unsigned char *k_mirror,
+        float scale,
+        uint32_t n_rows,
+        uint32_t max_comp) {
+    NS4_PDL_WAIT();
+    extern __shared__ __align__(128) unsigned char idx_dyn[];
+    unsigned char *kdec = idx_dyn;                                   /* phase 1 */
+    float *ksc = (float *)(idx_dyn + kIdxMmaKeys * 128u);            /* phase 1 */
+    unsigned char *qrows = idx_dyn;                                  /* phase 2 */
+    float *qsc = (float *)(idx_dyn + kIdxMmaV2RowsMax * kIdxMmaV2QRow);
+    float *wsm = qsc + kIdxMmaV2RowsMax * 64u * 4u;
+    __shared__ uint32_t s_ncomp[kFD2RowsMax];
+    __shared__ float *s_scores[kFD2RowsMax];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp = tid >> 5u;
+    const uint32_t lane = tid & 31u;
+    const uint32_t c0 = blockIdx.x * kIdxMmaKeys;
+    if (c0 >= max_comp) return;
+    const uint32_t nk = max_comp - c0 < kIdxMmaKeys ? max_comp - c0 : kIdxMmaKeys;
+    const unsigned char *qm0 = args.row[0].qm;
+    const float *w0 = args.row[0].weights;
+    if (tid == 0) {
+#pragma unroll
+        for (uint32_t r = 0; r < kFD2RowsMax; r++) {
+            if (r < n_rows) {
+                s_ncomp[r] = args.row[r].n_comp;
+                s_scores[r] = args.row[r].scores;
+            }
+        }
+    }
+
+    /* Every global read of the block, in flight together. */
+    uint4 kraw[4];
+#pragma unroll
+    for (uint32_t u = 0; u < 4u; u++) {
+        const uint32_t ci = tid + u * 256u;
+        const uint32_t r = ci >> 2u, ch = ci & 3u;
+        kraw[u] = r < nk
+            ? *(const uint4 *)(k_mirror + (uint64_t)(c0 + r) * NS4_CUDA_INDEXER_MIRROR_ROW_BYTES + ch * 16u)
+            : make_uint4(0u, 0u, 0u, 0u);
+    }
+    const float4 ksraw = tid < nk
+        ? *(const float4 *)(k_mirror + (uint64_t)(c0 + tid) * NS4_CUDA_INDEXER_MIRROR_ROW_BYTES + 64u)
+        : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    /* The rows' q mirrors are contiguous: 64 heads x 80 bytes per row, five
+     * 16-byte chunks per head (four of codes, one of scales). */
+    const uint32_t qchunks = 320u * n_rows;
+    uint4 qraw[7];
+#pragma unroll
+    for (uint32_t u = 0; u < 7u; u++) {
+        const uint32_t ci = tid + u * 256u;
+        qraw[u] = ci < qchunks ? *(const uint4 *)(qm0 + (uint64_t)ci * 16u) : make_uint4(0u, 0u, 0u, 0u);
+    }
+    float wraw[2];
+#pragma unroll
+    for (uint32_t u = 0; u < 2u; u++) {
+        const uint32_t i = tid + u * 256u;
+        wraw[u] = i < 64u * n_rows ? w0[i] : 0.0f;
+    }
+    /* Keep every load above the decodes (the compiler otherwise sinks the
+     * q loads below the key decode to save registers: two round trips). */
+    asm volatile("" ::: "memory");
+
+    /* Keys: the original's kdec bytes and ksc values. */
+#pragma unroll
+    for (uint32_t u = 0; u < 4u; u++) {
+        const uint32_t ci = tid + u * 256u;
+        const uint32_t r = ci >> 2u, ch = ci & 3u;
+        const uint32_t wv[4] = {kraw[u].x, kraw[u].y, kraw[u].z, kraw[u].w};
+#pragma unroll
+        for (uint32_t k = 0; k < 4u; k++) {
+            *(uint2 *)(kdec + idx_mma_swz(r, (ch * 4u + k) * 8u)) = idx_mma_decode8_lut(wv[k]);
+        }
+    }
+    *(float4 *)(ksc + tid * 4u) =
+        make_float4(ksraw.x * 0.5f, ksraw.y * 0.5f, ksraw.z * 0.5f, ksraw.w * 0.5f);
+    __syncthreads();
+
+    const uint32_t key0 = warp * 32u;
+    const uint32_t grp = lane >> 2u, tig = lane & 3u;
+    const uint32_t lm = lane >> 3u;
+    uint32_t a[2][8][2];
+    float ks[2][2][4];
+    {
+        const uint32_t arow = (lm & 1u) * 8u + (lane & 7u);
+#pragma unroll
+        for (uint32_t mt = 0; mt < 2u; mt++) {
+#pragma unroll
+            for (uint32_t kp = 0; kp < 4u; kp++) {
+                const uint32_t addr = (uint32_t)__cvta_generic_to_shared(
+                    kdec + idx_mma_swz(key0 + mt * 16u + arow, (2u * kp + (lm >> 1u)) * 16u));
+                idx_mma_ldsm_x4(addr, a[mt][2u * kp][0], a[mt][2u * kp][1],
+                                a[mt][2u * kp + 1u][0], a[mt][2u * kp + 1u][1]);
+            }
+#pragma unroll
+            for (uint32_t half = 0; half < 2u; half++) {
+#pragma unroll
+                for (uint32_t g = 0; g < 4u; g++) {
+                    ks[mt][half][g] = ksc[(key0 + mt * 16u + grp + half * 8u) * 4u + g];
+                }
+            }
+        }
+    }
+    /* Every warp holds its fragments: kdec and ksc are dead. */
+    __syncthreads();
+
+    /* All rows' q: the original q_store's bytes, scales and weights, per row. */
+#pragma unroll
+    for (uint32_t u = 0; u < 7u; u++) {
+        const uint32_t ci = tid + u * 256u;
+        if (ci < qchunks) {
+            const uint32_t hr = ci / 5u, part = ci - hr * 5u;
+            const uint32_t r = hr >> 6u, h = hr & 63u;
+            if (part < 4u) {
+                const uint32_t wv[4] = {qraw[u].x, qraw[u].y, qraw[u].z, qraw[u].w};
+#pragma unroll
+                for (uint32_t k = 0; k < 4u; k++) {
+                    *(uint2 *)(qrows + r * kIdxMmaV2QRow + idx_mma_swz(h, (part * 4u + k) * 8u)) =
+                        idx_mma_decode8_lut(wv[k]);
+                }
+            } else {
+                *(float4 *)(qsc + r * 256u + h * 4u) = make_float4(
+                    __uint_as_float(qraw[u].x) * 0.5f, __uint_as_float(qraw[u].y) * 0.5f,
+                    __uint_as_float(qraw[u].z) * 0.5f, __uint_as_float(qraw[u].w) * 0.5f);
+            }
+        }
+    }
+#pragma unroll
+    for (uint32_t u = 0; u < 2u; u++) {
+        const uint32_t i = tid + u * 256u;
+        if (i < 64u * n_rows) wsm[i] = wraw[u];
+    }
+    __syncthreads();
+
+    const uint32_t brow = lane & 7u;
+    for (uint32_t r = 0; r < n_rows; r++) {
+        const unsigned char *qd = qrows + r * kIdxMmaV2QRow;
+        const float *qsr = qsc + r * 256u;
+        const float *wr = wsm + r * 64u;
+        float run[2][2] = {{0.0f, 0.0f}, {0.0f, 0.0f}};
+#pragma unroll 1
+        for (uint32_t j = 0; j < 8u; j++) {
+            const uint32_t h0 = j * 8u;
+            uint32_t b[8];
+            idx_mma_ldsm_x4((uint32_t)__cvta_generic_to_shared(qd + idx_mma_swz(h0 + brow, lm * 16u)),
+                            b[0], b[1], b[2], b[3]);
+            idx_mma_ldsm_x4((uint32_t)__cvta_generic_to_shared(qd + idx_mma_swz(h0 + brow, (4u + lm) * 16u)),
+                            b[4], b[5], b[6], b[7]);
+            float qs4[2][4];
+#pragma unroll
+            for (uint32_t hh = 0; hh < 2u; hh++) {
+#pragma unroll
+                for (uint32_t g = 0; g < 4u; g++) qs4[hh][g] = qsr[(h0 + 2u * tig + hh) * 4u + g];
+            }
+            float dot[2][4];
+#pragma unroll
+            for (uint32_t g = 0; g < 4u; g++) {
+#pragma unroll
+                for (uint32_t mt = 0; mt < 2u; mt++) {
+                    int c[4] = {0, 0, 0, 0};
+                    idx_mma_s8_k32(c, a[mt][2u * g][0], a[mt][2u * g][1],
+                                   a[mt][2u * g + 1u][0], a[mt][2u * g + 1u][1],
+                                   b[2u * g], b[2u * g + 1u]);
+#pragma unroll
+                    for (uint32_t e = 0; e < 4u; e++) {
+                        const float cf = (float)c[e];
+                        const float p = __fmul_rn(cf, __fmul_rn(ks[mt][e >> 1u][g], qs4[e & 1u][g]));
+                        dot[mt][e] = g == 0u ? p : __fadd_rn(dot[mt][e], p);
+                    }
+                }
+            }
+            const float wa = wr[h0 + 2u * tig], wb = wr[h0 + 2u * tig + 1u];
+#pragma unroll
+            for (uint32_t mt = 0; mt < 2u; mt++) {
+#pragma unroll
+                for (uint32_t half = 0; half < 2u; half++) {
+                    const float t0 = __fmul_rn(__fmul_rn(fmaxf(dot[mt][half * 2u], 0.0f), wa), scale);
+                    const float t1 = __fmul_rn(__fmul_rn(fmaxf(dot[mt][half * 2u + 1u], 0.0f), wb), scale);
+                    const float s = __fadd_rn(t0, t1);
+                    const float sp = __shfl_up_sync(0xffffffffu, s, 1u);
+                    const float g4 = __fadd_rn(__fadd_rn(sp, t0), t1);
+                    const float g4a = __shfl_sync(0xffffffffu, g4, (lane & ~3u) | 1u);
+                    const float g4b = __shfl_sync(0xffffffffu, g4, (lane & ~3u) | 3u);
+                    run[mt][half] = __fadd_rn(__fadd_rn(run[mt][half], g4a), g4b);
+                }
+            }
+        }
+        if (tig == 0u) {
+#pragma unroll
+            for (uint32_t mt = 0; mt < 2u; mt++) {
+#pragma unroll
+                for (uint32_t half = 0; half < 2u; half++) {
+                    const uint32_t key = key0 + mt * 16u + grp + half * 8u;
+                    if (key < s_ncomp[r]) s_scores[r][c0 + key] = run[mt][half];
+                }
+            }
         }
     }
 }
@@ -20831,7 +21101,23 @@ extern "C" int ns4_gpu_indexer_scan_topk_rows_tensor(
                                         (int)kIdxMmaSmem) == cudaSuccess;
         (void)cudaGetLastError();
     }
-    if (mma_scan) {
+    static int mma_scan_v2 = -1;
+    if (mma_scan_v2 < 0) {
+        mma_scan_v2 = getenv("NS4_CUDA_NO_INDEXER_MMA_V2") == NULL &&
+                      cudaFuncSetAttribute(indexer_score_mma_rows_v2_kernel,
+                                           cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                           (int)kIdxMmaV2Smem) == cudaSuccess;
+        (void)cudaGetLastError();
+    }
+    if (mma_scan && mma_scan_v2 && n_rows <= kIdxMmaV2RowsMax &&
+        (((uintptr_t)index_mirror->ptr) & 15u) == 0u &&
+        (((uintptr_t)g_indexer_qm_rows_scratch) & 15u) == 0u) {
+        cuda_launch_pdl(indexer_score_mma_rows_v2_kernel,
+                        (max_comp + kIdxMmaKeys - 1u) / kIdxMmaKeys, 256, kIdxMmaV2Smem,
+                        cuda_decode_stream(),
+                        args, (const unsigned char *)index_mirror->ptr, scale, n_rows,
+                        max_comp);
+    } else if (mma_scan) {
         cuda_launch_pdl(indexer_score_mma_rows_kernel,
                         (max_comp + kIdxMmaKeys - 1u) / kIdxMmaKeys, 256, kIdxMmaSmem,
                         cuda_decode_stream(),
