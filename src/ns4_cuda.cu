@@ -6058,6 +6058,259 @@ __device__ __forceinline__ static int32_t dot_i8_block_a2b16(const int8_t *a, co
     return dot_i8_block(a, b, n, use_dp4a);
 }
 
+/* ---- warp-per-row q8_0 rows GEMV (verify-block twin of the four rows kernels) ----
+ *
+ * One warp per output row, every row of the launch in flight from the first
+ * instruction: the row's 1088-byte spans stream through a small cp.async ring
+ * in shared memory, the lane's NR activation blocks for the current span sit
+ * in registers (the block prefetches the activation set into L1 at entry), and
+ * the lane's weight block is read from the span as nine aligned dwords plus
+ * byte permutes -- the integer block dot is exact however its bytes are
+ * assembled, and the products feed the same float chains as the kernels it
+ * replaces, so every output is bit-identical:
+ *   PAIR   -- matmul_q8_0_pair_preq_wide_rows_shared_kernel<NT, NR> for
+ *             blocks <= NT: 0 + ws*xs*dot per lane, warp tree per 32-block
+ *             group in group order, group totals summed serially from 0.0f
+ *             (the idle warps' +0.0f adds are exact no-ops: the running total
+ *             is never -0).
+ *   !PAIR  -- matmul_q8_0_preq_warp8_rows_kernel / grouped_q8_0_a_preq_warp8_rows
+ *             / matmul_q8_0_hc_expand_preq_warp8_rows_shared: lane-strided
+ *             accumulation over the spans in order, one warp tree at the end,
+ *             the hc-expand epilogue with its multiply and fused adds kept in
+ *             the original order (n_hc == 4); add_experts > 0 means block_add
+ *             holds the deferred routed-MoE partials ([row][expert][out_dim])
+ *             and the epilogue sums them in moe_mmq_sum_kernel's order first.
+ * Measured in the standalone harness (nsys, 5 rows): q_a+kv 11.2 -> 8.9 us,
+ * shexp gate/up 21.5 -> 15.9, shexp down 14.0 -> 10.9, q_b 30.6 -> 28.9,
+ * out_b 28.7 -> 27.8, out_a 30.0 -> 27.6; the rows kernels it replaces were
+ * bound by 34-byte-strided u16 loads and per-group L2 latency, not by DRAM.
+ * NS4_CUDA_NO_Q8_ROWS_WPR restores the previous kernels for A/B. */
+#define NS4_Q8W_WARPS 8u
+__device__ __forceinline__ static void q8w_cp_async16(void *sdst, const void *gsrc) {
+    const uint32_t s = (uint32_t)__cvta_generic_to_shared(sdst);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(s), "l"(gsrc));
+}
+__device__ __forceinline__ static void q8w_cp_async_commit(void) { asm volatile("cp.async.commit_group;\n"); }
+__device__ __forceinline__ static void q8w_cp_async_wait(uint32_t pending) {
+    /* wait until at most `pending` most recent groups are still in flight */
+    if (pending == 0u) asm volatile("cp.async.wait_group 0;\n");
+    else asm volatile("cp.async.wait_group 1;\n");
+}
+__device__ __forceinline__ static void q8w_prefetch_l1(const void *p) { asm volatile("prefetch.global.L1 [%0];" :: "l"(p)); }
+__device__ __forceinline__ static int32_t q8w_dot_dw8(const uint32_t *wd, const int4 x0, const int4 x1) {
+    int32_t dot = 0;
+    dot = __dp4a((int32_t)wd[0], x0.x, dot); dot = __dp4a((int32_t)wd[1], x0.y, dot);
+    dot = __dp4a((int32_t)wd[2], x0.z, dot); dot = __dp4a((int32_t)wd[3], x0.w, dot);
+    dot = __dp4a((int32_t)wd[4], x1.x, dot); dot = __dp4a((int32_t)wd[5], x1.y, dot);
+    dot = __dp4a((int32_t)wd[6], x1.z, dot); dot = __dp4a((int32_t)wd[7], x1.w, dot);
+    return dot;
+}
+template <uint32_t NR, uint32_t DEPTH, bool PAIR, bool GROUPED, bool HC>
+__global__ static void __launch_bounds__(NS4_Q8W_WARPS * 32u)
+matmul_q8_0_rows_wpr_kernel(float *out0, float *out1,
+                            const unsigned char *w0, const unsigned char *w1,
+                            const int8_t *xq, const float *xscale,
+                            uint64_t out0_dim, uint64_t out1_dim, uint64_t blocks,
+                            uint64_t rank, uint32_t n_groups,
+                            float *out_hc, const float *block_add,
+                            const float *residual_hc, const float *split,
+                            uint32_t n_embd, uint32_t split_stride, uint32_t add_experts) {
+    NS4_PDL_WAIT();
+    extern __shared__ __align__(16) int8_t q8w_smem[];
+    /* warp id through a broadcast shuffle: proves the row loop warp-uniform,
+     * otherwise every __shfl_down_sync in it compiles to the collective fallback */
+    const uint32_t warp = __shfl_sync(0xffffffffu, threadIdx.x >> 5u, 0);
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t nspan = (uint32_t)(blocks >> 5u);
+    const uint32_t row_bytes = nspan * 1088u;
+    int8_t *ring = q8w_smem + (size_t)warp * DEPTH * 1088u;
+    const uint32_t row = blockIdx.x * NS4_Q8W_WARPS + warp;
+    const uint32_t rows_total = (uint32_t)(out0_dim + out1_dim);
+    const uint32_t group = GROUPED ? (uint32_t)(row / rank) : 0u;
+    {
+        const uint32_t lines_q = (uint32_t)(blocks * 32u) >> 7u;
+        for (uint32_t r = 0; r < NR; r++) {
+            const uint64_t xrow = GROUPED ? ((uint64_t)r * n_groups + group) : (uint64_t)r;
+            const int8_t *xb = xq + xrow * blocks * 32u;
+            for (uint32_t i = threadIdx.x; i < lines_q; i += NS4_Q8W_WARPS * 32u) q8w_prefetch_l1(xb + (size_t)i * 128u);
+            const float *sb = xscale + xrow * blocks;
+            for (uint32_t i = threadIdx.x; i < (uint32_t)(blocks >> 5u); i += NS4_Q8W_WARPS * 32u) q8w_prefetch_l1(sb + (size_t)i * 32u);
+        }
+    }
+    const bool active = row < rows_total;
+    const unsigned char *wr = 0;
+    if (active) {
+        if (PAIR) wr = row < out0_dim ? w0 + (uint64_t)row * row_bytes : w1 + (uint64_t)(row - out0_dim) * row_bytes;
+        else wr = w0 + (uint64_t)row * row_bytes;
+    }
+    auto issue = [&](uint32_t g) {
+        if (active && g < nspan) {
+            const unsigned char *src = wr + g * 1088u;
+            int8_t *dst = ring + (g % DEPTH) * 1088u;
+            for (uint32_t c = lane; c < 68u; c += 32u) q8w_cp_async16(dst + c * 16u, src + c * 16u);
+        }
+        q8w_cp_async_commit();
+    };
+#pragma unroll
+    for (uint32_t d = 0; d < DEPTH; d++) issue(d);
+    const uint32_t wb = 8u * lane + (lane >> 1u);   /* first dword of this lane's 34-byte block in a span */
+    const uint32_t odd = lane & 1u;
+    const uint32_t psel = odd ? 0x7654u : 0x5432u;
+    float acc[NR];
+#pragma unroll
+    for (uint32_t r = 0; r < NR; r++) acc[r] = 0.0f;
+    if (active) {
+        for (uint32_t g = 0; g < nspan; g++) {
+            int4 xa[NR][2]; float xs[NR];
+            const uint32_t b = g * 32u + lane;
+#pragma unroll
+            for (uint32_t r = 0; r < NR; r++) {
+                const uint64_t xrow = GROUPED ? ((uint64_t)r * n_groups + group) : (uint64_t)r;
+                const uint64_t off = xrow * blocks + b;
+                const int4 *xp = (const int4 *)(xq + off * 32u);
+                xa[r][0] = xp[0]; xa[r][1] = xp[1]; xs[r] = xscale[off];
+            }
+            q8w_cp_async_wait(DEPTH - 1u);
+            __syncwarp();
+            const uint32_t *span = (const uint32_t *)(ring + (g % DEPTH) * 1088u);
+            uint32_t wrd[9];
+#pragma unroll
+            for (uint32_t d = 0; d < 9u; d++) wrd[d] = span[wb + d];
+            uint32_t wd[8];
+#pragma unroll
+            for (uint32_t d = 0; d < 8u; d++) wd[d] = __byte_perm(wrd[d], wrd[d + 1], psel);
+            const uint16_t sbits = (uint16_t)((wrd[0] >> (16u * odd)) & 0xffffu);
+            const float wsc = __half2float(__ushort_as_half(sbits));
+#pragma unroll
+            for (uint32_t r = 0; r < NR; r++) {
+                const int dot = q8w_dot_dw8(wd, xa[r][0], xa[r][1]);
+                if (PAIR) {
+                    const float a = __fmaf_rn(__fmul_rn(wsc, xs[r]), (float)dot, 0.0f);
+                    const float t = warp_sum_f32(a);
+                    acc[r] += t;
+                } else {
+                    acc[r] = __fmaf_rn(__fmul_rn(wsc, xs[r]), (float)dot, acc[r]);
+                }
+            }
+            __syncwarp();
+            issue(g + DEPTH);
+        }
+        if (PAIR) {
+            if (lane == 0) {
+                const int second = row >= out0_dim;
+                float *o = second ? out1 : out0;
+                const uint64_t od = second ? out1_dim : out0_dim;
+                const uint64_t rr = second ? row - out0_dim : row;
+#pragma unroll
+                for (uint32_t r = 0; r < NR; r++) o[r * od + rr] = acc[r];
+            }
+        } else if (!HC) {
+#pragma unroll
+            for (uint32_t r = 0; r < NR; r++) {
+                const float sum = warp_sum_f32(acc[r]);
+                if (lane == 0) out0[(uint64_t)r * out0_dim + row] = sum;
+            }
+        } else {
+            const uint64_t hc_stride = 4ull * n_embd;
+            const uint32_t d_out = row;
+            /* epilogue operands first: they do not depend on the sums */
+            float addv[NR], postv[NR], combv[NR][4], resv[NR][4];
+#pragma unroll
+            for (uint32_t r = 0; r < NR; r++) {
+                const float *split_r = split + (uint64_t)r * split_stride;
+                const float *residual_r = residual_hc + (uint64_t)r * hc_stride;
+                addv[r] = add_experts
+                    ? (lane < add_experts
+                        ? block_add[((uint64_t)r * add_experts + lane) * out0_dim + d_out] : 0.0f)
+                    : block_add[(uint64_t)r * out0_dim + d_out];
+                postv[r] = lane < 4u ? split_r[4u + lane] : 0.f;
+#pragma unroll
+                for (uint32_t s2 = 0; s2 < 4u; s2++) {
+                    combv[r][s2] = lane < 4u ? split_r[8u + lane + s2 * 4u] : 0.f;
+                    resv[r][s2] = lane < 4u ? residual_r[(uint64_t)s2 * n_embd + d_out] : 0.f;
+                }
+            }
+#pragma unroll
+            for (uint32_t r = 0; r < NR; r++) {
+                float sum = warp_sum_f32(acc[r]);
+                sum = __shfl_sync(0xffffffffu, sum, 0);
+                float *block_out_r = out0 + (uint64_t)r * out0_dim;
+                float *out_hc_r = out_hc + (uint64_t)r * hc_stride;
+                float block_v = sum;
+                if (add_experts) {
+                    /* moe_mmq_sum_kernel's chain over the row's partials: one
+                     * lane holds each partial, the adds run in expert order */
+                    float av = 0.0f;
+                    for (uint32_t e = 0; e < add_experts; e++) {
+                        av += __shfl_sync(0xffffffffu, addv[r], e);
+                    }
+                    block_v += av;
+                }
+                if (lane == 0) {
+                    block_out_r[d_out] = sum;
+                    if (!add_experts) block_v += addv[r];
+                }
+                block_v = __shfl_sync(0xffffffffu, block_v, 0);
+                if (lane < 4u) {
+                    float hc_acc = __fmul_rn(block_v, postv[r]);
+#pragma unroll
+                    for (uint32_t src_hc = 0; src_hc < 4u; src_hc++) {
+                        hc_acc = __fmaf_rn(combv[r][src_hc], resv[r][src_hc], hc_acc);
+                    }
+                    out_hc_r[(uint64_t)lane * n_embd + d_out] = hc_acc;
+                }
+            }
+        }
+    }
+    q8w_cp_async_wait(0u);
+}
+
+/* Host side: eligibility and the NR switch.  Pair rows use a 2-span ring
+ * (their per-group trees leave the ring time to refill), the warp8-order
+ * rows a single span. */
+static int cuda_q8_rows_wpr_ok(const void *w0, const void *w1, uint64_t in_dim,
+                               uint64_t blocks, uint32_t n_rows, int use_dp4a) {
+    static int env = -1;
+    if (env < 0) env = getenv("NS4_CUDA_NO_Q8_ROWS_WPR") == NULL ? 1 : 0;
+    return env && use_dp4a && n_rows >= 2u && n_rows <= 5u &&
+           blocks >= 32u && blocks <= 256u && (blocks & 31u) == 0u &&
+           in_dim == blocks * 32u &&
+           (((uintptr_t)w0) & 15u) == 0u && (w1 == NULL || (((uintptr_t)w1) & 15u) == 0u);
+}
+#define NS4_Q8W_LAUNCH(NRV, DV, PAIRV, GRPV, HCV) \
+    cuda_launch_pdl(matmul_q8_0_rows_wpr_kernel<NRV, DV, PAIRV, GRPV, HCV>, grid, NS4_Q8W_WARPS * 32u, \
+                    (size_t)NS4_Q8W_WARPS * DV * 1088u, stream, out0, out1, w0, w1, xq, xscale, \
+                    out0_dim, out1_dim, blocks, rank, n_groups, out_hc, block_add, residual_hc, split, \
+                    n_embd, split_stride, add_experts)
+#define NS4_Q8W_SWITCH(DV, PAIRV, GRPV, HCV) \
+    switch (n_rows) { \
+    case 2u: NS4_Q8W_LAUNCH(2u, DV, PAIRV, GRPV, HCV); break; \
+    case 3u: NS4_Q8W_LAUNCH(3u, DV, PAIRV, GRPV, HCV); break; \
+    case 4u: NS4_Q8W_LAUNCH(4u, DV, PAIRV, GRPV, HCV); break; \
+    default: NS4_Q8W_LAUNCH(5u, DV, PAIRV, GRPV, HCV); break; \
+    }
+static void cuda_launch_q8_rows_wpr(int mode /* 0 pair, 1 rows, 2 grouped, 3 hc */,
+                                    float *out0, float *out1,
+                                    const unsigned char *w0, const unsigned char *w1,
+                                    const int8_t *xq, const float *xscale,
+                                    uint64_t out0_dim, uint64_t out1_dim, uint64_t blocks,
+                                    uint64_t rank, uint32_t n_groups,
+                                    float *out_hc, const float *block_add,
+                                    const float *residual_hc, const float *split,
+                                    uint32_t n_embd, uint32_t split_stride, uint32_t add_experts,
+                                    uint32_t n_rows, cudaStream_t stream) {
+    const uint64_t rows_total = out0_dim + out1_dim;
+    const dim3 grid((unsigned)((rows_total + NS4_Q8W_WARPS - 1u) / NS4_Q8W_WARPS), 1u, 1u);
+    switch (mode) {
+    case 0: if (blocks >= 64u) { NS4_Q8W_SWITCH(2u, true, false, false) } else { NS4_Q8W_SWITCH(1u, true, false, false) } break;
+    case 1: NS4_Q8W_SWITCH(1u, false, false, false) break;
+    case 2: NS4_Q8W_SWITCH(1u, false, true, false) break;
+    default: NS4_Q8W_SWITCH(1u, false, false, true) break;
+    }
+}
+#undef NS4_Q8W_SWITCH
+#undef NS4_Q8W_LAUNCH
+
 __global__ static NS4_CUDA_UNUSED void matmul_q8_0_kernel(
         float *out,
         const unsigned char *w,
@@ -6930,6 +7183,15 @@ static int cuda_launch_q8_0_pair_preq_warp8(
          * instead of re-reading the pair once per row. */
         if (n_rows >= 2u && n_rows <= 8u && (nt == 128 || nt == 256 || nt == 512) &&
             getenv("NS4_CUDA_NO_Q8_PAIR_ROWS_SHARED") == NULL) {
+            /* blocks <= nt: every NT-wide thread owns at most one block, so the
+             * per-group warp trees + serial warp sum are the wpr pair order */
+            if (blocks <= (uint64_t)nt &&
+                cuda_q8_rows_wpr_ok(w0, w1, in_dim, blocks, n_rows, use_dp4a)) {
+                cuda_launch_q8_rows_wpr(0, out0, out1, w0, w1, xq, xscale,
+                        out0_dim, out1_dim, blocks, 0u, 0u,
+                        NULL, NULL, NULL, NULL, 0u, 0u, 0u, n_rows, s);
+                return 1;
+            }
             const dim3 sgrid((unsigned)max_out, 1u, 1u);
 #define NS4_Q8_PAIR_SHARED_NT(NTV) \
             switch (n_rows) { \
@@ -21821,6 +22083,13 @@ extern "C" int ns4_gpu_matmul_q8_0_decode_rows_exact_tensor(
      * amortised by having enough blocks in flight. */
     if (n_rows > 1u && n_rows <= 8u &&
         getenv("NS4_CUDA_NO_Q8_ROWS_SHARED") == NULL) {
+        if (cuda_q8_rows_wpr_ok(wptr, NULL, in_dim, blocks, n_rows, cuda_q8_use_dp4a())) {
+            cuda_launch_q8_rows_wpr(1, (float *)out->ptr, NULL,
+                    reinterpret_cast<const unsigned char *>(wptr), NULL, xq, xscale,
+                    out_dim, 0u, blocks, 0u, 0u, NULL, NULL, NULL, NULL, 0u, 0u, 0u,
+                    n_rows, cuda_decode_stream());
+            return cuda_ok(cudaGetLastError(), "q8_0 decode rows wpr launch");
+        }
         const uint32_t rpb = cuda_q8_rows_rpb();
         const dim3 grid_r(((unsigned)out_dim + rpb - 1u) / rpb, 1u, 1u);
 #define NS4_Q8_ROWS_LAUNCH(NR) \
@@ -25736,6 +26005,13 @@ extern "C" int ns4_gpu_attention_output_low_q8_rows_exact_tensor(
                  "attention_output_low_q8 rows prequant launch")) return 0;
     if (n_rows > 1u && n_rows <= 8u &&
         getenv("NS4_CUDA_NO_ATTN_OUT_A_ROWS_SHARED") == NULL) {
+        if ((rank & 7u) == 0u &&
+            cuda_q8_rows_wpr_ok(out_a, NULL, group_dim, blocks_a, n_rows, use_dp4a)) {
+            cuda_launch_q8_rows_wpr(2, (float *)low->ptr, NULL, out_a, NULL, xq, xscale,
+                    low_dim, 0u, blocks_a, rank, group_cnt,
+                    NULL, NULL, NULL, NULL, 0u, 0u, 0u, n_rows, cuda_decode_stream());
+            return cuda_ok(cudaGetLastError(), "attention_output_low_q8 rows wpr launch");
+        }
         const uint32_t rpb = cuda_q8_rows_rpb();
         dim3 grid_s(((unsigned)low_dim + rpb - 1u) / rpb, 1u, 1u);
 #define NS4_ATTN_A_ROWS_LAUNCH(NR) \
@@ -34949,6 +35225,16 @@ extern "C" int ns4_gpu_shared_down_hc_expand_rows_exact_tensor(
         const float *add_ptr = use_partials ? dsum.down : (const float *)routed_out->ptr;
         const uint32_t add_experts = use_partials ? dsum.n_expert : 0u;
         if (use_partials) memset(&g_moe_sum_deferred, 0, sizeof(g_moe_sum_deferred));
+        if (n_hc == 4u &&
+            cuda_q8_rows_wpr_ok(wptr, NULL, in_dim, blocks, n_rows, cuda_q8_use_dp4a())) {
+            cuda_launch_q8_rows_wpr(3, (float *)block_out->ptr, NULL,
+                    reinterpret_cast<const unsigned char *>(wptr), NULL, xq, xscale,
+                    out_dim, 0u, blocks, 0u, 0u,
+                    (float *)out_hc->ptr, add_ptr,
+                    (const float *)residual_hc->ptr, (const float *)split->ptr,
+                    n_embd, split_stride, add_experts, n_rows, cuda_decode_stream());
+            return cuda_ok(cudaGetLastError(), "shared down hc expand rows wpr launch");
+        }
 #define NS4_HC_ROWS_SHARED(NR) \
         cuda_launch_pdl(matmul_q8_0_hc_expand_preq_warp8_rows_shared_kernel<NR>, grid_s, 256, 0, cuda_decode_stream(),  \
                 (float *)out_hc->ptr, (float *)block_out->ptr, \
