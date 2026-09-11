@@ -12952,6 +12952,412 @@ attention_flash2_decode_rows_kernel(
     }
 }
 
+/* Wide twin of attention_flash2_decode_rows_kernel: one 256-thread block
+ * owns all 64 heads, so each K tile is staged once per split instead of
+ * once per 16-head tile, and a split's blocks fit in one wave.  The Q
+ * A-fragments live in registers (no 64 KB Q tile), which leaves room for
+ * a two-stage f32 K ring fed by bulk async copies (one 2 KB row per copy,
+ * issued by warp 0, tracked by an mbarrier per stage) so two tiles are in
+ * flight with no load-issue stall on the tensor warps.  For every (head,
+ * tile) the QK, softmax and PV instruction sequences are exactly the ones
+ * the 16-head kernel issues (same fragments, same k order, same rescale),
+ * so the split partials are bit-identical; NS4_CUDA_NO_FLASH2_ROWS_WIDE=1
+ * selects the 16-head twin.  Shared memory: 2 x 32 KB stages + 16 KB f16 K
+ * tile dynamic, ~15 KB static: under this class's 99 KB per-block opt-in. */
+static constexpr uint32_t kFD2WHeads    = 64u;
+static constexpr uint32_t kFD2WMTiles   = kFD2WHeads / kFD2Heads;      /* 4 */
+static constexpr uint32_t kFD2WWarps    = 8u;
+static constexpr uint32_t kFD2WThreads  = kFD2WWarps * 32u;
+static constexpr uint32_t kFD2WTopkMax  = 512u;    /* the launcher rejects indexed rows above this */
+static constexpr uint32_t kFD2WSpStride = kFD2Tile + 1u;                /* 17: head lanes hit distinct banks */
+static constexpr uint32_t kFD2WPvNTiles = kFD2Dim / 8u / 2u;           /* 32: a warp owns 256 dims of one head tile */
+static constexpr uint32_t kFD2WKSteps   = (kFD2Dim / 16u) / 2u;        /* 16 per k-half */
+static constexpr uint32_t kFD2WStages   = 2u;
+static constexpr uint32_t kFD2WRowBytes = kFD2Dim * (uint32_t)sizeof(float);                 /* 2 KB */
+static constexpr uint32_t kFD2WTileF32Bytes = kFD2Tile * kFD2WRowBytes;                      /* 32 KB */
+static constexpr uint32_t kFD2WKsBytes  = kFD2Tile * kFD2Dim * (uint32_t)sizeof(half);       /* 16 KB */
+static constexpr uint32_t kFD2WSmemBytes = kFD2WStages * kFD2WTileF32Bytes + kFD2WKsBytes;  /* 80 KB dynamic */
+static_assert(kFD2WMTiles * 2u == kFD2WWarps, "one warp per (head tile, k-half / dim-half)");
+static_assert(kFD2Tile * kFD2Chunks == 4u * kFD2WThreads, "4 chunks per thread per tile");
+static constexpr uint32_t kFD2WSoftmaxWarps = 4u;                      /* 16 head lanes each */
+static constexpr uint32_t kFD2WIssueWarps   = kFD2WWarps - kFD2WSoftmaxWarps;
+static_assert(kFD2Tile == 4u * kFD2WIssueWarps, "four tile rows per issuing warp");
+static_assert(kFD2WSoftmaxWarps * 16u == kFD2WHeads, "one softmax lane per head");
+static constexpr uint32_t kFD2WOutStride = kFD2Dim + 8u;               /* 520 floats: conflict-free C-fragment stores */
+static_assert(2u * kFD2Heads * kFD2WOutStride * sizeof(float) <= kFD2WSmemBytes, "32 staged partial rows fit the ring");
+
+__device__ __forceinline__ static void fd2w_mbar_init(unsigned mb, uint32_t count) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("mbarrier.init.shared.b64 [%0], %1;" :: "r"(mb), "r"(count));
+#else
+    (void)mb; (void)count;
+#endif
+}
+__device__ __forceinline__ static void fd2w_mbar_expect_tx(unsigned mb, uint32_t bytes) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;" :: "r"(mb), "r"(bytes) : "memory");
+#else
+    (void)mb; (void)bytes;
+#endif
+}
+/* The shared::cta destination form on purpose: the shared::cluster form
+ * makes the driver reserve cluster resources at the kernel's first launch,
+ * which fails with "out of memory" once the weight arena has taken the
+ * VRAM (--gpu-vram 94 leaves ~2 GB). */
+__device__ __forceinline__ static void fd2w_bulk_copy(unsigned dst, const void *src, uint32_t bytes, unsigned mb) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                 :: "r"(dst), "l"(src), "r"(bytes), "r"(mb) : "memory");
+#else
+    (void)dst; (void)src; (void)bytes; (void)mb;
+#endif
+}
+__device__ __forceinline__ static void fd2w_mbar_wait(unsigned mb, uint32_t parity) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    uint32_t done = 0u;
+    do {
+        asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.shared.b64 p, [%1], %2; selp.u32 %0, 1, 0, p; }"
+                     : "=r"(done) : "r"(mb), "r"(parity) : "memory");
+    } while (!done);
+#else
+    (void)mb; (void)parity;
+#endif
+}
+
+__global__ static void __launch_bounds__(kFD2WThreads, 1)
+attention_flash2_decode_rows_wide_kernel(
+        fd2_rows_args args,
+        const float *raw_kv,
+        const float *comp_kv,
+        uint32_t n_head,
+        uint32_t raw_cap,
+        uint32_t n_rows) {
+    NS4_PDL_WAIT();
+    extern __shared__ __align__(128) unsigned char fd2w_dyn[];
+    unsigned char *stages = fd2w_dyn;                       /* [2][16 rows][512 f32] */
+    half *ks = reinterpret_cast<half *>(fd2w_dyn + kFD2WStages * kFD2WTileF32Bytes);
+    __shared__ float sp[2][kFD2WHeads][kFD2WSpStride];   /* QK partials, per k-half */
+    __shared__ half  ps[kFD2WHeads * kFD2PStride];
+    __shared__ float m_s[kFD2WHeads], l_s[kFD2WHeads], a_s[kFD2WHeads];
+    __shared__ uint32_t valid_s[kFD2Tile];
+    __shared__ uint32_t valid_st[kFD2WStages][kFD2Tile];
+    __shared__ int32_t topk_s[kFD2WTopkMax];
+    __shared__ __align__(8) uint64_t mbar[kFD2WStages];
+
+    if (blockIdx.z >= n_rows) return;
+    const fd2_rows_desc rd = args.row[blockIdx.z];
+    const float *q = rd.q;
+    float *part_o = rd.part_o;
+    float2 *part_ml = rd.part_ml;
+    const int32_t *topk = rd.topk;
+    const uint32_t n_split = rd.n_split;
+
+    const uint32_t tid   = threadIdx.x;
+    const uint32_t lane  = tid & 31u;
+    const uint32_t warp  = tid >> 5u;
+    const uint32_t head0 = blockIdx.x * kFD2WHeads;
+    const uint32_t split = blockIdx.y;
+    if (split >= n_split) return;
+
+    const fd_row_geom geom = fd_compute_geom(
+        rd.pos0, rd.n_raw, rd.n_comp, rd.top_k, rd.window, rd.ratio,
+        topk != NULL);
+
+    const uint32_t tiles_total = (geom.n_score + kFD2Tile - 1u) / kFD2Tile;
+    const uint32_t tiles_per   = (tiles_total + n_split - 1u) / n_split;
+    const uint32_t row_begin   = split * tiles_per * kFD2Tile;
+    uint32_t row_end = row_begin + tiles_per * kFD2Tile;
+    if (row_end > geom.n_score) row_end = geom.n_score;
+    const uint32_t n_tiles = row_begin < row_end
+        ? (row_end - row_begin + kFD2Tile - 1u) / kFD2Tile : 0u;
+
+    /* The indexed rows' top-k slots, once per block (the launcher caps
+     * top_k at kFD2WTopkMax). */
+    if (topk != NULL) {
+        for (uint32_t s = tid; s < geom.comp_slots && s < kFD2WTopkMax; s += kFD2WThreads) {
+            topk_s[s] = topk[s];
+        }
+    }
+    if (tid == 0u) {
+        fd2w_mbar_init(fd2_smem_addr(&mbar[0]), kFD2WIssueWarps);
+        fd2w_mbar_init(fd2_smem_addr(&mbar[1]), kFD2WIssueWarps);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+#endif
+    }
+    __syncthreads();
+
+    /* Tile t -> stage t & 1.  Each of the four issuing warps (the ones
+     * idle during the softmax) resolves its four rows r = 4*(warp-4) +
+     * lane (lanes 0-3; raw ring, then top-k / dense compressed), posts its
+     * byte count on the stage's mbarrier (one arrival per issuing warp),
+     * and each valid row's lane issues one 2 KB bulk copy.  Only called
+     * for t < n_tiles, and only once the stage's previous tile was
+     * converted. */
+    auto issue = [&](uint32_t t) {
+        const uint32_t stage = t & 1u;
+        const uint32_t row0 = row_begin + t * kFD2Tile;
+        const uint32_t nr_t = row_end - row0 < kFD2Tile ? row_end - row0 : kFD2Tile;
+        const uint32_t r = 4u * (warp - kFD2WSoftmaxWarps) + lane;
+        uint32_t ok = 0u;
+        const float *base = NULL;
+        uint32_t src = 0u;
+        if (lane < 4u && r < nr_t) {
+            const uint32_t gr = row0 + r;
+            if (gr < geom.raw_count) {
+                src = (rd.raw_start + geom.raw_first_idx + gr) % raw_cap;
+                base = raw_kv;
+                ok = 1u;
+            } else {
+                const uint32_t slot = gr - geom.raw_count;
+                const int32_t cc = topk ? topk_s[slot] : (int32_t)slot;
+                ok = (cc >= 0 && (uint32_t)cc < geom.visible_comp) ? 1u : 0u;
+                src = ok ? (uint32_t)cc : 0u;
+                base = comp_kv;
+            }
+        }
+        if (lane < 4u) valid_st[stage][r] = ok;
+        const uint32_t bytes = (uint32_t)__popc(__ballot_sync(0xffffffffu, ok)) * kFD2WRowBytes;
+        const unsigned mb = fd2_smem_addr(&mbar[stage]);
+        if (lane == 0u) fd2w_mbar_expect_tx(mb, bytes);
+        __syncwarp();
+        if (ok) {
+            fd2w_bulk_copy(fd2_smem_addr(stages + stage * kFD2WTileF32Bytes + r * kFD2WRowBytes),
+                           base + (uint64_t)src * kFD2Dim, kFD2WRowBytes, mb);
+        }
+    };
+    /* f32 stage -> swizzled f16 ks: the 16-head kernel's conversion and
+     * zero-fill per chunk; invalid rows are never read from the stage. */
+    auto convert = [&](uint32_t t) {
+        const uint32_t stage = t & 1u;
+        const unsigned char *src = stages + stage * kFD2WTileF32Bytes;
+        uint32_t okv[4];
+        float4 v[4][2];
+#pragma unroll
+        for (uint32_t i = 0; i < 4u; i++) {
+            const uint32_t idx = tid + kFD2WThreads * i;
+            const uint32_t r = idx >> 6u;
+            const uint32_t c = idx & (kFD2Chunks - 1u);
+            okv[i] = valid_st[stage][r];
+            const float4 *s4 = reinterpret_cast<const float4 *>(src + r * kFD2WRowBytes + c * 32u);
+            v[i][0] = s4[0];
+            v[i][1] = s4[1];
+        }
+#pragma unroll
+        for (uint32_t i = 0; i < 4u; i++) {
+            const uint32_t idx = tid + kFD2WThreads * i;
+            const uint32_t r = idx >> 6u;
+            const uint32_t c = idx & (kFD2Chunks - 1u);
+            if (c == 0u) valid_s[r] = okv[i];
+            if (okv[i]) fd2_store_chunk_f4(ks, r, c, v[i][0], v[i][1]);
+            else fd2_store_chunk_zero(ks, r, c);
+
+        }
+    };
+
+    /* Two tiles in flight before the Q fragments are fetched. */
+    if (warp >= kFD2WSoftmaxWarps) {
+        if (n_tiles > 0u) issue(0u);
+        if (n_tiles > 1u) issue(1u);
+    }
+
+    const uint32_t mt = warp >> 1u;                /* head tile 0..3        */
+    const uint32_t qk_khalf = warp & 1u;           /* QK: 256 dims each     */
+    const uint32_t pv_dhalf = warp & 1u;           /* PV: 256 dims each     */
+
+    /* ---- Q A-fragments for this warp's (head tile, k-half), the layout
+     * ldmatrix.x4 hands the 16-head kernel: a0 = (row g, k 2c..2c+1),
+     * a1 = (row g+8, k 2c..), a2 = (row g, k 8+2c..), a3 = (row g+8, k 8+2c..)
+     * with g = lane/4, c = lane%4; halves converted exactly as fd2_store_chunk. ---- */
+    uint32_t qf[kFD2WKSteps][4];
+    {
+        const uint32_t g = lane >> 2u;
+        const uint32_t c2 = (lane & 3u) * 2u;
+        const uint32_t gh_a = head0 + mt * kFD2Heads + g;
+        const uint32_t gh_b = gh_a + 8u;
+        const float *qa = q + (uint64_t)gh_a * kFD2Dim + qk_khalf * (kFD2Dim / 2u) + c2;
+        const float *qb = q + (uint64_t)gh_b * kFD2Dim + qk_khalf * (kFD2Dim / 2u) + c2;
+        const bool ok_a = gh_a < n_head, ok_b = gh_b < n_head;
+#pragma unroll
+        for (uint32_t b = 0; b < 1u; b++) {
+            float2 v[16][4];
+#pragma unroll
+            for (uint32_t i = 0; i < 16u; i++) {
+                const uint32_t k = (16u * b + i) * 16u;
+                v[i][0] = ok_a ? *reinterpret_cast<const float2 *>(qa + k) : make_float2(0.0f, 0.0f);
+                v[i][1] = ok_b ? *reinterpret_cast<const float2 *>(qb + k) : make_float2(0.0f, 0.0f);
+                v[i][2] = ok_a ? *reinterpret_cast<const float2 *>(qa + k + 8u) : make_float2(0.0f, 0.0f);
+                v[i][3] = ok_b ? *reinterpret_cast<const float2 *>(qb + k + 8u) : make_float2(0.0f, 0.0f);
+            }
+#pragma unroll
+            for (uint32_t i = 0; i < 16u; i++) {
+#pragma unroll
+                for (uint32_t j = 0; j < 4u; j++) {
+                    const half2 h2 = __halves2half2(__float2half(v[i][j].x), __float2half(v[i][j].y));
+                    qf[16u * b + i][j] = *reinterpret_cast<const uint32_t *>(&h2);
+                }
+            }
+        }
+    }
+
+    float o_acc[kFD2WPvNTiles][4];
+#pragma unroll
+    for (uint32_t t = 0; t < kFD2WPvNTiles; t++)
+#pragma unroll
+        for (uint32_t l = 0; l < 4u; l++) o_acc[t][l] = 0.0f;
+
+    if (tid < kFD2WHeads) { m_s[tid] = -INFINITY; l_s[tid] = 0.0f; }
+
+    const float scale = rsqrtf((float)kFD2Dim);
+
+    for (uint32_t t = 0; t < n_tiles; t++) {
+        const uint32_t row0 = row_begin + t * kFD2Tile;
+        const uint32_t nr = row_end - row0 < kFD2Tile ? row_end - row0 : kFD2Tile;
+        fd2w_mbar_wait(fd2_smem_addr(&mbar[t & 1u]), (t >> 1u) & 1u);   /* tile t landed */
+        __syncthreads();                            /* PV(t-1) is done with ks */
+
+        /* ---- stage KV rows: f32 stage -> f16 tile ---- */
+        convert(t);
+        /* zero both score partial planes before the MMA writes land */
+        for (uint32_t idx = tid; idx < 2u * kFD2WHeads * kFD2WSpStride; idx += kFD2WThreads) {
+            (&sp[0][0][0])[idx] = 0.0f;
+        }
+        __syncthreads();                            /* ks/sp ready; stage t&1 free */
+
+        /* ---- S = Q * K^T on tensor cores: warp = (head tile, k-half),
+         * both 8-row n-tiles ---- */
+        {
+            float s0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float s1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            const unsigned k_base = fd2_smem_addr(ks);
+            const uint32_t b_row0 = lane & 7u;                       /* kv row */
+            const uint32_t b_row1 = 8u + (lane & 7u);
+            const uint32_t b_half = (lane >> 3u) & 1u;
+#pragma unroll
+            for (uint32_t kt = 0; kt < kFD2WKSteps; kt++) {
+                const uint32_t kchunk = (qk_khalf * kFD2WKSteps + kt) * 2u;
+                uint32_t b0[2], b1[2];
+                fd2_ldmatrix_x2(b0, k_base + fd2_off_bytes(b_row0, kchunk + b_half));
+                fd2_ldmatrix_x2(b1, k_base + fd2_off_bytes(b_row1, kchunk + b_half));
+                fd2_mma(s0, qf[kt], b0);
+                fd2_mma(s1, qf[kt], b1);
+            }
+#pragma unroll
+            for (uint32_t l = 0; l < 4u; l++) {
+                const uint32_t i = mt * kFD2Heads + fd2_c_i(lane, l);
+                const uint32_t j = fd2_c_j(lane, l);
+                sp[qk_khalf][i][j] = s0[l];
+                sp[qk_khalf][i][8u + j] = s1[l];
+            }
+        }
+        __syncthreads();
+
+        /* ---- online softmax, one lane per head (four warps, 16 lanes
+         * each); the other four warps issue tile t+2 into the stage freed
+         * above meanwhile ---- */
+        if (warp >= kFD2WSoftmaxWarps) {
+            if (t + 2u < n_tiles) issue(t + 2u);
+        } else if (lane < 16u) {
+            const uint32_t h = warp * 16u + lane;
+            float tile_max = -INFINITY;
+            float s_row[kFD2Tile];
+#pragma unroll
+            for (uint32_t r = 0; r < kFD2Tile; r++) {
+                float v = (r < nr && valid_s[r])
+                              ? (sp[0][h][r] + sp[1][h][r]) * scale : -INFINITY;
+                s_row[r] = v;
+                tile_max = fmaxf(tile_max, v);
+            }
+            const float m_old = m_s[h];
+            const float m_new = fmaxf(m_old, tile_max);
+            const float alpha = (m_old == -INFINITY) ? 0.0f : __expf(m_old - m_new);
+            float l_add = 0.0f;
+            if (tile_max == -INFINITY) {
+                a_s[h] = 1.0f;                     /* nothing to add */
+#pragma unroll
+                for (uint32_t r = 0; r < kFD2Tile; r++) ps[h * kFD2PStride + r] = __float2half(0.0f);
+            } else {
+#pragma unroll
+                for (uint32_t r = 0; r < kFD2Tile; r++) {
+                    const float p = (s_row[r] == -INFINITY) ? 0.0f : __expf(s_row[r] - m_new);
+                    l_add += p;
+                    ps[h * kFD2PStride + r] = __float2half(p);
+                }
+                a_s[h] = alpha;
+                m_s[h] = m_new;
+                l_s[h] = l_s[h] * alpha + l_add;
+            }
+        }
+        __syncthreads();
+
+        /* ---- rescale the running output, then O += P * V: warp = (head
+         * tile, dim half) ---- */
+        {
+            const unsigned p_base = fd2_smem_addr(ps);
+            const unsigned k_base = fd2_smem_addr(ks);
+            uint32_t a[4];
+            fd2_ldmatrix_x4(a, p_base +
+                            (unsigned)(((mt * kFD2Heads + (lane & 15u)) * kFD2PStride +
+                                        (lane >> 4u) * 8u) * sizeof(half)));
+            const uint32_t v_row = lane & 15u;
+#pragma unroll
+            for (uint32_t t2 = 0; t2 < kFD2WPvNTiles; t2++) {
+                const uint32_t nchunk = pv_dhalf * kFD2WPvNTiles + t2;
+#pragma unroll
+                for (uint32_t l = 0; l < 4u; l++) {
+                    o_acc[t2][l] *= a_s[mt * kFD2Heads + fd2_c_i(lane, l)];
+                }
+                uint32_t b[2];
+                fd2_ldmatrix_x2_trans(b, k_base + fd2_off_bytes(v_row, nchunk));
+                fd2_mma(o_acc[t2], a, b);
+            }
+        }
+    }
+
+    /* ---- write this split's unnormalised partial: two passes of 32
+     * heads staged through the (now idle) ring at a conflict-free stride,
+     * then plain coalesced stores by the whole block.  Not bulk stores:
+     * cp.async.bulk stores do not take the launch's persisting-L2 window
+     * over the partials, so they were written back to DRAM under the next
+     * layer's weight streams (the shared expert's pair GEMV paid ~7 us a
+     * layer at 131k and the twin's gain vanished there). ---- */
+    __syncthreads();
+    float *ostage = reinterpret_cast<float *>(fd2w_dyn);
+#pragma unroll
+    for (uint32_t pass = 0; pass < 2u; pass++) {
+        if ((mt >> 1u) == pass) {
+            const uint32_t orow0 = (mt & 1u) * kFD2Heads;
+#pragma unroll
+            for (uint32_t t2 = 0; t2 < kFD2WPvNTiles; t2++) {
+                const uint32_t nchunk = pv_dhalf * kFD2WPvNTiles + t2;
+#pragma unroll
+                for (uint32_t lp = 0; lp < 2u; lp++) {
+                    const uint32_t r = orow0 + fd2_c_i(lane, 2u * lp);
+                    const uint32_t d = nchunk * 8u + fd2_c_j(lane, 2u * lp);
+                    *reinterpret_cast<float2 *>(ostage + r * kFD2WOutStride + d) =
+                        make_float2(o_acc[t2][2u * lp], o_acc[t2][2u * lp + 1u]);
+                }
+            }
+        }
+        __syncthreads();
+        /* float4 stores by the whole block: these take the L2 window */
+        for (uint32_t i = tid; i < 2u * kFD2Heads * (kFD2Dim / 4u); i += kFD2WThreads) {
+            const uint32_t row = i / (kFD2Dim / 4u);
+            const uint32_t c4 = i % (kFD2Dim / 4u);
+            const uint32_t gh = head0 + pass * 2u * kFD2Heads + row;
+            if (gh < n_head) {
+                *reinterpret_cast<float4 *>(part_o + ((uint64_t)split * n_head + gh) * kFD2Dim + c4 * 4u) =
+                    *reinterpret_cast<const float4 *>(ostage + row * kFD2WOutStride + c4 * 4u);
+            }
+        }
+        if (pass == 0u) __syncthreads();
+    }
+    if (tid < kFD2WHeads && head0 + tid < n_head) {
+        part_ml[(uint64_t)split * n_head + head0 + tid] =
+            make_float2(m_s[tid], l_s[tid]);
+    }
+}
+
 __global__ __launch_bounds__(kFDCombDims)
 static void attention_flash_decode_combine_rows_kernel(
         fd2_rows_args args,
@@ -13313,9 +13719,36 @@ static int attention_flash2_decode_rows_launch(
     }
 
     cudaStream_t stream = cuda_decode_stream();
-    const dim3 grid((n_head + kFD2Heads - 1u) / kFD2Heads, max_split, n_rows);
-    cuda_launch_pdl_l2win(attention_flash2_decode_rows_kernel, grid, kFD2Threads, 0, stream, g_fd_scratch, g_fd_l2win_bytes, 
-            args, raw_kv, comp_kv, n_head, raw_cap, n_rows);
+    /* The 64-head twin unless opted out; it needs the >48 KB dynamic
+     * shared-memory opt-in once per device. */
+    static int wide_env = -1;
+    if (wide_env < 0) wide_env = getenv("NS4_CUDA_NO_FLASH2_ROWS_WIDE") == NULL ? 1 : 0;
+    int use_wide = wide_env;
+    if (use_wide) {
+        static int wide_ready[NS4_MAX_GPUS] = {0};
+        if (device < 0 || device >= NS4_MAX_GPUS) {
+            use_wide = 0;
+        } else if (!wide_ready[device]) {
+            if (cuda_ok(cudaFuncSetAttribute(attention_flash2_decode_rows_wide_kernel,
+                                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                             (int)kFD2WSmemBytes),
+                        "flash2 rows wide shared-memory opt-in")) {
+                wide_ready[device] = 1;
+            } else {
+                wide_env = 0;
+                use_wide = 0;
+            }
+        }
+    }
+    if (use_wide) {
+        const dim3 grid((n_head + kFD2WHeads - 1u) / kFD2WHeads, max_split, n_rows);
+        cuda_launch_pdl_l2win(attention_flash2_decode_rows_wide_kernel, grid, kFD2WThreads, kFD2WSmemBytes, stream, g_fd_scratch, g_fd_l2win_bytes,
+                args, raw_kv, comp_kv, n_head, raw_cap, n_rows);
+    } else {
+        const dim3 grid((n_head + kFD2Heads - 1u) / kFD2Heads, max_split, n_rows);
+        cuda_launch_pdl_l2win(attention_flash2_decode_rows_kernel, grid, kFD2Threads, 0, stream, g_fd_scratch, g_fd_l2win_bytes,
+                args, raw_kv, comp_kv, n_head, raw_cap, n_rows);
+    }
     if (!cuda_ok(cudaGetLastError(), "flash2 rows attention launch")) return 0;
 
     const dim3 comb_grid(n_head, (kFD2Dim + kFDCombDims - 1u) / kFDCombDims, n_rows);
